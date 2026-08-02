@@ -1,0 +1,13 @@
+{
+  "batch_id": "replace-with-gateway-batch-id",
+  "observations": [
+    {
+      "event_id": "replace-with-a-new-uuid",
+      "epc": "3074257BF7194E4000001A85",
+      "observed_at": "replace-with-current-RFC3339-timestamp",
+      "reader_sequence": 1,
+      "antenna_port": 1,
+      "rssi_dbm": -48.5
+    }
+  ]
+}

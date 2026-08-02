@@ -1,0 +1,415 @@
+import hashlib
+import json
+import secrets
+import uuid
+from datetime import UTC, datetime
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from abacus.api.errors import ApiError
+from abacus.enums import BatchStatus, StoreStatus, TenantStatus
+from abacus.models.tenancy import (
+    Device,
+    DeviceAssignment,
+    OnboardingBatch,
+    OrganizationUnit,
+    Store,
+    Tenant,
+    Zone,
+)
+from abacus.schemas.tenancy import (
+    BulkStoreOnboardingRequest,
+    DeviceAssignmentCreate,
+    TenantCreate,
+)
+
+
+def create_tenant(db: Session, request: TenantCreate) -> Tenant:
+    existing = db.scalar(select(Tenant).where(Tenant.code == request.code))
+    if existing is not None:
+        if existing.name == request.name:
+            return existing
+        raise ApiError(
+            409,
+            "Tenant code conflict",
+            f"Tenant code '{request.code}' already belongs to another tenant name.",
+            code="tenant_code_conflict",
+        )
+
+    tenant = Tenant(code=request.code, name=request.name, status=TenantStatus.ACTIVE)
+    db.add(tenant)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Tenant code conflict",
+            f"Tenant code '{request.code}' already exists.",
+            code="tenant_code_conflict",
+        ) from exc
+    db.refresh(tenant)
+    return tenant
+
+
+def _request_hash(request: BulkStoreOnboardingRequest) -> str:
+    canonical = json.dumps(
+        request.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _get_tenant(db: Session, tenant_id: uuid.UUID) -> Tenant:
+    tenant = db.get(Tenant, tenant_id)
+    if tenant is None:
+        raise ApiError(404, "Tenant not found", "The requested tenant does not exist.")
+    return tenant
+
+
+def _resolve_organization_path(
+    db: Session,
+    tenant_id: uuid.UUID,
+    path: list[object],
+) -> uuid.UUID | None:
+    parent_id: uuid.UUID | None = None
+    for raw_segment in path:
+        segment = raw_segment
+        code = segment.code  # type: ignore[attr-defined]
+        existing = db.scalar(
+            select(OrganizationUnit).where(
+                OrganizationUnit.tenant_id == tenant_id,
+                OrganizationUnit.code == code,
+            )
+        )
+        if existing is not None:
+            if (
+                existing.parent_id != parent_id
+                or existing.name != segment.name  # type: ignore[attr-defined]
+                or existing.unit_type != segment.unit_type  # type: ignore[attr-defined]
+            ):
+                raise ApiError(
+                    409,
+                    "Organization hierarchy conflict",
+                    f"Organization unit '{code}' conflicts with its existing definition.",
+                    code="organization_unit_conflict",
+                )
+            parent_id = existing.id
+            continue
+
+        unit = OrganizationUnit(
+            tenant_id=tenant_id,
+            parent_id=parent_id,
+            code=code,
+            name=segment.name,  # type: ignore[attr-defined]
+            unit_type=segment.unit_type,  # type: ignore[attr-defined]
+        )
+        db.add(unit)
+        db.flush()
+        parent_id = unit.id
+    return parent_id
+
+
+def onboard_stores(
+    db: Session,
+    tenant_id: uuid.UUID,
+    idempotency_key: str,
+    request: BulkStoreOnboardingRequest,
+) -> OnboardingBatch:
+    _get_tenant(db, tenant_id)
+    digest = _request_hash(request)
+    existing_batch = db.scalar(
+        select(OnboardingBatch).where(
+            OnboardingBatch.tenant_id == tenant_id,
+            OnboardingBatch.idempotency_key == idempotency_key,
+        )
+    )
+    if existing_batch is not None:
+        if existing_batch.request_hash != digest:
+            raise ApiError(
+                409,
+                "Idempotency conflict",
+                "This idempotency key was already used with a different request.",
+                code="idempotency_key_reused",
+            )
+        return existing_batch
+
+    requested_codes = [store.code for store in request.stores]
+    existing_codes = set(
+        db.scalars(
+            select(Store.code).where(
+                Store.tenant_id == tenant_id,
+                Store.code.in_(requested_codes),
+            )
+        ).all()
+    )
+    if existing_codes:
+        raise ApiError(
+            409,
+            "Store code conflict",
+            f"Stores already exist: {sorted(existing_codes)}",
+            code="store_code_conflict",
+        )
+
+    requested_serials = [
+        device.serial_number for store in request.stores for device in store.devices
+    ]
+    if requested_serials:
+        existing_serials = set(
+            db.scalars(
+                select(Device.serial_number).where(Device.serial_number.in_(requested_serials))
+            ).all()
+        )
+        if existing_serials:
+            raise ApiError(
+                409,
+                "Device serial conflict",
+                f"Devices already exist: {sorted(existing_serials)}",
+                code="device_serial_conflict",
+            )
+
+    batch = OnboardingBatch(
+        tenant_id=tenant_id,
+        idempotency_key=idempotency_key,
+        request_hash=digest,
+        status=BatchStatus.VALIDATING,
+        total_count=len(request.stores),
+        succeeded_count=0,
+        failed_count=0,
+        errors=[],
+    )
+    db.add(batch)
+
+    effective_from = datetime.now(UTC)
+    for store_request in request.stores:
+        organization_unit_id = _resolve_organization_path(
+            db,
+            tenant_id,
+            list(store_request.organization_path),
+        )
+        store = Store(
+            tenant_id=tenant_id,
+            organization_unit_id=organization_unit_id,
+            code=store_request.code,
+            name=store_request.name,
+            timezone=store_request.timezone,
+            status=StoreStatus.ACTIVE,
+            configuration=store_request.configuration,
+        )
+        db.add(store)
+        db.flush()
+
+        zones_by_code: dict[str, Zone] = {}
+        for zone_request in store_request.zones:
+            zone = Zone(
+                tenant_id=tenant_id,
+                store_id=store.id,
+                code=zone_request.code,
+                name=zone_request.name,
+                kind=zone_request.kind,
+            )
+            db.add(zone)
+            db.flush()
+            zones_by_code[zone.code] = zone
+
+        for device_request in store_request.devices:
+            device = Device(
+                tenant_id=tenant_id,
+                serial_number=device_request.serial_number,
+                display_name=device_request.display_name,
+            )
+            db.add(device)
+            db.flush()
+            db.add(
+                DeviceAssignment(
+                    tenant_id=tenant_id,
+                    device_id=device.id,
+                    store_id=store.id,
+                    zone_id=zones_by_code[device_request.zone_code].id,
+                    effective_from=effective_from,
+                )
+            )
+
+    batch.status = BatchStatus.COMPLETED
+    batch.succeeded_count = len(request.stores)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Onboarding conflict",
+            "Onboarding conflicted with concurrently created tenant data.",
+            code="onboarding_conflict",
+        ) from exc
+    db.refresh(batch)
+    return batch
+
+
+def list_stores(db: Session, tenant_id: uuid.UUID) -> list[Store]:
+    _get_tenant(db, tenant_id)
+    return list(
+        db.scalars(
+            select(Store).where(Store.tenant_id == tenant_id).order_by(Store.code.asc())
+        ).all()
+    )
+
+
+def list_devices(db: Session, tenant_id: uuid.UUID) -> list[Device]:
+    _get_tenant(db, tenant_id)
+    return list(
+        db.scalars(
+            select(Device).where(Device.tenant_id == tenant_id).order_by(Device.serial_number.asc())
+        ).all()
+    )
+
+
+def rotate_device_credential(
+    db: Session,
+    tenant_id: uuid.UUID,
+    device_id: uuid.UUID,
+) -> str:
+    _get_tenant(db, tenant_id)
+    device = db.scalar(select(Device).where(Device.id == device_id, Device.tenant_id == tenant_id))
+    if device is None:
+        raise ApiError(404, "Device not found", "The requested device does not exist.")
+    secret = secrets.token_urlsafe(32)
+    device.credential_hash = hashlib.sha256(secret.encode()).hexdigest()
+    db.commit()
+    return f"{device.id}.{secret}"
+
+
+def assign_device(
+    db: Session,
+    tenant_id: uuid.UUID,
+    device_id: uuid.UUID,
+    request: DeviceAssignmentCreate,
+) -> DeviceAssignment:
+    device = db.scalar(
+        select(Device)
+        .where(Device.id == device_id, Device.tenant_id == tenant_id)
+        .with_for_update()
+    )
+    if device is None:
+        raise ApiError(404, "Device not found", "The requested device does not exist.")
+    zone = db.scalar(
+        select(Zone).where(
+            Zone.id == request.zone_id,
+            Zone.tenant_id == tenant_id,
+            Zone.store_id == request.store_id,
+        )
+    )
+    if zone is None:
+        raise ApiError(
+            422,
+            "Invalid assignment location",
+            "The zone and store must belong to the requested tenant and to each other.",
+            code="invalid_device_assignment_location",
+        )
+
+    current = db.scalar(
+        select(DeviceAssignment)
+        .where(
+            DeviceAssignment.tenant_id == tenant_id,
+            DeviceAssignment.device_id == device_id,
+            DeviceAssignment.effective_to.is_(None),
+        )
+        .with_for_update()
+    )
+    if (
+        current is not None
+        and current.store_id == request.store_id
+        and current.zone_id == request.zone_id
+    ):
+        if request.effective_from < current.effective_from:
+            previous = db.scalar(
+                select(DeviceAssignment)
+                .where(
+                    DeviceAssignment.tenant_id == tenant_id,
+                    DeviceAssignment.device_id == device_id,
+                    DeviceAssignment.id != current.id,
+                    DeviceAssignment.effective_to.is_not(None),
+                )
+                .order_by(DeviceAssignment.effective_to.desc())
+                .limit(1)
+            )
+            if (
+                previous is not None
+                and previous.effective_to is not None
+                and request.effective_from < previous.effective_to
+            ):
+                raise ApiError(
+                    409,
+                    "Invalid assignment interval",
+                    "The backdated assignment would overlap assignment history.",
+                    code="device_assignment_interval_conflict",
+                )
+            current.effective_from = request.effective_from
+            try:
+                db.commit()
+            except IntegrityError as exc:
+                db.rollback()
+                raise ApiError(
+                    409,
+                    "Device assignment conflict",
+                    "The assignment overlaps existing assignment history.",
+                    code="device_assignment_conflict",
+                ) from exc
+            db.refresh(current)
+        return current
+    if current is not None:
+        if request.effective_from <= current.effective_from:
+            raise ApiError(
+                409,
+                "Invalid assignment interval",
+                "A reassignment must start after the current assignment starts.",
+                code="device_assignment_interval_conflict",
+            )
+        current.effective_to = request.effective_from
+        db.flush()
+
+    assignment = DeviceAssignment(
+        tenant_id=tenant_id,
+        device_id=device_id,
+        store_id=request.store_id,
+        zone_id=request.zone_id,
+        effective_from=request.effective_from,
+    )
+    db.add(assignment)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Device assignment conflict",
+            "The assignment conflicted with another active assignment.",
+            code="device_assignment_conflict",
+        ) from exc
+    db.refresh(assignment)
+    return assignment
+
+
+def list_device_assignments(
+    db: Session,
+    tenant_id: uuid.UUID,
+    device_id: uuid.UUID,
+) -> list[DeviceAssignment]:
+    device_exists = db.scalar(
+        select(Device.id).where(Device.id == device_id, Device.tenant_id == tenant_id)
+    )
+    if device_exists is None:
+        raise ApiError(404, "Device not found", "The requested device does not exist.")
+    return list(
+        db.scalars(
+            select(DeviceAssignment)
+            .where(
+                DeviceAssignment.tenant_id == tenant_id,
+                DeviceAssignment.device_id == device_id,
+            )
+            .order_by(DeviceAssignment.effective_from.desc())
+        ).all()
+    )

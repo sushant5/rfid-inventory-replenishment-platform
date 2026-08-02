@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abacus-rfid-platform"
+version = "0.1.0"
+description = "GreyOrange Engineering take-home: multi-tenant RFID inventory and replenishment API"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "alembic==1.18.5",
+  "email-validator==2.3.0",
+  "fastapi==0.141.1",
+  "psycopg[binary,pool]==3.3.4",
+  "pydantic-settings==2.14.2",
+  "PyJWT==2.13.0",
+  "pwdlib[argon2]==0.3.0",
+  "python-multipart==0.0.32",
+  "sqlalchemy==2.0.51",
+  "structlog==26.1.0",
+  "uvicorn[standard]==0.52.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "mypy==2.3.0",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "pytest-cov==7.1.0",
+  "reportlab==5.0.0",
+  "ruff==0.16.1",
+  "testcontainers[postgres]==4.15.0",
+]
+
+[project.scripts]
+abacus-worker = "abacus.worker:main"
+abacus-cli = "abacus.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "integration: requires a PostgreSQL database",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["abacus"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "S", "ASYNC"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
+mypy_path = "src"

@@ -1,0 +1,30 @@
+{
+  "stores": [
+    {
+      "code": "la01",
+      "name": "Los Angeles 01",
+      "timezone": "America/Los_Angeles",
+      "organization_path": [
+        {"code": "us", "name": "United States", "unit_type": "COUNTRY"},
+        {"code": "west", "name": "West", "unit_type": "REGION"}
+      ],
+      "zones": [
+        {"code": "floor", "name": "Sales Floor", "kind": "SALES_FLOOR"},
+        {"code": "backroom", "name": "Backroom", "kind": "BACKROOM"}
+      ],
+      "devices": [
+        {
+          "serial_number": "ORANGE-LA01-FLOOR",
+          "display_name": "LA01 Floor Reader",
+          "zone_code": "floor"
+        },
+        {
+          "serial_number": "ORANGE-LA01-BACK",
+          "display_name": "LA01 Backroom Reader",
+          "zone_code": "backroom"
+        }
+      ],
+      "configuration": {"rfid_enabled": true}
+    }
+  ]
+}

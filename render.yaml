@@ -1,0 +1,68 @@
+services:
+  - type: web
+    name: abacus-api
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: "off"
+    healthCheckPath: /health/ready
+    preDeployCommand: alembic upgrade head && abacus-cli bootstrap-admin
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: PORT
+        value: "8000"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: abacus-postgres
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PLATFORM_API_KEY
+        generateValue: true
+      - key: BOOTSTRAP_TENANT_CODE
+        value: orange
+      - key: BOOTSTRAP_TENANT_NAME
+        value: Orange
+      - key: BOOTSTRAP_ADMIN_EMAIL
+        value: reviewer@orange.example
+      - key: BOOTSTRAP_ADMIN_DISPLAY_NAME
+        value: Assignment Reviewer
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false
+
+  - type: worker
+    name: abacus-worker
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python -m abacus.worker
+    autoDeployTrigger: "off"
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: abacus-postgres
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PLATFORM_API_KEY
+        generateValue: true
+
+databases:
+  - name: abacus-postgres
+    plan: basic-256mb
+    region: oregon
+    postgresMajorVersion: "17"
+    databaseName: abacus
+    user: abacus
+    diskSizeGB: 5
+    storageAutoscalingEnabled: false
+    ipAllowList: []
