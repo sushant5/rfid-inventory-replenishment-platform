@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import RequestResponseEndpoint
 from structlog.contextvars import bind_contextvars, clear_contextvars
 
+from abacus import __version__
 from abacus.api.errors import install_error_handlers
 from abacus.api.router import api_router
 from abacus.config import get_settings
@@ -29,7 +30,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     application = FastAPI(
         title=settings.app_name,
-        version="0.1.0",
+        version=__version__,
         description="Multi-tenant RFID inventory and replenishment API.",
         lifespan=lifespan,
     )

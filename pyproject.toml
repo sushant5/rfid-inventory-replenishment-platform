@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abacus-rfid-platform"
-version = "0.1.0"
+dynamic = ["version"]
 description = "GreyOrange Engineering take-home: multi-tenant RFID inventory and replenishment API"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -40,6 +40,9 @@ abacus-cli = "abacus.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "abacus.__version__"}
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"

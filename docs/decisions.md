@@ -184,11 +184,12 @@ required.
 
 ### D14. API style
 
-**Decision:** Version REST endpoints under `/v1`, publish OpenAPI/Swagger, use stable
-identifiers, timezone-aware ISO-8601 timestamps, structured problem responses,
-bounded `limit`/`offset` on high-growth domain collections, and idempotency keys for
-retriable commands/imports. Platform store/device/assignment listing pagination is
-deferred and documented.
+**Decision:** Version business/domain REST endpoints under `/v1`; keep operational
+health, version, and documentation endpoints unversioned. Publish OpenAPI/Swagger,
+use stable identifiers, timezone-aware ISO-8601 timestamps, structured problem
+responses, bounded `limit`/`offset` on high-growth domain collections, and idempotency
+keys for retriable commands/imports. Platform store/device/assignment listing
+pagination is deferred and documented.
 
 **Why:** These conventions make reviewer testing and safe client retries predictable.
 

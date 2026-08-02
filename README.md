@@ -16,6 +16,18 @@ volume, replay, or multiple consumers justify operating it.
 > repository yet. Add the tested immutable URL and reviewer credentials only after
 > deployment verification.
 
+## Published API contract
+
+- Product and OpenAPI title: `Abacus RFID Platform`
+- Python distribution: `abacus-rfid-platform`
+- Business API namespace: `/v1`; operational endpoints remain unversioned
+- Application/OpenAPI info version: `0.1.0`; OpenAPI document format: `3.1.0`
+- Authoritative contract: `GET /openapi.json`; interactive view: `GET /docs`
+
+The namespace major version and application release version serve different purposes:
+`/v1` preserves HTTP contract compatibility, while `0.1.0` identifies this submitted
+software release. `GET /version` returns that release plus its deployed `build_sha`.
+
 ## Assignment coverage
 
 The implementation follows the exercise in its original order:
@@ -229,7 +241,8 @@ manual path is:
    credential. Inspect quarantine/progress via the platform observation endpoint.
 8. Query paginated inventory at `GET /v1/tenants/{tenant_id}/inventory`.
 9. With the corporate JWT and an `Idempotency-Key`, import policies; call
-   `/replenishment/evaluations` with a corporate/assigned-manager JWT, then
+   `POST /v1/tenants/{tenant_id}/replenishment/evaluations` with a
+   corporate/assigned-manager JWT, then
    claim the generated task, record the full movement while it is `IN_PROGRESS`,
    submit it for verification, and verify it with an assigned associate JWT.
 

@@ -99,7 +99,7 @@ Future BookInventoryLedger (receipts, sales, transfers, returns, adjustments, sh
     -> Future variance workflow against observed quantity
 ```
 
-Raw observations are not overwritten. Current presence and aggregates are derived views optimized for API reads. Book inventory remains separate because an RFID read does not itself prove a sale, receipt or shrink event.
+Raw observation identity, payload, and event-time evidence are immutable. Replay may advance processing, resolution, and quarantine metadata while preserving that original evidence. Current presence and aggregates are derived views optimized for API reads. Book inventory remains separate because an RFID read does not itself prove a sale, receipt or shrink event.
 
 ### Identity and access
 
@@ -282,15 +282,15 @@ exact physical attribution is required.
 | Area | Representative endpoints | Notes |
 |---|---|---|
 | Authentication | `POST /v1/auth/login`, `GET /v1/auth/me` | Demo login; production direction is OIDC |
-| Users/access | `POST/GET /v1/users`, `POST /v1/users/{id}:suspend`, audit listing | Corporate or assigned-store capability, scoped and audited |
+| Users/access | `POST/GET /v1/users`, `POST /v1/users/{user_id}:suspend`, audit listing | Corporate or assigned-store capability, scoped and audited |
 | Onboarding | `/v1/platform/tenants`, `.../stores:bulk-onboard`, store/device listing | Platform-key integration plane and idempotent atomic batch |
-| Hardware | `.../devices/{id}/assignments`, `.../credentials:rotate` | Effective-dated assignments and one-time key display |
+| Hardware | `.../devices/{device_id}/assignments`, `.../devices/{device_id}/credentials:rotate` | Effective-dated assignments and one-time key display |
 | Catalog | `/v1/tenants/{tenant_id}/catalog/imports`, `/skus` | Staged status/errors and JWT SKU discovery |
 | RFID | `POST /v1/device/read-batches`, platform observation list/replay | Device-authenticated acceptance and remediation |
 | Inventory | `GET /v1/tenants/{tenant_id}/inventory` | Scoped, paginated aggregates with `projection_updated_at` and `last_relevant_observation_at` |
 | Policies | `/v1/tenants/{tenant_id}/replenishment/policies` and bulk import | Effective-dated management |
-| Calculation/tasks | `/replenishment/evaluations`, `/replenishment/tasks` | Explainable scoped task lifecycle |
-| Operations | `GET /health/live`, `GET /health/ready`, `GET /docs`, `GET /openapi.json` | Liveness is process-only; readiness checks dependencies |
+| Calculation/tasks | `/v1/tenants/{tenant_id}/replenishment/evaluations`, `/v1/tenants/{tenant_id}/replenishment/tasks` | Explainable scoped task lifecycle |
+| Operations | `GET /health/live`, `GET /health/ready`, `GET /version`, `GET /docs`, `GET /openapi.json` | Liveness is process-only; readiness checks dependencies |
 
 Common API rules include idempotency keys for retriable commands, structured
 validation/problem responses, timezone-aware timestamps, rejected unknown request

@@ -44,12 +44,12 @@ custom UI are production design options, not features claimed by the submitted d
 :::diagram
 Platform operator -- X-Platform-Key --+
 Orange users ----- Bearer JWT --------+--> FastAPI API --> PostgreSQL 17
-Store readers ---- Device Key --------+         |                ^
+Store readers ---- X-Device-Key ------+         |                ^
                                                 +-- durable jobs -+
                                                               Worker
 :::
 
-The API is stateless and handles validation, authentication, authorization, transactional writes, and query endpoints. The worker leases durable jobs from PostgreSQL and performs catalog promotion, RFID state processing, and targeted replenishment recalculation. PostgreSQL holds canonical tenant, catalog, observation, inventory, identity, policy, task, and job state.
+The API keeps durable business and session state outside the process and handles validation, authentication, authorization, transactional writes, and query endpoints. The bounded demo login throttle is the one process-local exception and must move to a trusted gateway or shared store before horizontal API scaling. The worker leases durable jobs from PostgreSQL and performs catalog promotion, RFID state processing, and targeted replenishment recalculation. PostgreSQL holds canonical tenant, catalog, observation, inventory, identity, policy, task, and job state.
 
 The hosted slice intentionally has few infrastructure dependencies. The database transaction that accepts RFID evidence also creates its durable work item, eliminating a dual-write gap. At larger measured scale, edge aggregation, partitioning, object storage, and regional Kafka cells are introduced incrementally.
 
@@ -224,7 +224,7 @@ Initial presence currently trusts one structurally valid, edge-filtered sighting
 
 ## Storage and Scaling Choices
 
-PostgreSQL is used for the submitted slice because observations and durable jobs can be accepted atomically, while relational constraints and locks protect current state and aggregates. The stateless API and worker can scale independently.
+PostgreSQL is used for the submitted slice because observations and durable jobs can be accepted atomically, while relational constraints and locks protect current state and aggregates. API and worker capacity can scale independently; a multi-instance API also requires moving the demo's login-throttle counters to shared infrastructure.
 
 The first scale steps are stronger edge filtering, larger batches, additional API/worker replicas, connection pooling, time/tenant partitioning, and archival of older raw evidence to object storage. At sustained multi-consumer volume or long replay windows, regional Kafka cells become appropriate. Presence streams would be keyed by tenant and EPC; inventory/replenishment streams would be re-keyed by tenant, store, and SKU.
 
@@ -309,9 +309,12 @@ Only one active task may exist for a tenant/store/SKU. Uniqueness constraints, r
 The submitted provisional lifecycle is:
 
 :::diagram
-OPEN --> CLAIMED --> IN_PROGRESS --> AWAITING_VERIFICATION --> VERIFIED
-                         +------------------> EXCEPTION
-OPEN / CLAIMED ----------+------------------> CANCELLED (manager-authorized)
+OPEN -> CLAIMED -> IN_PROGRESS -> AWAITING_VERIFICATION -> VERIFIED
+OPEN -> CANCELLED | EXCEPTION
+CLAIMED -> OPEN | CANCELLED | EXCEPTION
+IN_PROGRESS -> CANCELLED | EXCEPTION
+AWAITING_VERIFICATION -> IN_PROGRESS | EXCEPTION
+VERIFIED | CANCELLED | EXCEPTION -> terminal
 :::
 
 A claimed task is owned by its claimant. The claimant must first start it as `IN_PROGRESS`, then may record movement while continuing or returning to that state. The full quantity must be recorded before `AWAITING_VERIFICATION`, and `VERIFIED` only confirms it. Store managers and corporate admins can override ownership only to choose `CANCELLED` or `EXCEPTION`; all three outcomes are immutable terminal records. Each confirmed same-store backroom-to-floor EPC transition consumes at most one task unit—executing work first, then the oldest terminal reservation—so one read cannot release a multi-unit reservation. Same-zone and reverse movements consume nothing. Exact production attribution would add `task_id` to the associate EPC-scan workflow.
@@ -329,6 +332,11 @@ The formula, rule hierarchy, verification semantics, exception approvals, pooled
 
 # Testable REST APIs and Reviewer Walkthrough
 
+The OpenAPI title is `Abacus RFID Platform` and the Python distribution is
+`abacus-rfid-platform`. Business endpoints use `/v1`; operational endpoints are
+unversioned. The application/OpenAPI info version is `0.1.0`, the document format is
+OpenAPI `3.1.0`, and `/openapi.json` is the authoritative contract rendered by `/docs`.
+
 ## Authentication Surfaces
 
 | Surface | Credential | Purpose |
@@ -343,14 +351,14 @@ The formula, rule hierarchy, verification semantics, exception approvals, pooled
 |---|---|
 | Operations | `GET /health/live`, `GET /health/ready`, `GET /version`, `GET /docs`, `GET /openapi.json` |
 | Authentication | `POST /v1/auth/login`, `GET /v1/auth/me` |
-| Users | `POST/GET /v1/users`, `GET /v1/users/{id}`, `POST /v1/users/{id}:suspend`, audit listing |
-| Onboarding | `POST /v1/platform/tenants`, `POST .../stores:bulk-onboard`, store/device listing |
-| Hardware | Device credential rotation, assignment creation, assignment history |
-| Catalog | `POST/GET .../catalog/imports`, import status/errors, `GET .../catalog/skus` |
-| RFID | `POST /v1/device/read-batches`, platform observation listing and replay |
+| Users | `POST/GET /v1/users`, `GET /v1/users/{user_id}`, `POST /v1/users/{user_id}:suspend`, `GET /v1/users/audit-records` |
+| Onboarding | `POST /v1/platform/tenants`, `GET /v1/platform/tenants/{tenant_id}/stores`, `POST /v1/platform/tenants/{tenant_id}/stores:bulk-onboard` |
+| Hardware | `GET /v1/platform/tenants/{tenant_id}/devices`, assignment history/creation, and `POST .../credentials:rotate` |
+| Catalog | `POST/GET /v1/tenants/{tenant_id}/catalog/imports`, import status/errors, `GET /v1/tenants/{tenant_id}/catalog/skus` |
+| RFID | `POST /v1/device/read-batches`, `GET /v1/platform/tenants/{tenant_id}/rfid/observations`, and `POST .../{observation_id}:replay` |
 | Inventory | `GET /v1/tenants/{tenant_id}/inventory` |
-| Policies | Policy CRUD, `POST .../policies:bulk-upsert`, import status |
-| Replenishment | `POST/GET .../evaluations`, `GET/PATCH .../tasks` |
+| Policies | CRUD under `/v1/tenants/{tenant_id}/replenishment/policies`, `POST .../policies:bulk-upsert`, import status |
+| Replenishment | `POST /v1/tenants/{tenant_id}/replenishment/evaluations`, `GET .../evaluations/{run_id}`, `GET/PATCH .../tasks` |
 
 ## Reviewer Happy Path
 
@@ -384,7 +392,7 @@ The intended release procedure is:
 2. Run formatting, lint, strict type checking, PostgreSQL integration tests, coverage, migration drift checks, and the container build.
 3. Apply the Render Blueprint and set the bootstrap administrator password.
 4. Exercise the complete reviewer path and negative authorization tests against the hosted service.
-5. Confirm `/version` matches the repository SHA/tag.
+5. Confirm `/version.build_sha` matches the commit referenced by the submission tag.
 6. Insert the verified links and credentials into this document.
 7. Disable automatic deployment and keep the paid services healthy through the review window.
 
@@ -467,7 +475,7 @@ Kafka provides partitioned ordering, replay, and independent consumers. Regional
 The repository contains automated coverage for tenant/store onboarding, catalog validation and promotion, authenticated RFID ingestion, duplicate/conflict handling, late-event non-regression, quarantine/replay, store-scoped authorization, policy precedence, explainable calculation, task lifecycle, and concurrency controls. An assignment-sized test provisions 100 stores and 200 readers.
 
 Local release verification on August 2, 2026 passed all 59 tests against PostgreSQL
-17.10 with 83.15% total coverage, including branch measurement. Ruff lint/format, strict mypy, and Alembic migration
+17.10 with 83.16% total coverage, including branch measurement. Ruff lint/format, strict mypy, and Alembic migration
 drift checks also passed. The one-command reviewer runner completed the full path twice
 against a clean local API, worker, and database, including a safe idempotent rerun.
 

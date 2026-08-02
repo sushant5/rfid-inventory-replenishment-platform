@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from abacus import API_TITLE
+
 
 class Settings(BaseSettings):
     """Runtime configuration loaded from environment variables."""
@@ -15,7 +17,7 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    app_name: str = "Abacus RFID Platform"
+    app_name: str = API_TITLE
     app_env: Literal["development", "test", "production"] = "development"
     database_url: str = "postgresql+psycopg://abacus:abacus@localhost:5432/abacus"
     jwt_secret: str = Field(
