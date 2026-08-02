@@ -68,3 +68,11 @@ def test_openapi_contains_the_frozen_reviewer_demo_path() -> None:
     }
     assert paths["/v1/platform/tenants"]["post"]["security"] == [{"PlatformApiKey": []}]
     assert paths["/v1/device/read-batches"]["post"]["security"] == [{"DeviceApiKey": []}]
+
+    inventory_properties = schema["components"]["schemas"]["InventoryBalanceRead"]["properties"]
+    assert "as_of" not in inventory_properties
+    assert "projection_updated_at" in inventory_properties
+    assert "last_relevant_observation_at" in inventory_properties
+
+    observation_properties = schema["components"]["schemas"]["RfidObservationRead"]["properties"]
+    assert observation_properties["acceptance_sequence"]["type"] == "integer"

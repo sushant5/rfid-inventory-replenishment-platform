@@ -3,6 +3,11 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from functools import lru_cache
+from hashlib import sha256
+from math import ceil
+from threading import Lock
+from time import monotonic
 from typing import Annotated, Any
 
 import jwt
@@ -111,6 +116,227 @@ class AccessTokenClaims:
     tenant_id: uuid.UUID
     token_version: int
     expires_at: datetime
+
+
+@dataclass(slots=True)
+class _LoginAttemptWindow:
+    started_at: float
+    attempts: int = 0
+
+
+@dataclass(slots=True)
+class LoginAttemptReservation:
+    _ip_key: tuple[str, str]
+    _account_key: tuple[str, str]
+    _ip_window: _LoginAttemptWindow
+    _account_window: _LoginAttemptWindow
+    _finalized: bool = False
+
+
+class LoginAttemptOutcome(StrEnum):
+    SUCCESS = "SUCCESS"
+    AUTHENTICATION_FAILED = "AUTHENTICATION_FAILED"
+    ABORTED = "ABORTED"
+
+
+@dataclass(frozen=True, slots=True)
+class LoginThrottleDecision:
+    reservation: LoginAttemptReservation | None = None
+    retry_after: int | None = None
+
+
+class LoginThrottle:
+    """Bounded, process-local fixed-window login throttling.
+
+    An in-flight attempt reserves both budgets. Every completed authentication attempt
+    remains in the source-IP budget, while only failed authentication remains in the
+    normalized tenant/account budget. Reserving both counters under one lock prevents
+    concurrent requests from exceeding either limit in this single-service demo.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        window_seconds: int,
+        ip_limit: int,
+        account_limit: int,
+        max_entries: int,
+        clock: Callable[[], float] = monotonic,
+    ) -> None:
+        if window_seconds < 1 or ip_limit < 1 or account_limit < 1 or max_entries < 2:
+            raise ValueError("Login throttle limits must be positive and max_entries at least 2")
+        self.enabled = enabled
+        self.window_seconds = window_seconds
+        self.ip_limit = ip_limit
+        self.account_limit = account_limit
+        self.max_entries = max_entries
+        self._clock = clock
+        self._entries: dict[tuple[str, str], _LoginAttemptWindow] = {}
+        self._lock = Lock()
+
+    @property
+    def entry_count(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    @staticmethod
+    def _ip_key(source_ip: str) -> tuple[str, str]:
+        return "ip", source_ip.strip().lower() or "unknown"
+
+    @staticmethod
+    def _account_key(tenant_code: str, email: str) -> tuple[str, str]:
+        normalized_account = f"{tenant_code.strip().lower()}\0{email.strip().lower()}"
+        return "account", sha256(normalized_account.encode(), usedforsecurity=False).hexdigest()
+
+    def _active_window(
+        self,
+        key: tuple[str, str],
+        now: float,
+    ) -> _LoginAttemptWindow | None:
+        window = self._entries.get(key)
+        if window is None:
+            return None
+        if now - window.started_at >= self.window_seconds:
+            del self._entries[key]
+            return None
+        return window
+
+    def _new_window(self, key: tuple[str, str], now: float) -> _LoginAttemptWindow:
+        window = _LoginAttemptWindow(started_at=now)
+        self._entries[key] = window
+        return window
+
+    def _remove_expired_windows(self, now: float) -> None:
+        expired_keys = [
+            key
+            for key, window in self._entries.items()
+            if now - window.started_at >= self.window_seconds
+        ]
+        for key in expired_keys:
+            del self._entries[key]
+
+    def _capacity_retry_after(self, now: float) -> int:
+        remaining = [
+            self.window_seconds - (now - window.started_at) for window in self._entries.values()
+        ]
+        return max(1, ceil(min(remaining, default=self.window_seconds)))
+
+    def begin_attempt(
+        self,
+        *,
+        source_ip: str,
+        tenant_code: str,
+        email: str,
+    ) -> LoginThrottleDecision:
+        """Atomically reserve an attempt, or return a Retry-After decision."""
+
+        if not self.enabled:
+            return LoginThrottleDecision()
+
+        ip_key = self._ip_key(source_ip)
+        account_key = self._account_key(tenant_code, email)
+        now = self._clock()
+        with self._lock:
+            ip_window = self._active_window(ip_key, now)
+            account_window = self._active_window(account_key, now)
+            retry_after = [
+                self.window_seconds - (now - window.started_at)
+                for window, limit in (
+                    (ip_window, self.ip_limit),
+                    (account_window, self.account_limit),
+                )
+                if window is not None and window.attempts >= limit
+            ]
+            if retry_after:
+                return LoginThrottleDecision(retry_after=max(1, ceil(max(retry_after))))
+
+            required_entries = int(ip_window is None) + int(account_window is None)
+            if len(self._entries) + required_entries > self.max_entries:
+                self._remove_expired_windows(now)
+                ip_window = self._active_window(ip_key, now)
+                account_window = self._active_window(account_key, now)
+                required_entries = int(ip_window is None) + int(account_window is None)
+                if len(self._entries) + required_entries > self.max_entries:
+                    return LoginThrottleDecision(retry_after=self._capacity_retry_after(now))
+
+            if ip_window is None:
+                ip_window = self._new_window(ip_key, now)
+            if account_window is None:
+                account_window = self._new_window(account_key, now)
+            ip_window.attempts += 1
+            account_window.attempts += 1
+            reservation = LoginAttemptReservation(
+                _ip_key=ip_key,
+                _account_key=account_key,
+                _ip_window=ip_window,
+                _account_window=account_window,
+            )
+        return LoginThrottleDecision(reservation=reservation)
+
+    def finish_attempt(
+        self,
+        reservation: LoginAttemptReservation | None,
+        *,
+        outcome: LoginAttemptOutcome,
+    ) -> None:
+        """Finalize exactly one reservation according to the authentication outcome."""
+
+        if reservation is None:
+            return
+        with self._lock:
+            if reservation._finalized:
+                return
+            reservation._finalized = True
+            retained_keys: set[tuple[str, str]] = set()
+            if outcome in {
+                LoginAttemptOutcome.SUCCESS,
+                LoginAttemptOutcome.AUTHENTICATION_FAILED,
+            }:
+                retained_keys.add(reservation._ip_key)
+            if outcome is LoginAttemptOutcome.AUTHENTICATION_FAILED:
+                retained_keys.add(reservation._account_key)
+            for key, window in (
+                (reservation._ip_key, reservation._ip_window),
+                (reservation._account_key, reservation._account_window),
+            ):
+                if key in retained_keys:
+                    continue
+                if self._entries.get(key) is not window:
+                    continue
+                window.attempts -= 1
+                if window.attempts == 0:
+                    del self._entries[key]
+
+
+@lru_cache(maxsize=16)
+def _configured_login_throttle(
+    enabled: bool,
+    window_seconds: int,
+    ip_limit: int,
+    account_limit: int,
+    max_entries: int,
+) -> LoginThrottle:
+    return LoginThrottle(
+        enabled=enabled,
+        window_seconds=window_seconds,
+        ip_limit=ip_limit,
+        account_limit=account_limit,
+        max_entries=max_entries,
+    )
+
+
+def get_login_throttle(settings: SettingsDependency) -> LoginThrottle:
+    return _configured_login_throttle(
+        settings.login_throttle_enabled,
+        settings.login_throttle_window_seconds,
+        settings.login_throttle_ip_limit,
+        settings.login_throttle_account_limit,
+        settings.login_throttle_max_entries,
+    )
+
+
+LoginThrottleDependency = Annotated[LoginThrottle, Depends(get_login_throttle)]
 
 
 _password_hash = PasswordHash((Argon2Hasher(),))

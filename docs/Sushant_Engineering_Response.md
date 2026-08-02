@@ -16,7 +16,7 @@ The submitted vertical slice uses Python, FastAPI, PostgreSQL 17, SQLAlchemy, Al
 The design prioritizes tenant isolation, safe retries, transactional consistency, effective-dated hardware and EPC mappings, retained RFID evidence, at-least-once processing with idempotent effects, and explainable replenishment decisions. The implementation addresses the required 100-store scenario. A regional Kafka architecture is a future scale path when measured traffic, replay requirements, or multiple consumers justify its operational cost.
 
 :::callout
-Release candidate repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home` (private). The tested code is frozen under tag `submission-code-v1`; reviewer access and the hosted API URL still require account-level release steps before this document is sent to the recruiter.
+Release candidate repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home` (private). The tested code is frozen under tag `submission-code-v2`; reviewer access and the hosted API URL still require account-level release steps before this document is sent to the recruiter.
 :::
 
 ## Submitted Demo Scope
@@ -24,12 +24,16 @@ Release candidate repository: `https://github.com/sushant5/greyorange-abacus-eng
 The reviewer-facing demo intentionally proves one complete business path:
 
 - onboard Orange and all 100 stores through an idempotent bulk operation;
-- create corporate and store-scoped users and enforce tenant/store authorization;
+- create corporate and store-scoped users and verify their expected roles;
 - import a representative product, SKU, UPC, and EPC catalog;
 - accept simulated device-authenticated RFID batches through a durable worker;
-- handle duplicate, conflicting, late, future-dated, and unmapped observations safely;
+- project valid RFID evidence into current inventory;
 - query current inventory by store, zone, and SKU; and
-- create a replenishment policy, evaluate it, and create and claim one deduplicated task; the complete guarded lifecycle is covered by integration tests.
+- create a replenishment policy, evaluate it, and complete one deduplicated task through guarded movement and verification.
+
+The PostgreSQL-backed automated tests, rather than the happy-path runner, prove
+cross-tenant/store denial and duplicate, conflicting, late, future-dated, unmapped,
+quarantine, and replay behavior.
 
 Kafka/SQS, physical edge software, X.509/mTLS, enterprise OIDC/SCIM, object-storage
 imports, calibrated confidence scoring, book-inventory variance, regional cells, and a
@@ -192,9 +196,9 @@ The guarantee is at-least-once processing with idempotent business effects. Exac
 
 ## Event and Inventory Model
 
-- `RfidObservation` retains event/batch identity, device, EPC, observation/ingestion times, resolved store/zone, antenna port, RSSI, payload hash, raw payload, and processing status.
+- `RfidObservation` retains event/batch identity, a database-issued acceptance sequence, device, EPC, observation/ingestion times, resolved store/zone, antenna port, RSSI, payload hash, raw payload, and processing status. Reader sequence is device-local diagnostic evidence, not a cross-reader ordering key.
 - `InventoryItemState` stores the latest confirmed location for each tenant/EPC, candidate movement evidence, confidence, and last event time.
-- `InventoryBalance` provides query-optimized quantities by tenant, store, zone, and SKU.
+- `InventoryBalance` provides query-optimized quantities by tenant, store, zone, and SKU, with separate projection-update time and latest relevant observation-event time.
 - `InventoryChange` records each confirmed transition for audit and targeted downstream processing.
 - `DurableJob` provides restart-safe asynchronous work.
 
@@ -205,6 +209,12 @@ RFID observations are evidence, not automatically a sale, receipt, transfer, ret
 - Same event ID and same payload: return a duplicate disposition without another business effect.
 - Same event ID and different payload: return an explicit conflict for investigation.
 - Late event: retain it for audit, but do not allow it to regress newer current state.
+- Conflicting store/zone reads for one EPC and event time: serialize acceptance by
+  tenant/EPC, treat the lowest durable database acceptance sequence among
+  non-quarantined observations as canonical, and quarantine later conflicting
+  locations independent of application clocks or worker lease order.
+- Same-location read at the current event time: process it as a no-op; it does not
+  advance candidate evidence or count as a second movement confirmation.
 - Excessive future timestamp: quarantine it so a bad clock cannot poison event-time state.
 - Unknown EPC or missing effective device assignment: quarantine with a reason and permit replay after correction.
 - Possible cross-zone movement: require configurable consecutive evidence within a bounded window.
@@ -236,7 +246,7 @@ I separate authentication (who the principal is) from authorization (what that p
 
 The first Orange corporate administrator is created through a trusted deployment/bootstrap command. Authorized users can then create managers and associates through the REST API. A user belongs to one tenant, and normalized email addresses are unique within that tenant.
 
-For reproducible reviewer testing, passwords are stored as Argon2id hashes. Login requires the Orange tenant code, email, and password and returns a short-lived JWT. The token contains identity and a version, but persisted grants remain the authorization truth. On each request the API validates the token, confirms the tenant/user are active, and reloads current roles and store grants. Suspending a user increments the token version and invalidates existing tokens.
+For reproducible reviewer testing, passwords are stored as Argon2id hashes. Login requires the Orange tenant code, email, and password and returns a short-lived JWT. A bounded process-local throttle limits all attempts per direct client IP and failed attempts per normalized tenant/account; a multi-instance deployment would move that state to a trusted gateway or shared store. The token contains identity and a version, but persisted grants remain the authorization truth. On each request the API validates the token, confirms the tenant/user are active, and reloads current roles and store grants. Suspending a user increments the token version and invalidates existing tokens.
 
 Production should integrate Orange's OIDC/SSO provider, MFA, and optionally SCIM provisioning while retaining the same server-side resource authorization model.
 
@@ -249,7 +259,7 @@ Production should integrate Orange's OIDC/SSO provider, MFA, and optionally SCIM
 
 A user can hold multiple store grants. Protected endpoints verify the required operation, verified tenant, and persisted store scope. A URL/body tenant identifier is never accepted as authorization on its own. Cross-tenant and unassigned-store access is rejected without exposing another tenant's data.
 
-The implementation retains tenant-scoped records for login attempts, user creation, and suspension. Invitations, password reset, grant-editing/resume workflows, richer corporate roles, distributed login throttling, and broader action auditing are production extensions.
+The implementation applies a bounded process-local throttle to all attempts by client IP and to failed attempts by normalized tenant/account. The Render service explicitly trusts its sole ingress proxy; portable/direct deployments retain Uvicorn's restrictive proxy default. It also retains tenant-scoped audit records for user creation and suspension. Invitations, password reset, grant-editing/resume workflows, richer corporate roles, distributed login throttling, and broader action auditing are production extensions.
 
 ## Implemented REST APIs
 
@@ -304,7 +314,9 @@ OPEN --> CLAIMED --> IN_PROGRESS --> AWAITING_VERIFICATION --> VERIFIED
 OPEN / CLAIMED ----------+------------------> CANCELLED (manager-authorized)
 :::
 
-A claimed task is owned by its claimant. Moved quantity cannot decrease or exceed the requested amount, and verification requires the full amount to be recorded as moved. Confirmed RFID inventory changes enqueue targeted store/SKU recalculation. Policy changes use an explicit evaluation API in the submitted slice; automatic estate-wide policy fan-out is future work.
+A claimed task is owned by its claimant. The claimant must first start it as `IN_PROGRESS`, then may record movement while continuing or returning to that state. The full quantity must be recorded before `AWAITING_VERIFICATION`, and `VERIFIED` only confirms it. Store managers and corporate admins can override ownership only to choose `CANCELLED` or `EXCEPTION`; all three outcomes are immutable terminal records. Each confirmed same-store backroom-to-floor EPC transition consumes at most one task unit—executing work first, then the oldest terminal reservation—so one read cannot release a multi-unit reservation. Same-zone and reverse movements consume nothing. Exact production attribution would add `task_id` to the associate EPC-scan workflow.
+
+Confirmed RFID inventory changes enqueue targeted store/SKU recalculation. Policy changes use an explicit evaluation API in the submitted slice; automatic estate-wide policy fan-out is future work.
 
 The formula, rule hierarchy, verification semantics, exception approvals, pooled style/category allocation, and SLAs are provisional because Orange did not provide those business rules. They require confirmation before production.
 
@@ -353,7 +365,7 @@ The formula, rule hierarchy, verification semantics, exception approvals, pooled
 9. Repeat representative requests to demonstrate idempotency and negative authorization.
 
 :::callout
-Repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home` at tag `submission-code-v1`. Before submission, verify reviewer access and add the hosted base URL, Swagger/OpenAPI/version URLs, and dedicated reviewer credentials. Keep the platform integration key in the private recruiter email, never in the repository.
+Repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home` at tag `submission-code-v2`. Before submission, verify reviewer access and add the hosted base URL, Swagger/OpenAPI/version URLs, and dedicated reviewer credentials. Keep the platform integration key in the private recruiter email, never in the repository.
 :::
 
 # Deployment and Operations
@@ -361,6 +373,10 @@ Repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home
 The deployment Blueprint defines a paid Render web service, paid worker, and managed PostgreSQL 17 database in the same region. Paid instances are recommended for an immutable take-home link because sleeping services, worker unavailability, and database expiry create reviewer risk.
 
 Migrations run before traffic. Secrets come from the hosting secret store. `/health/live` checks the process, `/health/ready` checks database connectivity and schema readiness, and `/version` identifies the release. Automatic deployment is disabled so the submitted commit remains fixed.
+
+A populated upgrade to durable RFID/task attribution is fail-closed: stop the old API
+and worker, migrate, reconcile each flagged legacy movement through the audited CLI,
+then restart only after readiness passes. Clean deployments have no flagged rows.
 
 The intended release procedure is:
 
@@ -426,7 +442,7 @@ Kafka provides partitioned ordering, replay, and independent consumers. Regional
 ## Principal Risks and Mitigations
 
 - Tenant leakage: server-derived tenant/store scopes, negative authorization tests, and future RLS/composite tenant keys.
-- Noisy or missing reads: edge filtering, retained RSSI/evidence, movement hysteresis, freshness metadata, and no absence inference from one missing read.
+- Noisy or missing reads: edge filtering, retained RSSI/evidence, movement hysteresis, distinct projection/observation freshness timestamps, and no absence inference from one missing read.
 - Late/duplicate events: stable event IDs, payload fingerprints, observation time, idempotent effects, and non-regressing current state.
 - Bad product mappings: staged validation, row evidence, reconciliation, effective-dated bindings, quarantine, and replay.
 - Reviewer availability: paid hosting, health/version endpoints, fixed commit, backups, and a Docker Compose fallback.
@@ -450,12 +466,12 @@ Kafka provides partitioned ordering, replay, and independent consumers. Regional
 
 The repository contains automated coverage for tenant/store onboarding, catalog validation and promotion, authenticated RFID ingestion, duplicate/conflict handling, late-event non-regression, quarantine/replay, store-scoped authorization, policy precedence, explainable calculation, task lifecycle, and concurrency controls. An assignment-sized test provisions 100 stores and 200 readers.
 
-Local release verification on August 2, 2026 passed all 50 tests against PostgreSQL
-17.10 with 82.38% total coverage, including branch measurement. Ruff lint/format, strict mypy, and Alembic migration
+Local release verification on August 2, 2026 passed all 59 tests against PostgreSQL
+17.10 with 83.15% total coverage, including branch measurement. Ruff lint/format, strict mypy, and Alembic migration
 drift checks also passed. The one-command reviewer runner completed the full path twice
 against a clean local API, worker, and database, including a safe idempotent rerun.
 
-The code release is tagged `submission-code-v1`. Before recruiter submission, add the
+The code release is tagged `submission-code-v2`. Before recruiter submission, add the
 hosted URL and matching `/version` value after rerunning the same verifier against the
 deployed build.
 

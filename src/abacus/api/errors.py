@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -26,6 +27,7 @@ class ApiError(Exception):
         *,
         code: str | None = None,
         errors: list[dict[str, Any]] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(detail)
         self.status_code = status_code
@@ -33,6 +35,7 @@ class ApiError(Exception):
         self.detail = detail
         self.code = code
         self.errors = errors
+        self.headers = dict(headers) if headers is not None else None
 
 
 def install_error_handlers(app: FastAPI) -> None:
@@ -50,6 +53,7 @@ def install_error_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             content=problem.model_dump(exclude_none=True),
             media_type="application/problem+json",
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)

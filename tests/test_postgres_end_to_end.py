@@ -8,17 +8,23 @@ import pytest
 from fastapi.testclient import TestClient
 from httpx import Response
 from scripts.generate_store_batch import build_store_batch
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from abacus.enums import JobKind, JobStatus, ObservationStatus, TenantStatus, ZoneKind
 from abacus.models.catalog import CatalogImport, EpcBinding, Sku
 from abacus.models.identity import IdentityRole
 from abacus.models.jobs import DurableJob
-from abacus.models.rfid import InventoryBalance, InventoryItemState, RfidObservation
+from abacus.models.rfid import (
+    InventoryBalance,
+    InventoryChange,
+    InventoryItemState,
+    RfidObservation,
+)
 from abacus.models.tenancy import DeviceAssignment, Tenant, Zone
 from abacus.schemas.identity import RoleAssignmentCreate, UserCreate
 from abacus.schemas.tenancy import TenantCreate
+from abacus.services.cutover import ReservationCutoverPending
 from abacus.services.identity import bootstrap_corporate_admin
 from abacus.services.jobs import claim_jobs, mark_completed, mark_failed
 from abacus.worker import _dispatch
@@ -136,6 +142,53 @@ def _drain_jobs(
     pytest.fail(f"worker queue did not drain after {maximum_jobs} jobs")
 
 
+def _dispatch_rfid_jobs_in_event_order(
+    session_factory: sessionmaker[Session],
+    event_ids: list[str],
+) -> None:
+    """Process selected RFID jobs in an explicit order using real job leases."""
+
+    with session_factory() as db:
+        observation_ids = dict(
+            db.execute(
+                select(RfidObservation.event_id, RfidObservation.id).where(
+                    RfidObservation.event_id.in_(event_ids)
+                )
+            ).all()
+        )
+    assert set(observation_ids) == set(event_ids)
+
+    for event_id in event_ids:
+        worker_id = f"pytest-ordered-{uuid.uuid4()}"
+        observation_id = observation_ids[event_id]
+        with session_factory() as claim_session:
+            pending_jobs = list(
+                claim_session.scalars(
+                    select(DurableJob).where(
+                        DurableJob.kind == JobKind.RFID_OBSERVATION,
+                        DurableJob.status == JobStatus.PENDING,
+                    )
+                ).all()
+            )
+            job = next(
+                candidate
+                for candidate in pending_jobs
+                if candidate.payload.get("observation_id") == str(observation_id)
+            )
+            job.status = JobStatus.PROCESSING
+            job.locked_by = worker_id
+            job.lease_expires_at = datetime.now(UTC) + timedelta(seconds=30)
+            job.attempts += 1
+            claim_session.commit()
+            job_id = job.id
+
+        with session_factory() as processing_session:
+            job = processing_session.get(DurableJob, job_id)
+            assert job is not None
+            _dispatch(processing_session, job)
+            assert mark_completed(processing_session, job.id, worker_id)
+
+
 def _store_payload(
     code: str,
     name: str,
@@ -242,6 +295,16 @@ def test_postgres_end_to_end(
     client = api_client
 
     assert _expect(client.get("/health/live"), 200) == {"status": "ok"}
+    assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
+    with postgres_session_factory() as db:
+        db.execute(text("UPDATE alembic_version SET version_num = 'c421c8a25f4e'"))
+        db.commit()
+    stale_schema_health = client.get("/health/ready")
+    assert stale_schema_health.status_code == 503
+    assert stale_schema_health.json()["code"] == "schema_not_ready"
+    with postgres_session_factory() as db:
+        db.execute(text("UPDATE alembic_version SET version_num = 'b6e3f19a2d44'"))
+        db.commit()
     assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
     version = _expect(client.get("/version"), 200)
     assert isinstance(version, dict)
@@ -784,6 +847,188 @@ def test_postgres_end_to_end(
     assert isinstance(quarantine_page, dict)
     assert quarantine_page["total"] == 2
 
+    # Equal-time evidence at the same confirmed location is a processed no-op:
+    # it cannot masquerade as a second temporal movement confirmation.
+    same_location_equal_time_event = str(uuid.uuid4())
+    _ingest(
+        client,
+        floor_device_key,
+        event_id=same_location_equal_time_event,
+        epc=KNOWN_EPCS[3],
+        observed_at=base_time + timedelta(seconds=3),
+        batch_id="same-location-equal-time",
+    )
+    _drain_jobs(postgres_session_factory)
+    with postgres_session_factory() as db:
+        equal_time_row = db.scalar(
+            select(RfidObservation).where(
+                RfidObservation.event_id == same_location_equal_time_event
+            )
+        )
+        equal_time_state = db.scalar(
+            select(InventoryItemState).where(InventoryItemState.epc == KNOWN_EPCS[3])
+        )
+        assert equal_time_row is not None
+        assert equal_time_row.status is ObservationStatus.PROCESSED
+        assert equal_time_state is not None
+        assert equal_time_state.last_event_id == initial_events[3][0]
+        assert equal_time_state.candidate_count == 0
+
+    # Start an identical movement candidate for two EPCs. At the next event time,
+    # accept floor evidence before conflicting backroom evidence. One scenario runs
+    # the jobs in reverse order; the other processes the floor event before the
+    # conflict is ingested. Acceptance precedence must produce the same result.
+    ambiguity_scenarios: list[dict[str, object]] = []
+    for index, epc in enumerate(KNOWN_EPCS[1:3], start=1):
+        candidate_event_id = str(uuid.uuid4())
+        candidate_time = base_time + timedelta(seconds=7 + index * 4)
+        _ingest(
+            client,
+            floor_device_key,
+            event_id=candidate_event_id,
+            epc=epc,
+            observed_at=candidate_time,
+            batch_id=f"ambiguity-candidate-{index}",
+        )
+        ambiguity_scenarios.append(
+            {
+                "epc": epc,
+                "candidate_event_id": candidate_event_id,
+                "candidate_time": candidate_time,
+                "conflict_time": candidate_time + timedelta(seconds=1),
+            }
+        )
+    _drain_jobs(postgres_session_factory)
+
+    repeated_candidate = ambiguity_scenarios[0]
+    repeated_candidate_time = repeated_candidate["candidate_time"]
+    assert isinstance(repeated_candidate_time, datetime)
+    repeated_candidate_event_id = str(uuid.uuid4())
+    _ingest(
+        client,
+        floor_device_key,
+        event_id=repeated_candidate_event_id,
+        epc=str(repeated_candidate["epc"]),
+        observed_at=repeated_candidate_time,
+        batch_id="same-candidate-equal-time",
+    )
+    _drain_jobs(postgres_session_factory)
+    with postgres_session_factory() as db:
+        repeated_candidate_row = db.scalar(
+            select(RfidObservation).where(RfidObservation.event_id == repeated_candidate_event_id)
+        )
+        repeated_candidate_state = db.scalar(
+            select(InventoryItemState).where(
+                InventoryItemState.epc == str(repeated_candidate["epc"])
+            )
+        )
+        assert repeated_candidate_row is not None
+        assert repeated_candidate_row.status is ObservationStatus.PROCESSED
+        assert repeated_candidate_state is not None
+        assert repeated_candidate_state.candidate_count == 1
+        assert repeated_candidate_state.last_event_id == repeated_candidate["candidate_event_id"]
+
+    for scenario_index, scenario in enumerate(ambiguity_scenarios):
+        epc = str(scenario["epc"])
+        conflict_time = scenario["conflict_time"]
+        assert isinstance(conflict_time, datetime)
+        floor_event_id = str(uuid.uuid4())
+        backroom_event_id = str(uuid.uuid4())
+        _ingest(
+            client,
+            floor_device_key,
+            event_id=floor_event_id,
+            epc=epc,
+            observed_at=conflict_time,
+            batch_id=f"ambiguous-floor-{scenario_index}",
+        )
+        if scenario_index == 1:
+            _dispatch_rfid_jobs_in_event_order(postgres_session_factory, [floor_event_id])
+        _ingest(
+            client,
+            back_device_key,
+            event_id=backroom_event_id,
+            epc=epc,
+            observed_at=conflict_time,
+            batch_id=f"ambiguous-backroom-{scenario_index}",
+        )
+        scenario["canonical_event_id"] = floor_event_id
+        scenario["conflicting_event_id"] = backroom_event_id
+        ordered_event_ids = (
+            [backroom_event_id, floor_event_id] if scenario_index == 0 else [backroom_event_id]
+        )
+        _dispatch_rfid_jobs_in_event_order(postgres_session_factory, ordered_event_ids)
+
+    with postgres_session_factory() as db:
+        for scenario in ambiguity_scenarios:
+            canonical_event_id = str(scenario["canonical_event_id"])
+            conflicting_event_id = str(scenario["conflicting_event_id"])
+            canonical_row = db.scalar(
+                select(RfidObservation).where(RfidObservation.event_id == canonical_event_id)
+            )
+            conflicting_row = db.scalar(
+                select(RfidObservation).where(RfidObservation.event_id == conflicting_event_id)
+            )
+            assert canonical_row is not None
+            assert canonical_row.status is ObservationStatus.PROCESSED
+            assert conflicting_row is not None
+            assert conflicting_row.status is ObservationStatus.QUARANTINED
+            assert conflicting_row.quarantine_reason == "AMBIGUOUS_SAME_TIMESTAMP_LOCATION"
+            assert canonical_row.acceptance_sequence < conflicting_row.acceptance_sequence
+
+            candidate_state = db.scalar(
+                select(InventoryItemState).where(InventoryItemState.epc == str(scenario["epc"]))
+            )
+            assert candidate_state is not None
+            assert candidate_state.store_id == uuid.UUID(store_1_id)
+            assert candidate_state.zone_id == floor_zone_id
+            assert candidate_state.candidate_zone_id is None
+            assert candidate_state.candidate_count == 0
+            assert candidate_state.last_event_id == canonical_event_id
+            assert candidate_state.last_observed_at == scenario["conflict_time"]
+
+        balances = list(
+            db.scalars(
+                select(InventoryBalance).where(
+                    InventoryBalance.store_id == uuid.UUID(store_1_id),
+                    InventoryBalance.sku_id == uuid.UUID(sku_id),
+                )
+            ).all()
+        )
+        assert {balance.zone_id: balance.quantity for balance in balances} == {
+            backroom_zone_id: 1,
+            floor_zone_id: 3,
+        }
+
+    # Restore both test EPCs to their starting zone so the remaining assignment
+    # scenario keeps its original inventory inputs.
+    for scenario_index, scenario in enumerate(ambiguity_scenarios):
+        conflict_time = scenario["conflict_time"]
+        assert isinstance(conflict_time, datetime)
+        for read_index in range(1, 3):
+            _ingest(
+                client,
+                back_device_key,
+                event_id=str(uuid.uuid4()),
+                epc=str(scenario["epc"]),
+                observed_at=conflict_time + timedelta(seconds=read_index),
+                batch_id=f"ambiguity-restore-{scenario_index}-{read_index}",
+            )
+    _drain_jobs(postgres_session_factory)
+    with postgres_session_factory() as db:
+        balances = list(
+            db.scalars(
+                select(InventoryBalance).where(
+                    InventoryBalance.store_id == uuid.UUID(store_1_id),
+                    InventoryBalance.sku_id == uuid.UUID(sku_id),
+                )
+            ).all()
+        )
+        assert {balance.zone_id: balance.quantity for balance in balances} == {
+            backroom_zone_id: 3,
+            floor_zone_id: 1,
+        }
+
     # A single cross-zone read is noisy evidence; the second confirms the move.
     moving_epc = KNOWN_EPCS[0]
     first_move_event = str(uuid.uuid4())
@@ -881,6 +1126,14 @@ def test_postgres_end_to_end(
     )
     assert isinstance(inventory, dict)
     assert inventory["total"] == 2
+    for item in inventory["items"]:
+        assert "as_of" not in item
+        assert isinstance(item["projection_updated_at"], str)
+        assert isinstance(item["last_relevant_observation_at"], str)
+        datetime.fromisoformat(item["projection_updated_at"])
+        assert datetime.fromisoformat(item["last_relevant_observation_at"]) == (
+            base_time + timedelta(seconds=31)
+        )
     quantities = {str(item["zone_kind"]): int(item["quantity"]) for item in inventory["items"]}
     assert quantities == {"BACKROOM": 3, "SALES_FLOOR": 2}
     first_inventory_page = _expect(
@@ -1140,6 +1393,58 @@ def test_postgres_end_to_end(
     task_id = str(task["id"])
     assert task["quantity"] == 3
     assert task["version"] == 1
+
+    with postgres_session_factory() as db:
+        reviewed_before_toggle = db.scalar(
+            text(
+                "SELECT reservation_cutover_reviewed FROM replenishment_tasks WHERE id = :task_id"
+            ),
+            {"task_id": uuid.UUID(task_id)},
+        )
+        assert reviewed_before_toggle is True
+        db.execute(
+            text(
+                "UPDATE replenishment_tasks "
+                "SET reservation_cutover_reviewed = false WHERE id = :task_id"
+            ),
+            {"task_id": uuid.UUID(task_id)},
+        )
+        db.commit()
+    cutover_health = client.get("/health/ready")
+    assert cutover_health.status_code == 503
+    assert cutover_health.json()["code"] == "cutover_reconciliation_required"
+    with postgres_session_factory() as db, pytest.raises(ReservationCutoverPending):
+        claim_jobs(db, worker_id="cutover-guard-test", limit=1, lease_seconds=30)
+    blocked_task_mutation = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+        headers=_bearer(manager_token),
+        json={"status": "CANCELLED", "expected_version": 1},
+    )
+    assert blocked_task_mutation.status_code == 503
+    assert blocked_task_mutation.json()["code"] == "cutover_reconciliation_required"
+    with postgres_session_factory() as db:
+        db.execute(
+            text(
+                "UPDATE replenishment_tasks "
+                "SET reservation_cutover_reviewed = true WHERE id = :task_id"
+            ),
+            {"task_id": uuid.UUID(task_id)},
+        )
+        db.commit()
+    assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
+
+    unclaimed_movement = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+        headers=_bearer(associate_token),
+        json={
+            "status": "CLAIMED",
+            "expected_version": 1,
+            "moved_quantity": 1,
+        },
+    )
+    assert unclaimed_movement.status_code == 409
+    assert unclaimed_movement.json()["code"] == "task_claim_required"
+
     assert (
         client.get(
             f"/v1/tenants/{tenant_a_id}/replenishment/tasks",
@@ -1214,43 +1519,321 @@ def test_postgres_end_to_end(
     assert stale_update.status_code == 409
     assert stale_update.json()["code"] == "task_version_conflict"
 
+    movement_while_starting = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+        headers=_bearer(associate_token),
+        json={
+            "status": "IN_PROGRESS",
+            "expected_version": claimed_task["version"],
+            "moved_quantity": 1,
+        },
+    )
+    assert movement_while_starting.status_code == 409
+    assert movement_while_starting.json()["code"] == "task_movement_not_allowed"
+
+    started_task = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+            headers=_bearer(associate_token),
+            json={
+                "status": "IN_PROGRESS",
+                "expected_version": claimed_task["version"],
+            },
+        ),
+        200,
+    )
+    assert isinstance(started_task, dict)
+    partially_moved_task = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+            headers=_bearer(associate_token),
+            json={
+                "status": "IN_PROGRESS",
+                "expected_version": started_task["version"],
+                "moved_quantity": 1,
+            },
+        ),
+        200,
+    )
+    assert isinstance(partially_moved_task, dict)
+
+    exception_task = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+            headers=_bearer(manager_token),
+            json={
+                "status": "EXCEPTION",
+                "expected_version": partially_moved_task["version"],
+                "note": "Fixture unavailable at the nominated source zone.",
+            },
+        ),
+        200,
+    )
+    assert isinstance(exception_task, dict)
+    assert exception_task["status"] == "EXCEPTION"
+    assert exception_task["moved_quantity"] == 1
+    assert exception_task["completed_at"] is not None
+    exception_task_id = task_id
+
+    associate_exception_reopen = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+        headers=_bearer(associate_token),
+        json={"status": "OPEN", "expected_version": exception_task["version"]},
+    )
+    assert associate_exception_reopen.status_code == 403
+    assert associate_exception_reopen.json()["code"] == "task_management_permission_required"
+    manager_exception_reopen = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+        headers=_bearer(manager_token),
+        json={"status": "OPEN", "expected_version": exception_task["version"]},
+    )
+    assert manager_exception_reopen.status_code == 409
+    assert manager_exception_reopen.json()["code"] == "terminal_task_immutable"
+
+    # EXCEPTION is a terminal audit outcome. Reevaluation creates one fresh active
+    # task, and subsequent evaluations reuse that task rather than duplicating it.
+    after_exception = _expect(
+        client.post(
+            f"/v1/tenants/{tenant_a_id}/replenishment/evaluations",
+            headers={
+                **_bearer(manager_token),
+                "Idempotency-Key": "evaluation-after-exception",
+            },
+            json=evaluation_request,
+        ),
+        201,
+    )
+    assert isinstance(after_exception, dict)
+    assert after_exception["tasks_created"] == 1
+    assert after_exception["lines"][0]["open_task_quantity"] == 1
+    assert after_exception["lines"][0]["recommended_quantity"] == 2
+    replacement_task_id = str(after_exception["lines"][0]["task_id"])
+    assert replacement_task_id != task_id
+
+    repeated_after_exception = _expect(
+        client.post(
+            f"/v1/tenants/{tenant_a_id}/replenishment/evaluations",
+            headers={
+                **_bearer(manager_token),
+                "Idempotency-Key": "evaluation-after-exception-repeat",
+            },
+            json=evaluation_request,
+        ),
+        201,
+    )
+    assert isinstance(repeated_after_exception, dict)
+    assert repeated_after_exception["tasks_created"] == 0
+    assert repeated_after_exception["tasks_updated"] == 0
+    assert repeated_after_exception["lines"][0]["task_id"] == replacement_task_id
+
+    tasks_after_exception = _expect(
+        client.get(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks",
+            headers=_bearer(manager_token),
+            params={"store_id": store_1_id},
+        ),
+        200,
+    )
+    assert isinstance(tasks_after_exception, dict)
+    assert tasks_after_exception["total"] == 2
+    assert [item["status"] for item in tasks_after_exception["items"]].count("OPEN") == 1
+    assert [item["status"] for item in tasks_after_exception["items"]].count("EXCEPTION") == 1
+
+    claimed_replacement = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{replacement_task_id}",
+            headers=_bearer(associate_token),
+            json={"status": "CLAIMED", "expected_version": 1},
+        ),
+        200,
+    )
+    assert isinstance(claimed_replacement, dict)
+    cancelled_replacement = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{replacement_task_id}",
+            headers=_bearer(manager_token),
+            json={
+                "status": "CANCELLED",
+                "expected_version": claimed_replacement["version"],
+                "note": "Manager cancelled obsolete physical work.",
+            },
+        ),
+        200,
+    )
+    assert isinstance(cancelled_replacement, dict)
+    assert cancelled_replacement["status"] == "CANCELLED"
+    assert cancelled_replacement["completed_at"] is not None
+
+    associate_cancelled_mutation = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{replacement_task_id}",
+        headers=_bearer(associate_token),
+        json={
+            "status": "CANCELLED",
+            "expected_version": cancelled_replacement["version"],
+            "note": "Attempted terminal edit.",
+        },
+    )
+    assert associate_cancelled_mutation.status_code == 403
+    assert associate_cancelled_mutation.json()["code"] == "task_management_permission_required"
+
+    after_cancel = _expect(
+        client.post(
+            f"/v1/tenants/{tenant_a_id}/replenishment/evaluations",
+            headers={
+                **_bearer(manager_token),
+                "Idempotency-Key": "evaluation-after-cancel",
+            },
+            json=evaluation_request,
+        ),
+        201,
+    )
+    assert isinstance(after_cancel, dict)
+    assert after_cancel["tasks_created"] == 1
+    task_id = str(after_cancel["lines"][0]["task_id"])
+
+    claimed_task = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+            headers=_bearer(associate_token),
+            json={"status": "CLAIMED", "expected_version": 1},
+        ),
+        200,
+    )
+    assert isinstance(claimed_task, dict)
+    execution_quantity = int(claimed_task["quantity"])
+    assert execution_quantity == 2
+
+    execution_started = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+            headers=_bearer(associate_token),
+            json={
+                "status": "IN_PROGRESS",
+                "expected_version": claimed_task["version"],
+            },
+        ),
+        200,
+    )
+    assert isinstance(execution_started, dict)
+
+    # The task must already be IN_PROGRESS before physical movement. If RFID confirms
+    # a unit before the associate records moved_quantity, that one-unit change links
+    # to the executing task and reduces its unreflected reservation exactly once.
+    active_reflection_event_id = ""
+    for read_index in range(1, 3):
+        active_reflection_event_id = str(uuid.uuid4())
+        _ingest(
+            client,
+            floor_device_key,
+            event_id=active_reflection_event_id,
+            epc=KNOWN_EPCS[1],
+            observed_at=base_time + timedelta(seconds=64 + read_index),
+            batch_id=f"active-task-reflection-{read_index}",
+        )
+    _drain_jobs(postgres_session_factory)
+    with postgres_session_factory() as db:
+        active_reflection_observation = db.scalar(
+            select(RfidObservation).where(RfidObservation.event_id == active_reflection_event_id)
+        )
+        assert active_reflection_observation is not None
+        active_reflection_change = db.scalar(
+            select(InventoryChange).where(
+                InventoryChange.observation_id == active_reflection_observation.id
+            )
+        )
+        assert active_reflection_change is not None
+        assert active_reflection_change.replenishment_task_id == uuid.UUID(task_id)
+
+    during_execution = _expect(
+        client.post(
+            f"/v1/tenants/{tenant_a_id}/replenishment/evaluations",
+            headers={
+                **_bearer(manager_token),
+                "Idempotency-Key": "evaluation-during-execution",
+            },
+            json=evaluation_request,
+        ),
+        201,
+    )
+    assert isinstance(during_execution, dict)
+    assert during_execution["lines"][0]["open_task_quantity"] == 2
+    assert during_execution["lines"][0]["recommended_quantity"] == 0
+
     in_progress = _expect(
         client.patch(
             f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
             headers=_bearer(associate_token),
             json={
                 "status": "IN_PROGRESS",
-                "expected_version": 2,
+                "expected_version": execution_started["version"],
                 "moved_quantity": 1,
             },
         ),
         200,
     )
     assert isinstance(in_progress, dict)
+
+    movement_owner_conflict = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+        headers=_bearer(associate_two_token),
+        json={
+            "status": "IN_PROGRESS",
+            "expected_version": in_progress["version"],
+            "moved_quantity": execution_quantity,
+        },
+    )
+    assert movement_owner_conflict.status_code == 409
+    assert movement_owner_conflict.json()["code"] == "task_claim_owner_conflict"
+
+    incomplete_awaiting = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+        headers=_bearer(associate_token),
+        json={
+            "status": "AWAITING_VERIFICATION",
+            "expected_version": in_progress["version"],
+        },
+    )
+    assert incomplete_awaiting.status_code == 422
+    assert incomplete_awaiting.json()["code"] == "task_awaiting_verification_incomplete"
+
+    completed_movement = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+            headers=_bearer(associate_token),
+            json={
+                "status": "IN_PROGRESS",
+                "expected_version": in_progress["version"],
+                "moved_quantity": execution_quantity,
+            },
+        ),
+        200,
+    )
+    assert isinstance(completed_movement, dict)
     awaiting = _expect(
         client.patch(
             f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
             headers=_bearer(associate_token),
             json={
                 "status": "AWAITING_VERIFICATION",
-                "expected_version": in_progress["version"],
-                "moved_quantity": 2,
+                "expected_version": completed_movement["version"],
             },
         ),
         200,
     )
     assert isinstance(awaiting, dict)
-    incomplete_verification = client.patch(
+
+    movement_during_verification = client.patch(
         f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
         headers=_bearer(associate_token),
         json={
             "status": "VERIFIED",
             "expected_version": awaiting["version"],
-            "moved_quantity": 2,
+            "moved_quantity": execution_quantity,
         },
     )
-    assert incomplete_verification.status_code == 422
-    assert incomplete_verification.json()["code"] == "task_verification_incomplete"
+    assert movement_during_verification.status_code == 409
+    assert movement_during_verification.json()["code"] == "task_movement_not_allowed"
+
     verified = _expect(
         client.patch(
             f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
@@ -1258,7 +1841,6 @@ def test_postgres_end_to_end(
             json={
                 "status": "VERIFIED",
                 "expected_version": awaiting["version"],
-                "moved_quantity": 3,
                 "note": "Count verified at the sales floor.",
             },
         ),
@@ -1268,6 +1850,42 @@ def test_postgres_end_to_end(
     assert verified["status"] == "VERIFIED"
     assert verified["remaining_quantity"] == 0
     assert verified["completed_at"] is not None
+
+    terminal_note_mutation = client.patch(
+        f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+        headers=_bearer(associate_token),
+        json={
+            "status": "VERIFIED",
+            "expected_version": verified["version"],
+            "note": "Attempted audit rewrite.",
+        },
+    )
+    assert terminal_note_mutation.status_code == 409
+    assert terminal_note_mutation.json()["code"] == "terminal_task_immutable"
+
+    verified_no_op = _expect(
+        client.patch(
+            f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
+            headers=_bearer(associate_token),
+            json={"status": "VERIFIED", "expected_version": verified["version"]},
+        ),
+        200,
+    )
+    assert isinstance(verified_no_op, dict)
+    assert verified_no_op["version"] == verified["version"]
+
+    # A later read in the already-confirmed zone refreshes observation evidence but
+    # does not prove that the human-recorded movement reached the quantity aggregate.
+    # It must therefore leave the verified-work reservation in place.
+    _ingest(
+        client,
+        floor_device_key,
+        event_id=str(uuid.uuid4()),
+        epc=moving_epc,
+        observed_at=base_time + timedelta(seconds=60),
+        batch_id="post-verification-same-zone-reaffirmation",
+    )
+    _drain_jobs(postgres_session_factory)
 
     # Human-verified movement remains reserved until a later RFID balance transition,
     # so an immediate reevaluation cannot issue the same physical work again.
@@ -1284,9 +1902,9 @@ def test_postgres_end_to_end(
     )
     assert isinstance(post_verification_run, dict)
     post_verification_line = post_verification_run["lines"][0]
-    assert post_verification_line["open_task_quantity"] == 3
+    assert post_verification_line["open_task_quantity"] == 2
     assert post_verification_line["recommended_quantity"] == 0
-    assert post_verification_line["reason"] == "NO_BACKROOM_STOCK"
+    assert post_verification_line["reason"] == "FLOOR_AT_OR_ABOVE_MINIMUM"
     tasks_after_verification = _expect(
         client.get(
             f"/v1/tenants/{tenant_a_id}/replenishment/tasks",
@@ -1296,7 +1914,52 @@ def test_postgres_end_to_end(
         200,
     )
     assert isinstance(tasks_after_verification, dict)
-    assert tasks_after_verification["total"] == 1
+    assert tasks_after_verification["total"] == 3
+
+    # One confirmed backroom-to-floor EPC movement consumes exactly one FIFO task
+    # reservation. It must not release all three terminal moved units at once.
+    reflected_event_id = ""
+    for read_index in range(1, 3):
+        reflected_event_id = str(uuid.uuid4())
+        _ingest(
+            client,
+            floor_device_key,
+            event_id=reflected_event_id,
+            epc=KNOWN_EPCS[2],
+            observed_at=base_time + timedelta(seconds=70 + read_index),
+            batch_id=f"post-verification-reflection-{read_index}",
+        )
+    _drain_jobs(postgres_session_factory)
+    with postgres_session_factory() as db:
+        reflected_observation = db.scalar(
+            select(RfidObservation).where(RfidObservation.event_id == reflected_event_id)
+        )
+        assert reflected_observation is not None
+        reflected_change = db.scalar(
+            select(InventoryChange).where(
+                InventoryChange.observation_id == reflected_observation.id
+            )
+        )
+        assert reflected_change is not None
+        assert reflected_change.replenishment_task_id == uuid.UUID(exception_task_id)
+
+    after_one_reflection = _expect(
+        client.post(
+            f"/v1/tenants/{tenant_a_id}/replenishment/evaluations",
+            headers={
+                **_bearer(manager_token),
+                "Idempotency-Key": "evaluation-after-one-reflection",
+            },
+            json=evaluation_request,
+        ),
+        201,
+    )
+    assert isinstance(after_one_reflection, dict)
+    assert after_one_reflection["tasks_created"] == 0
+    assert after_one_reflection["lines"][0]["floor_quantity"] == 4
+    assert after_one_reflection["lines"][0]["backroom_quantity"] == 1
+    assert after_one_reflection["lines"][0]["open_task_quantity"] == 1
+    assert after_one_reflection["lines"][0]["recommended_quantity"] == 0
 
     # CRUD endpoints remain tenant scoped after the evaluation snapshot has been created.
     created_policy = _expect(

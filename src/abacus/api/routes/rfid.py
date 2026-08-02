@@ -108,7 +108,8 @@ def list_inventory_endpoint(
                 sku_id=balance.sku_id,
                 sku_code=sku.code,
                 quantity=balance.quantity,
-                as_of=balance.updated_at,
+                projection_updated_at=balance.updated_at,
+                last_relevant_observation_at=balance.last_relevant_observation_at,
             )
             for balance, zone, sku in rows
         ],

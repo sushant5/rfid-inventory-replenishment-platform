@@ -466,20 +466,10 @@ def update_task_endpoint(
     )
     if target is None:
         raise ApiError(404, "Task not found", "The requested task does not exist.")
-    if request.status in {
-        ReplenishmentTaskStatus.CANCELLED,
-        ReplenishmentTaskStatus.EXCEPTION,
-    } and not principal.can_access_store(
+    can_manage_task = principal.can_access_store(
         Permission.REPLENISHMENT_MANAGE,
         target.store_id,
-    ):
-        raise ApiError(
-            403,
-            "Forbidden",
-            "Cancelling a task or placing it in exception requires manager permission "
-            "for this store.",
-            code="task_management_permission_required",
-        )
+    )
     _ensure_store(
         principal,
         tenant_id,
@@ -492,5 +482,6 @@ def update_task_endpoint(
         task_id,
         request,
         actor_subject=str(principal.user_id),
+        can_manage_task=can_manage_task,
     )
     return _task_read(task, sku)

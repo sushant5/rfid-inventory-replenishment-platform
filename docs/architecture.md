@@ -53,7 +53,7 @@ flowchart LR
 | RFID processor | Deduplicate effects, resolve historical mappings, handle noise/late data and update presence | Job leases, quarantine, item presence and inventory changes |
 | Identity and access | Authenticate demo users and enforce role plus resource scope | Users, password hashes, roles, permissions and store grants |
 | Replenishment | Manage effective-dated policies, calculate shortages and create idempotent work | Policies, rules, calculation evidence and tasks |
-| Inventory projection | Expose confirmed observed floor/backroom state and `as_of` | Item presence, aggregates and auditable derived changes |
+| Inventory projection | Expose confirmed observed floor/backroom state with separate projection-update and observation-event times | Item presence, aggregates and auditable derived changes |
 | Book variance (evolution) | Reconcile POS/receiving/transfer/return/shrink ledger with RFID evidence | Not implemented in the hosted slice |
 | Operations | Health, readiness, identity audit, structured logs, migrations and release identity | Submitted operational controls; metrics/alerts are the production direction below |
 
@@ -134,9 +134,12 @@ duplicate work.
   open Orange input.
 - A client-generated UUID event ID is unique in its tenant; the stored payload
   fingerprint detects conflicting reuse across devices.
+- Conflicting store/zone evidence for one EPC at one event time is quarantined;
+  equal-time same-location evidence cannot advance a movement candidate.
 - Exactly one current item-presence row exists per tenant/EPC even though observation history is append-only.
 - Aggregate inventory changes and the underlying presence transition commit together.
 - At most one active replenishment task exists per tenant/store/SKU; completed task history is retained.
+- Verified, cancelled and exception tasks are immutable terminal audit records.
 - Policy resolution must yield one deterministic rule or an explicit conflict, never an arbitrary winner.
 
 ## End-to-end data flows
@@ -196,6 +199,12 @@ Processing rules:
 - The UUID event ID is unique in its tenant. An exact retry is idempotent; the same ID with different content is a conflict requiring investigation.
 - `observed_at` describes device time and `ingested_at` describes platform time. Mapping resolution uses the effective mapping at observation time.
 - An older observation is retained but cannot regress a newer confirmed current state.
+- `reader_sequence` is device-local evidence, not a cross-reader ordering key.
+  Acceptance is serialized per tenant/EPC and PostgreSQL assigns a unique monotonic
+  acceptance sequence; for equal `observed_at`, the lowest sequence among
+  non-quarantined observations is canonical and later conflicting locations are
+  quarantined. The sequence uses `CACHE 1`; this result is independent of application
+  clocks, pooled connections, and worker lease order.
 - A same-zone read refreshes evidence. A possible cross-zone move becomes a candidate until confirmation/hysteresis rules are met.
 - A move requires consecutive reads within a configured confirmation window; missing
   reads do not prove absence.
@@ -250,11 +259,23 @@ These are proposed defaults, not facts from the assignment. Separating operation
 
 5. The result stores the selected policy, inputs, inventory timestamp, formula and
    reason. A positive result creates or updates the one active task for that
-   tenant/store/SKU. The full active quantity remains reserved after partial movement;
-   verified work remains reserved until a later RFID aggregate transition reflects it.
+   tenant/store/SKU. Each confirmed same-store `BACKROOM -> SALES_FLOOR` EPC change
+   links to at most one task unit (executing work first, then the oldest terminal
+   reservation). Active and terminal reservations subtract those durable per-unit
+   links; same-zone and reverse movements do not consume them.
 6. The submitted provisional lifecycle is
    `OPEN -> CLAIMED -> IN_PROGRESS -> AWAITING_VERIFICATION -> VERIFIED`, with a
-   cancellation path. The customer must confirm these semantics before production.
+   manager/corporate-authorized cancellation/exception path. Only the claimant records movement,
+   execution must start before movement is recorded, all movement is complete before
+   awaiting verification, and verification only confirms that quantity. Terminal
+   records cannot be reopened or edited; after remediation,
+   reevaluation creates at most one replacement active task. The customer must confirm
+   these semantics before production.
+
+The submitted reconciliation assumes a confirmed floorward EPC change for a
+store/SKU belongs to its executing task, otherwise to the oldest unreflected terminal
+task. Production should capture `task_id` plus EPC in the associate scan workflow when
+exact physical attribution is required.
 
 ## Implemented REST surface
 
@@ -266,7 +287,7 @@ These are proposed defaults, not facts from the assignment. Separating operation
 | Hardware | `.../devices/{id}/assignments`, `.../credentials:rotate` | Effective-dated assignments and one-time key display |
 | Catalog | `/v1/tenants/{tenant_id}/catalog/imports`, `/skus` | Staged status/errors and JWT SKU discovery |
 | RFID | `POST /v1/device/read-batches`, platform observation list/replay | Device-authenticated acceptance and remediation |
-| Inventory | `GET /v1/tenants/{tenant_id}/inventory` | Scoped, paginated aggregates with `as_of` |
+| Inventory | `GET /v1/tenants/{tenant_id}/inventory` | Scoped, paginated aggregates with `projection_updated_at` and `last_relevant_observation_at` |
 | Policies | `/v1/tenants/{tenant_id}/replenishment/policies` and bulk import | Effective-dated management |
 | Calculation/tasks | `/replenishment/evaluations`, `/replenishment/tasks` | Explainable scoped task lifecycle |
 | Operations | `GET /health/live`, `GET /health/ready`, `GET /docs`, `GET /openapi.json` | Liveness is process-only; readiness checks dependencies |
@@ -374,6 +395,9 @@ This is an evolution architecture, not a claim that the hosted PostgreSQL inbox 
 
 - Pin dependencies and build a repeatable container from the submitted commit/tag.
 - Run migrations before traffic and take a managed backup before risky schema changes.
+- A populated upgrade from the pre-allocation task model leaves legacy moved units
+  conservatively reserved and fails readiness until an operator reviews and records
+  each task's RFID cutover baseline; a clean deployment needs no intervention.
 - Keep `/health/live` independent of dependencies; make `/health/ready` fail when the API cannot safely serve required operations.
 - Emit submitted structured request logs with request IDs and structured worker logs
   with job/worker IDs while excluding secrets. Add tenant/device/import correlation

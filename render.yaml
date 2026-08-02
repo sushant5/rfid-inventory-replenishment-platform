@@ -15,6 +15,11 @@ services:
         value: production
       - key: PORT
         value: "8000"
+      # Render is the only public ingress to this container. Trust its forwarding
+      # header here—not in the portable image—so Uvicorn exposes the real client IP
+      # to the application login throttle.
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"
       - key: DATABASE_URL
         fromDatabase:
           name: abacus-postgres

@@ -27,6 +27,7 @@ class DemoTransport:
         self.requests: list[tuple[str, str]] = []
         self.task_status = "OPEN"
         self.task_owner: str | None = None
+        self.task_moved_quantity = 0
         self.task_patch_count = 0
 
     def request(
@@ -202,8 +203,20 @@ class DemoTransport:
                 200,
                 {
                     "items": [
-                        {"sku_id": SKU_ID, "zone_kind": "SALES_FLOOR", "quantity": 1},
-                        {"sku_id": SKU_ID, "zone_kind": "BACKROOM", "quantity": 3},
+                        {
+                            "sku_id": SKU_ID,
+                            "zone_kind": "SALES_FLOOR",
+                            "quantity": 1,
+                            "projection_updated_at": "2026-08-02T12:00:02Z",
+                            "last_relevant_observation_at": "2026-08-02T12:00:01Z",
+                        },
+                        {
+                            "sku_id": SKU_ID,
+                            "zone_kind": "BACKROOM",
+                            "quantity": 3,
+                            "projection_updated_at": "2026-08-02T12:00:02Z",
+                            "last_relevant_observation_at": "2026-08-02T12:00:01Z",
+                        },
                     ],
                     "total": 2,
                 },
@@ -217,6 +230,7 @@ class DemoTransport:
             )
         if method == "POST" and path.endswith("/replenishment/evaluations"):
             self._bearer(headers)
+            assert headers["Idempotency-Key"] == "reviewer-demo-evaluation-v1"
             return self._response(
                 201,
                 {
@@ -241,6 +255,8 @@ class DemoTransport:
                             "id": TASK_ID,
                             "status": self.task_status,
                             "version": 1 + self.task_patch_count,
+                            "quantity": 3,
+                            "moved_quantity": self.task_moved_quantity,
                             "claimed_by_subject": self.task_owner,
                         }
                     ],
@@ -249,17 +265,57 @@ class DemoTransport:
             )
         if method == "PATCH" and path.endswith(f"/replenishment/tasks/{TASK_ID}"):
             assert headers["Authorization"] == "Bearer associate-token"
-            assert payload == {
-                "status": "CLAIMED",
-                "expected_version": 1,
-                "note": "Claimed by reviewer demo",
+            expected_payloads: dict[str, dict[str, object]] = {
+                "OPEN": {
+                    "status": "CLAIMED",
+                    "expected_version": 1,
+                    "note": "Claimed by reviewer demo",
+                },
+                "CLAIMED": {
+                    "status": "IN_PROGRESS",
+                    "expected_version": 2,
+                    "note": "Execution started by reviewer demo",
+                },
+                "AWAITING_VERIFICATION": {
+                    "status": "VERIFIED",
+                    "expected_version": 5,
+                    "note": "Full movement verified by reviewer demo",
+                },
             }
-            self.task_status = "CLAIMED"
-            self.task_owner = ASSOCIATE_ID
+            if self.task_status == "IN_PROGRESS":
+                expected_payload = (
+                    {
+                        "status": "IN_PROGRESS",
+                        "expected_version": 3,
+                        "moved_quantity": 3,
+                        "note": "Physical movement completed by reviewer demo",
+                    }
+                    if self.task_moved_quantity == 0
+                    else {
+                        "status": "AWAITING_VERIFICATION",
+                        "expected_version": 4,
+                        "note": "Full movement submitted for verification",
+                    }
+                )
+            else:
+                expected_payload = expected_payloads[self.task_status]
+            assert payload == expected_payload
+            self.task_status = str(payload["status"])
+            if self.task_status == "CLAIMED":
+                self.task_owner = ASSOCIATE_ID
+            if "moved_quantity" in payload:
+                self.task_moved_quantity = int(payload["moved_quantity"])
             self.task_patch_count += 1
             return self._response(
                 200,
-                {"id": TASK_ID, "status": "CLAIMED", "version": 2},
+                {
+                    "id": TASK_ID,
+                    "status": self.task_status,
+                    "version": 1 + self.task_patch_count,
+                    "quantity": 3,
+                    "moved_quantity": self.task_moved_quantity,
+                    "claimed_by_subject": self.task_owner,
+                },
             )
         raise AssertionError(f"Unexpected request: {method} {url}")
 
@@ -312,8 +368,8 @@ def test_reviewer_demo_runs_the_frozen_end_to_end_contract() -> None:
         sleeper=lambda _: None,
         output=output.append,
     ).run()
-    # A second run reuses the same stores/users/imports and does not steal or
-    # re-transition the already claimed task.
+    # A second run reuses the same stores/users/imports and the frozen evaluation;
+    # the immutable VERIFIED task is observed without being rewritten.
     ReviewerDemo(
         config,
         transport=transport,
@@ -324,13 +380,15 @@ def test_reviewer_demo_runs_the_frozen_end_to_end_contract() -> None:
     assert transport.store_payload is not None
     assert len(transport.store_payload["stores"]) == 100
     assert transport.rfid_batch_sizes == [1, 3, 1, 3]
-    assert transport.task_patch_count == 1
+    assert transport.task_patch_count == 5
+    assert transport.task_status == "VERIFIED"
     assert len(transport.users) == 2
     assert {user["role_assignments"][0]["role"] for user in transport.users} == {
         "STORE_MANAGER",
         "STORE_ASSOCIATE",
     }
     transcript = "\n".join(output)
+    assert "task=VERIFIED" in transcript
     assert "PASS reviewer demo complete: https://demo.example.test/docs" in transcript
     assert "platform-secret-for-test" not in transcript
     assert "admin-secret-for-test" not in transcript

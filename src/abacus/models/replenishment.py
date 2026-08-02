@@ -240,6 +240,28 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "moved_quantity >= 0 AND moved_quantity <= quantity",
             name="ck_replenishment_tasks_valid_moved_quantity",
         ),
+        CheckConstraint(
+            "reconciled_before_tracking_quantity >= 0 "
+            "AND reconciled_before_tracking_quantity <= moved_quantity",
+            name="ck_replenishment_tasks_reconciled_baseline",
+        ),
+        CheckConstraint(
+            "(reservation_cutover_reviewed_at IS NULL "
+            "AND reservation_cutover_reviewed_by IS NULL "
+            "AND reservation_cutover_note IS NULL) OR "
+            "(reservation_cutover_reviewed = true "
+            "AND reservation_cutover_reviewed_at IS NOT NULL "
+            "AND reservation_cutover_reviewed_by IS NOT NULL "
+            "AND reservation_cutover_note IS NOT NULL)",
+            name="ck_replenishment_tasks_cutover_audit",
+        ),
+        CheckConstraint(
+            "(status IN ('VERIFIED', 'CANCELLED', 'EXCEPTION') "
+            "AND completed_at IS NOT NULL) OR "
+            "(status IN ('OPEN', 'CLAIMED', 'IN_PROGRESS', 'AWAITING_VERIFICATION') "
+            "AND completed_at IS NULL)",
+            name="ck_replenishment_tasks_terminal_completion",
+        ),
         CheckConstraint("version >= 1", name="ck_replenishment_tasks_positive_version"),
         Index(
             "uq_replenishment_tasks_active_store_sku",
@@ -252,6 +274,11 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             ),
         ),
         Index("ix_replenishment_tasks_tenant_store_status", "tenant_id", "store_id", "status"),
+        Index(
+            "ix_replenishment_tasks_unreviewed_cutover",
+            "id",
+            postgresql_where=text("reservation_cutover_reviewed = false"),
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -282,6 +309,37 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     moved_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Cutover baseline for terminal tasks completed before per-EPC reservation
+    # allocation existed. New tasks always start at zero.
+    reconciled_before_tracking_quantity: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    # Legacy rows with recorded movement require a one-time operator decision: RFID
+    # evidence may or may not already include those units. New tasks are born after
+    # durable allocation exists and therefore need no cutover review.
+    reservation_cutover_reviewed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        # A legacy binary or direct SQL insert does not know how to create durable
+        # movement links. Fail such rows closed; current ORM code sends True.
+        server_default=text("false"),
+    )
+    reservation_cutover_reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    reservation_cutover_reviewed_by: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    reservation_cutover_note: Mapped[str | None] = mapped_column(
+        String(1000),
+        nullable=True,
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     claimed_by_subject: Mapped[str | None] = mapped_column(String(255), nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -17,6 +17,7 @@ from abacus.services.replenishment import (
     calculate_replenishment_quantity,
     effective_intervals_overlap,
     select_policy_winner,
+    task_movement_allowed,
     task_transition_allowed,
 )
 
@@ -173,4 +174,37 @@ def test_task_lifecycle_allows_only_declared_transitions() -> None:
     assert not task_transition_allowed(
         ReplenishmentTaskStatus.VERIFIED,
         ReplenishmentTaskStatus.OPEN,
+    )
+    assert not task_transition_allowed(
+        ReplenishmentTaskStatus.EXCEPTION,
+        ReplenishmentTaskStatus.OPEN,
+    )
+    assert not task_transition_allowed(
+        ReplenishmentTaskStatus.EXCEPTION,
+        ReplenishmentTaskStatus.CANCELLED,
+    )
+
+    assert not task_movement_allowed(
+        ReplenishmentTaskStatus.CLAIMED,
+        ReplenishmentTaskStatus.IN_PROGRESS,
+    )
+    assert task_movement_allowed(
+        ReplenishmentTaskStatus.IN_PROGRESS,
+        ReplenishmentTaskStatus.IN_PROGRESS,
+    )
+    assert task_movement_allowed(
+        ReplenishmentTaskStatus.AWAITING_VERIFICATION,
+        ReplenishmentTaskStatus.IN_PROGRESS,
+    )
+    assert not task_movement_allowed(
+        ReplenishmentTaskStatus.OPEN,
+        ReplenishmentTaskStatus.CLAIMED,
+    )
+    assert not task_movement_allowed(
+        ReplenishmentTaskStatus.IN_PROGRESS,
+        ReplenishmentTaskStatus.AWAITING_VERIFICATION,
+    )
+    assert not task_movement_allowed(
+        ReplenishmentTaskStatus.AWAITING_VERIFICATION,
+        ReplenishmentTaskStatus.VERIFIED,
     )

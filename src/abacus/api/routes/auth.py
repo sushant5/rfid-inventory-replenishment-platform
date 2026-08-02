@@ -1,15 +1,21 @@
 from datetime import timedelta
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
+from abacus.api.errors import ApiError
 from abacus.schemas.identity import (
     AccessTokenRead,
     CurrentPrincipalRead,
     LoginRequest,
     RoleAssignmentRead,
 )
-from abacus.security import CurrentPrincipal, create_access_token
+from abacus.security import (
+    CurrentPrincipal,
+    LoginAttemptOutcome,
+    LoginThrottleDependency,
+    create_access_token,
+)
 from abacus.services.identity import authenticate_user
 
 router = APIRouter(prefix="/v1/auth", tags=["4. Identity and Access"])
@@ -22,29 +28,69 @@ router = APIRouter(prefix="/v1/auth", tags=["4. Identity and Access"])
 )
 def login_endpoint(
     request: LoginRequest,
+    http_request: Request,
     db: DatabaseSession,
     settings: SettingsDependency,
+    login_throttle: LoginThrottleDependency,
 ) -> AccessTokenRead:
-    user = authenticate_user(
-        db,
+    source_ip = http_request.client.host if http_request.client is not None else "unknown"
+    throttle_decision = login_throttle.begin_attempt(
+        source_ip=source_ip,
         tenant_code=request.tenant_code,
         email=str(request.email),
-        password=request.password.get_secret_value(),
     )
-    lifetime = timedelta(minutes=settings.access_token_minutes)
-    token, _ = create_access_token(
-        user_id=user.id,
-        tenant_id=user.tenant_id,
-        token_version=user.token_version,
-        secret=settings.jwt_secret,
-        issuer=settings.jwt_issuer,
-        audience=settings.jwt_audience,
-        lifetime=lifetime,
+    if throttle_decision.retry_after is not None:
+        raise ApiError(
+            429,
+            "Too many login attempts",
+            "Too many login attempts were made. Try again later.",
+            code="login_rate_limited",
+            headers={"Retry-After": str(throttle_decision.retry_after)},
+        )
+
+    try:
+        user = authenticate_user(
+            db,
+            tenant_code=request.tenant_code,
+            email=str(request.email),
+            password=request.password.get_secret_value(),
+        )
+        lifetime = timedelta(minutes=settings.access_token_minutes)
+        token, _ = create_access_token(
+            user_id=user.id,
+            tenant_id=user.tenant_id,
+            token_version=user.token_version,
+            secret=settings.jwt_secret,
+            issuer=settings.jwt_issuer,
+            audience=settings.jwt_audience,
+            lifetime=lifetime,
+        )
+        response = AccessTokenRead(
+            access_token=token,
+            expires_in=int(lifetime.total_seconds()),
+        )
+    except ApiError as exc:
+        login_throttle.finish_attempt(
+            throttle_decision.reservation,
+            outcome=(
+                LoginAttemptOutcome.AUTHENTICATION_FAILED
+                if exc.status_code == 401
+                else LoginAttemptOutcome.ABORTED
+            ),
+        )
+        raise
+    except Exception:
+        login_throttle.finish_attempt(
+            throttle_decision.reservation,
+            outcome=LoginAttemptOutcome.ABORTED,
+        )
+        raise
+
+    login_throttle.finish_attempt(
+        throttle_decision.reservation,
+        outcome=LoginAttemptOutcome.SUCCESS,
     )
-    return AccessTokenRead(
-        access_token=token,
-        expires_in=int(lifetime.total_seconds()),
-    )
+    return response
 
 
 @router.get(

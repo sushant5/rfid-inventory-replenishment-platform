@@ -122,6 +122,29 @@ Run the worker in a second terminal with the same environment:
 .\.venv\Scripts\python.exe -m abacus.worker
 ```
 
+### Populated-database migration cutover
+
+The RFID-to-task allocation migration is automatic for a clean deployment. For a
+populated upgrade, first stop the old API and worker, take a backup, run the migration,
+then inspect the deliberately blocked rows:
+
+```powershell
+.\.venv\Scripts\abacus-cli.exe list-reservation-cutover
+.\.venv\Scripts\abacus-cli.exe reconcile-reservation-cutover `
+  --task-id <uuid> --baseline <0-to-moved_quantity> `
+  --reviewed-by <operator> --note "Evidence and change-ticket reference"
+```
+
+Compare each legacy task with RFID/physical evidence. The baseline is the number of
+legacy moved units already reflected in RFID; zero is conservative because it keeps
+uncertain units reserved rather than risking duplicate physical work. The command
+locks the store/SKU and task, records reviewer/time/note, and is safe to repeat with
+the same baseline. Until every row is reviewed, `/health/ready` returns 503, affected
+API mutations are rejected, and the worker refuses to lease jobs. Once the list is
+empty, start the new API, verify readiness, and then start the worker. The database
+default is also fail-closed, so a legacy binary or direct insert cannot silently
+create a task that appears reconciled.
+
 The bootstrap command reads:
 
 - `BOOTSTRAP_TENANT_CODE`
@@ -148,10 +171,10 @@ $env:DATABASE_URL = $env:TEST_DATABASE_URL
 .\.venv\Scripts\alembic.exe check
 ```
 
-The GitHub Actions workflow template in `ci/github-actions.yml` provisions PostgreSQL
+The active GitHub Actions workflow in `.github/workflows/ci.yml` provisions PostgreSQL
 17, migrates a clean database, runs lint/format/strict mypy, the full test and coverage
-gate, `alembic check`, builds this PDF, and builds the Docker image. Copy it to
-`.github/workflows/ci.yml` when the repository credential has GitHub's `workflow` scope.
+gate, `alembic check`, builds this PDF, and builds the Docker image. The copy in
+`ci/github-actions.yml` remains a portable template.
 
 Build the recruiter-facing PDF from its Markdown source with:
 
@@ -182,7 +205,8 @@ $env:DEMO_ASSOCIATE_PASSWORD = "<associate password>"
 
 The runner never prints credentials. It verifies readiness, onboards 100 stores and
 200 readers, creates narrowly scoped users, waits for catalog/RFID worker projections,
-then evaluates and claims a replenishment task. The equivalent manual path is:
+then evaluates and completes a replenishment task through verification. The equivalent
+manual path is:
 
 1. Log in at `POST /v1/auth/login`, then read the Orange `tenant_id` from
    `GET /v1/auth/me`. On a deliberately empty database, the alternative is to create
@@ -206,7 +230,8 @@ then evaluates and claims a replenishment task. The equivalent manual path is:
 8. Query paginated inventory at `GET /v1/tenants/{tenant_id}/inventory`.
 9. With the corporate JWT and an `Idempotency-Key`, import policies; call
    `/replenishment/evaluations` with a corporate/assigned-manager JWT, then
-   claim/update the generated task with an assigned associate JWT.
+   claim the generated task, record the full movement while it is `IN_PROGRESS`,
+   submit it for verification, and verify it with an assigned associate JWT.
 
 Authentication boundaries are deliberate:
 
@@ -227,6 +252,7 @@ Authentication boundaries are deliberate:
 | Manage policies | Yes | No | No |
 | Evaluate/list replenishment | All stores | Assigned stores | Read assigned stores |
 | Claim/execute tasks | Yes | Assigned stores | Assigned stores |
+| Cancel/place tasks in exception | Yes | Assigned stores | No |
 
 The tenant in a URL must match the verified token, and store-scoped principals must
 pass an assigned store. Platform integration routes are intentionally a separate,
@@ -243,6 +269,14 @@ trusted administrative plane.
   reader cannot poison event-time state.
 - Older reads are retained but marked `LATE_IGNORED`; they never move current state
   backward.
+- Device-local sequences cannot order different readers, so ingestion is serialized per
+  EPC and PostgreSQL assigns a unique monotonic acceptance sequence. The lowest
+  sequence among non-quarantined observations is the deterministic tie winner.
+  A later conflicting location at the same event time is quarantined as
+  `AMBIGUOUS_SAME_TIMESTAMP_LOCATION`, independent of worker lease order. Repeated
+  same-location evidence is a processed no-op and cannot count twice toward movement.
+- `reader_sequence` is retained as device-local diagnostic evidence only; sequences
+  from different readers are never used as a global ordering tie-breaker.
 - A location move requires consecutive evidence within a configurable time window.
 - Initial presence currently trusts one structurally valid, edge-filtered sighting;
   RSSI is retained but no universal signal threshold is assumed. Production onboarding
@@ -251,6 +285,11 @@ trusted administrative plane.
   reconciliation rather than silently moving counts between products.
 - Observations are evidence. Receiving, POS sales, transfers, returns, shrink, book
   inventory, and variance workflows remain separate production integrations.
+
+Inventory responses expose `projection_updated_at` (database processing time) and
+`last_relevant_observation_at` (event time of the newest observation that changed or
+reaffirmed that confirmed aggregate). The latter may be null for migrated historical
+rows where event-time evidence cannot be reconstructed.
 
 ## Replenishment semantics
 
@@ -276,10 +315,12 @@ else:
 
 Every evaluation persists its inputs, selected policy, formula, result, reason, and
 inventory timestamp. One active task is allowed per tenant/store/SKU. Re-evaluation
-adds only uncovered work, preserves the full active reservation, and keeps a verified
-move reserved until a later RFID aggregate transition reflects it. It may cancel only
-an unstarted task when the policy disappears or the floor has already reached minimum.
-Claim ownership and an expected version prevent silent concurrent overwrites;
+adds only uncovered work. A task must enter `IN_PROGRESS` before movement is recorded.
+Each confirmed same-store `BACKROOM -> SALES_FLOOR` EPC transition consumes at most
+one task unit: the executing task first, then the oldest terminal reservation. Active
+work reserves `quantity - linked transitions`; terminal work reserves
+`moved_quantity - linked transitions`. Same-zone and opposite-direction reads consume
+nothing. Claim ownership and an expected version prevent silent concurrent overwrites;
 cancellation/exception transitions require manager-level permission.
 
 ## Hosting and immutable submission
@@ -347,8 +388,13 @@ requirements.
   automatically. Evaluations take a consistent tenant-policy snapshot. Operators call
   an explicit evaluation, while RFID inventory changes enqueue targeted store/SKU
   recalculations.
-- Login throttling is expected at the edge/hosting layer; a distributed application
-  rate limiter and bounded audit retention remain production hardening.
+- The submitted single-service demo applies a bounded in-process login throttle to all
+  attempts per client IP and to failed attempts per normalized tenant/account. Render
+  alone sets `FORWARDED_ALLOW_IPS=*` because its load balancer is the only public
+  ingress, allowing Uvicorn to derive `request.client.host` from the forwarded chain.
+  Direct deployments retain Uvicorn's restrictive proxy default; they should trust
+  only their own proxy addresses. Multiple API instances still need a shared limiter
+  at the gateway or data store and bounded audit retention.
 - The hosted slice caps catalog files and synchronous validation. Production-scale
   imports should land in object storage and use asynchronous chunked staging/COPY.
 - No custom UI is included; the exercise asks for accessible REST APIs, and Swagger

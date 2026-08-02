@@ -26,7 +26,7 @@ from abacus.models.replenishment import (
     ReplenishmentTaskStatus,
     ReplenishmentTrigger,
 )
-from abacus.models.rfid import InventoryBalance
+from abacus.models.rfid import InventoryBalance, InventoryChange
 from abacus.models.tenancy import Store, Tenant, Zone
 from abacus.schemas.replenishment import (
     PolicyBulkUpsertRequest,
@@ -36,6 +36,8 @@ from abacus.schemas.replenishment import (
     ReplenishmentEvaluationRequest,
     ReplenishmentTaskUpdate,
 )
+from abacus.services.cutover import require_reservation_cutover_ready
+from abacus.services.locks import lock_replenishment_store_sku
 
 REPLENISHMENT_FORMULA = (
     "if floor >= minimum: 0; otherwise "
@@ -80,15 +82,31 @@ TASK_TRANSITIONS: dict[ReplenishmentTaskStatus, frozenset[ReplenishmentTaskStatu
             ReplenishmentTaskStatus.EXCEPTION,
         }
     ),
-    ReplenishmentTaskStatus.EXCEPTION: frozenset(
-        {
-            ReplenishmentTaskStatus.OPEN,
-            ReplenishmentTaskStatus.CANCELLED,
-        }
-    ),
+    ReplenishmentTaskStatus.EXCEPTION: frozenset(),
     ReplenishmentTaskStatus.VERIFIED: frozenset(),
     ReplenishmentTaskStatus.CANCELLED: frozenset(),
 }
+
+OWNED_TASK_STATUSES = frozenset(
+    {
+        ReplenishmentTaskStatus.CLAIMED,
+        ReplenishmentTaskStatus.IN_PROGRESS,
+        ReplenishmentTaskStatus.AWAITING_VERIFICATION,
+    }
+)
+MANAGED_OUTCOME_STATUSES = frozenset(
+    {
+        ReplenishmentTaskStatus.CANCELLED,
+        ReplenishmentTaskStatus.EXCEPTION,
+    }
+)
+TERMINAL_TASK_STATUSES = frozenset(
+    {
+        ReplenishmentTaskStatus.VERIFIED,
+        ReplenishmentTaskStatus.CANCELLED,
+        ReplenishmentTaskStatus.EXCEPTION,
+    }
+)
 
 
 class PolicyResolutionConflictError(Exception):
@@ -193,6 +211,23 @@ def task_transition_allowed(
     requested: ReplenishmentTaskStatus,
 ) -> bool:
     return current == requested or requested in TASK_TRANSITIONS[current]
+
+
+def task_movement_allowed(
+    current: ReplenishmentTaskStatus,
+    requested: ReplenishmentTaskStatus,
+) -> bool:
+    """Return whether one update may record physical movement.
+
+    A claimant may record movement while starting, continuing, or returning to
+    IN_PROGRESS. The full quantity must already be recorded before the task enters
+    AWAITING_VERIFICATION, and VERIFIED only confirms that previously recorded work.
+    """
+
+    return requested is ReplenishmentTaskStatus.IN_PROGRESS and current in {
+        ReplenishmentTaskStatus.IN_PROGRESS,
+        ReplenishmentTaskStatus.AWAITING_VERIFICATION,
+    }
 
 
 def _get_tenant(db: Session, tenant_id: uuid.UUID) -> Tenant:
@@ -892,7 +927,10 @@ def _inventory_quantities(
                 ),
                 0,
             ),
-            func.max(InventoryBalance.updated_at),
+            # Only a quantity transition can show that verified physical work has
+            # reached the RFID aggregate. A same-location read refreshes evidence
+            # and ``updated_at`` but must not release the verified-work reservation.
+            func.max(InventoryBalance.quantity_changed_at),
         )
         .select_from(InventoryBalance)
         .join(Zone, Zone.id == InventoryBalance.zone_id)
@@ -905,19 +943,6 @@ def _inventory_quantities(
         )
     ).one()
     return int(row[0] or 0), int(row[1] or 0), row[2]
-
-
-def _advisory_lock_store_sku(
-    db: Session,
-    tenant_id: uuid.UUID,
-    store_id: uuid.UUID,
-    sku_id: uuid.UUID,
-) -> None:
-    lock_key = f"replenishment:{tenant_id}:{store_id}:{sku_id}"
-    db.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
 
 
 def _active_task(
@@ -938,33 +963,67 @@ def _active_task(
     )
 
 
-def _unreflected_verified_quantity(
+def _unreflected_terminal_moved_quantity(
     db: Session,
     tenant_id: uuid.UUID,
     store_id: uuid.UUID,
     sku_id: uuid.UUID,
-    inventory_as_of: datetime | None,
 ) -> int:
-    """Reserve verified work until a later RFID balance transition is visible.
+    """Return terminal moved units not yet matched to a confirmed RFID move.
 
-    Verification is human evidence that stock moved. Counting it until the derived
-    RFID aggregate advances prevents an immediate reevaluation from issuing the same
-    physical move again while reader observations are still catching up.
+    VERIFIED work is fully moved. CANCELLED/EXCEPTION work may be partially moved
+    before a manager closes the remainder. Each confirmed same-store
+    BACKROOM-to-SALES_FLOOR inventory change can consume at most one reserved unit.
+    The durable foreign-key allocation avoids releasing all units on one transition.
     """
 
-    predicates = [
-        ReplenishmentTask.tenant_id == tenant_id,
-        ReplenishmentTask.store_id == store_id,
-        ReplenishmentTask.sku_id == sku_id,
-        ReplenishmentTask.status == ReplenishmentTaskStatus.VERIFIED,
-        ReplenishmentTask.completed_at.is_not(None),
-    ]
-    if inventory_as_of is not None:
-        predicates.append(ReplenishmentTask.completed_at > inventory_as_of)
+    remaining_by_task = (
+        select(
+            func.greatest(
+                ReplenishmentTask.moved_quantity
+                - ReplenishmentTask.reconciled_before_tracking_quantity
+                - func.count(InventoryChange.id),
+                0,
+            ).label("remaining_quantity")
+        )
+        .select_from(ReplenishmentTask)
+        .outerjoin(
+            InventoryChange,
+            InventoryChange.replenishment_task_id == ReplenishmentTask.id,
+        )
+        .where(
+            ReplenishmentTask.tenant_id == tenant_id,
+            ReplenishmentTask.store_id == store_id,
+            ReplenishmentTask.sku_id == sku_id,
+            ReplenishmentTask.status.in_(TERMINAL_TASK_STATUSES),
+            ReplenishmentTask.completed_at.is_not(None),
+            ReplenishmentTask.moved_quantity > 0,
+        )
+        .group_by(ReplenishmentTask.id)
+        .subquery()
+    )
+    quantity = db.scalar(select(func.coalesce(func.sum(remaining_by_task.c.remaining_quantity), 0)))
+    return int(quantity or 0)
+
+
+def _linked_task_movement_count(db: Session, task_id: uuid.UUID) -> int:
     quantity = db.scalar(
-        select(func.coalesce(func.sum(ReplenishmentTask.quantity), 0)).where(*predicates)
+        select(func.count(InventoryChange.id)).where(
+            InventoryChange.replenishment_task_id == task_id
+        )
     )
     return int(quantity or 0)
+
+
+def _unreflected_active_task_quantity(db: Session, task: ReplenishmentTask | None) -> int:
+    if task is None:
+        return 0
+    return max(
+        0,
+        task.quantity
+        - task.reconciled_before_tracking_quantity
+        - _linked_task_movement_count(db, task.id),
+    )
 
 
 def _cancel_unstarted_task_if_obsolete(
@@ -996,7 +1055,7 @@ def _evaluate_sku(
     sku: Sku,
     generate_tasks: bool,
 ) -> tuple[ReplenishmentRunLine, bool, bool]:
-    _advisory_lock_store_sku(db, run.tenant_id, run.store_id, sku.id)
+    lock_replenishment_store_sku(db, run.tenant_id, run.store_id, sku.id)
     task = _active_task(db, run.tenant_id, run.store_id, sku.id)
     floor_quantity, backroom_quantity, inventory_as_of = _inventory_quantities(
         db,
@@ -1004,16 +1063,15 @@ def _evaluate_sku(
         run.store_id,
         sku.id,
     )
-    # An active task reserves its full requested quantity even after a user records
-    # partial movement, because the RFID aggregate may not have observed that movement
-    # yet. Recently verified work stays reserved until a later aggregate transition.
-    open_task_quantity = task.quantity if task is not None else 0
-    open_task_quantity += _unreflected_verified_quantity(
+    # Active and terminal work reserves only units not yet FIFO-linked to confirmed
+    # backroom-to-floor EPC transitions. This keeps the RFID projection plus work
+    # reservation from counting the same physical unit twice.
+    open_task_quantity = _unreflected_active_task_quantity(db, task)
+    open_task_quantity += _unreflected_terminal_moved_quantity(
         db,
         run.tenant_id,
         run.store_id,
         sku.id,
-        inventory_as_of,
     )
     policy = resolve_policy(
         db,
@@ -1140,6 +1198,7 @@ def create_replenishment_run(
     idempotency_key: str | None = None,
     evaluated_at: datetime | None = None,
 ) -> ReplenishmentRun:
+    require_reservation_cutover_ready(db)
     _get_tenant(db, tenant_id)
     _get_store(db, tenant_id, request.store_id)
     normalized_key = idempotency_key.strip() if idempotency_key is not None else None
@@ -1316,7 +1375,9 @@ def update_task(
     request: ReplenishmentTaskUpdate,
     *,
     actor_subject: str,
+    can_manage_task: bool,
 ) -> tuple[ReplenishmentTask, Sku]:
+    require_reservation_cutover_ready(db)
     _get_tenant(db, tenant_id)
     initial = db.scalar(
         select(ReplenishmentTask).where(
@@ -1326,7 +1387,7 @@ def update_task(
     )
     if initial is None:
         raise ApiError(404, "Task not found", "The requested task does not exist.")
-    _advisory_lock_store_sku(db, tenant_id, initial.store_id, initial.sku_id)
+    lock_replenishment_store_sku(db, tenant_id, initial.store_id, initial.sku_id)
     task = db.scalar(
         select(ReplenishmentTask)
         .where(
@@ -1345,6 +1406,33 @@ def update_task(
             f"{task.version}.",
             code="task_version_conflict",
         )
+    management_involved = (
+        task.status in MANAGED_OUTCOME_STATUSES or request.status in MANAGED_OUTCOME_STATUSES
+    )
+    if management_involved and not can_manage_task:
+        raise ApiError(
+            403,
+            "Task management permission required",
+            "Cancelling a task, placing it in exception, or updating a managed outcome "
+            "requires manager permission for this store.",
+            code="task_management_permission_required",
+        )
+    if task.status in TERMINAL_TASK_STATUSES:
+        exact_no_op = (
+            request.status is task.status
+            and request.moved_quantity is None
+            and request.note is None
+        )
+        if exact_no_op:
+            sku = _get_sku(db, tenant_id, task.sku_id)
+            return task, sku
+        raise ApiError(
+            409,
+            "Terminal task is immutable",
+            "Verified, cancelled, and exception task records cannot be changed; "
+            "create or evaluate new work instead.",
+            code="terminal_task_immutable",
+        )
     if not task_transition_allowed(task.status, request.status):
         raise ApiError(
             409,
@@ -1352,23 +1440,45 @@ def update_task(
             f"Task cannot transition from {task.status.value} to {request.status.value}.",
             code="invalid_task_transition",
         )
-    if (
-        task.claimed_by_subject is not None
-        and task.claimed_by_subject != actor_subject
-        and task.status
-        in {
-            ReplenishmentTaskStatus.CLAIMED,
-            ReplenishmentTaskStatus.IN_PROGRESS,
-            ReplenishmentTaskStatus.AWAITING_VERIFICATION,
-        }
-    ):
-        raise ApiError(
-            409,
-            "Task owned by another user",
-            "Only the user who claimed this active task may update it.",
-            code="task_claim_owner_conflict",
-        )
+    management_override = can_manage_task and request.status in MANAGED_OUTCOME_STATUSES
+    if task.status in OWNED_TASK_STATUSES and not management_override:
+        if task.claimed_by_subject is None:
+            raise ApiError(
+                409,
+                "Task is not claimed",
+                "The task must have a claimant before execution can continue.",
+                code="task_claim_required",
+            )
+        if task.claimed_by_subject != actor_subject:
+            raise ApiError(
+                409,
+                "Task owned by another user",
+                "Only the user who claimed this active task may update it.",
+                code="task_claim_owner_conflict",
+            )
     if request.moved_quantity is not None:
+        if task.claimed_by_subject is None:
+            raise ApiError(
+                409,
+                "Task is not claimed",
+                "moved_quantity can be recorded only after a user claims the task.",
+                code="task_claim_required",
+            )
+        if task.claimed_by_subject != actor_subject:
+            raise ApiError(
+                409,
+                "Task owned by another user",
+                "Only the task claimant may change moved_quantity.",
+                code="task_claim_owner_conflict",
+            )
+        if not task_movement_allowed(task.status, request.status):
+            raise ApiError(
+                409,
+                "Movement not allowed in task state",
+                "moved_quantity may change only while the claimant is executing the task; "
+                "first start or return the task to IN_PROGRESS, then record movement.",
+                code="task_movement_not_allowed",
+            )
         if request.moved_quantity < task.moved_quantity:
             raise ApiError(
                 422,
@@ -1386,6 +1496,29 @@ def update_task(
     resulting_moved_quantity = (
         request.moved_quantity if request.moved_quantity is not None else task.moved_quantity
     )
+    linked_movement_count = _linked_task_movement_count(db, task.id)
+    if request.status in MANAGED_OUTCOME_STATUSES:
+        # A confirmed floorward RFID transition is stronger evidence of physical
+        # movement than a stale client counter. Preserve that observed minimum when a
+        # manager closes partially executed work.
+        observed_movement_floor = min(
+            task.quantity,
+            task.reconciled_before_tracking_quantity + linked_movement_count,
+        )
+        resulting_moved_quantity = max(
+            resulting_moved_quantity,
+            observed_movement_floor,
+        )
+    if (
+        request.status is ReplenishmentTaskStatus.AWAITING_VERIFICATION
+        and resulting_moved_quantity != task.quantity
+    ):
+        raise ApiError(
+            422,
+            "Task movement is incomplete",
+            "A task may await verification only after moved_quantity equals quantity.",
+            code="task_awaiting_verification_incomplete",
+        )
     if (
         request.status is ReplenishmentTaskStatus.VERIFIED
         and resulting_moved_quantity != task.quantity
@@ -1395,6 +1528,13 @@ def update_task(
             "Task is not fully moved",
             "A task can be verified only after moved_quantity equals quantity.",
             code="task_verification_incomplete",
+        )
+    if request.status is ReplenishmentTaskStatus.OPEN and resulting_moved_quantity != 0:
+        raise ApiError(
+            409,
+            "Task cannot be released after movement",
+            "A claimed task may return to OPEN only before any movement is recorded.",
+            code="task_release_after_movement",
         )
 
     changed = (
@@ -1411,24 +1551,21 @@ def update_task(
     task.status = request.status
     if request.moved_quantity is not None:
         task.moved_quantity = request.moved_quantity
+    if request.status in MANAGED_OUTCOME_STATUSES:
+        task.moved_quantity = resulting_moved_quantity
     if request.note is not None:
         task.last_note = request.note
-    if request.status is ReplenishmentTaskStatus.CLAIMED:
+    if (
+        request.status is ReplenishmentTaskStatus.CLAIMED
+        and previous_status is ReplenishmentTaskStatus.OPEN
+    ):
         task.claimed_by_subject = actor_subject
         task.claimed_at = now
     elif request.status is ReplenishmentTaskStatus.OPEN:
         task.claimed_by_subject = None
         task.claimed_at = None
-    if request.status in {
-        ReplenishmentTaskStatus.VERIFIED,
-        ReplenishmentTaskStatus.CANCELLED,
-    }:
+    if request.status in TERMINAL_TASK_STATUSES and previous_status not in TERMINAL_TASK_STATUSES:
         task.completed_at = now
-    elif previous_status in {
-        ReplenishmentTaskStatus.VERIFIED,
-        ReplenishmentTaskStatus.CANCELLED,
-    }:
-        task.completed_at = None
     task.version += 1
     try:
         db.commit()

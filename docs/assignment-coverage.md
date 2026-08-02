@@ -32,7 +32,7 @@ The assignment does not supply workload rates, latency targets, source schemas, 
 | 4.2 | Restrict users to assigned stores and permitted operations | **Required - build** | Tenant-bound roles plus store scopes; server-derived tenant context | Cross-tenant, unassigned-store and insufficient-permission tests |
 | 5.1 | Ingest replenishment policies | Required - design | Validated, idempotent policy import/API with effective dates and scope | Invalid, duplicate, overlapping and effective-date scenarios |
 | 5.2 | Store and manage replenishment policies | **Required - build** | Policy CRUD/lifecycle APIs, effective intervals, revision/timestamps and deterministic precedence | CRUD, validation, interval-boundary and precedence tests |
-| 5.3 | Calculate required sales-floor replenishment | **Required - build** | Explainable calculation using floor state, backroom availability and open work | Boundary, shortage, insufficient-backroom and duplicate-task tests |
+| 5.3 | Calculate required sales-floor replenishment | **Required - build** | Explainable calculation using floor state, backroom availability and open work; owned execution and immutable terminal outcomes | Boundary, shortage, insufficient-backroom, duplicate/replacement-task and lifecycle authorization tests |
 | 5.4 | Publish accessible REST APIs for testing | **Required - build** | Implemented OpenAPI/Swagger service, stable bootstrap procedure, repository instructions and Render Blueprint; public URL pending deployment approval | Clean reviewer walkthrough against the deployed immutable version |
 
 ## Candidate expectations
@@ -58,7 +58,7 @@ The assignment says the candidate **may also address** the following. They stren
 | Support 100 stores today and 5,000 tomorrow | Capacity model, scale gates and regional-cell architecture | Hosted slice is not claimed to prove 5,000-store capacity |
 | Detect and reconcile inventory variance | Keep observed RFID presence conceptually separate from a future book-inventory ledger and variance workflow | Design only; book inventory and formal variance reconciliation are not implemented |
 | Late, duplicate or noisy RFID reads | Event idempotency, observed/ingested timestamps, non-regressing state and bounded movement confirmation | Covered by the PostgreSQL end-to-end slice |
-| Near-real-time floor availability | Durable asynchronous processing, bounded polling and `as_of` metadata | Target is a documented service objective, not a claim until measured |
+| Near-real-time floor availability | Durable asynchronous processing, bounded polling, projection-update time, and latest relevant observation-event time | Target is a documented service objective, not a claim until measured |
 | Receiving, transfers, returns and shrink | Define these as future book-ledger inputs rather than infer them from radio reads | Design boundary only; operational workflows are outside the core build |
 | CI/CD, deployment and observability | Tests, migrations, health endpoints, structured logs, release identity and a deployment blueprint | Metrics/alerts are an explicit production recommendation, not submitted telemetry infrastructure |
 | Hands-on coding, design and deployment choices | One cohesive vertical slice with clear module boundaries and operational documentation | Avoid microservice overhead that would dilute the required workflows |

@@ -67,6 +67,7 @@ class RfidBatchReceipt(ApiModel):
 
 class RfidObservationRead(ApiModel):
     id: uuid.UUID
+    acceptance_sequence: int
     event_id: str
     epc: str
     observed_at: datetime
@@ -91,7 +92,18 @@ class InventoryBalanceRead(ApiModel):
     sku_id: uuid.UUID
     sku_code: str
     quantity: int
-    as_of: datetime
+    projection_updated_at: datetime = Field(
+        description=(
+            "Database time when this confirmed aggregate projection was last refreshed "
+            "by a quantity change or relevant reaffirming observation."
+        )
+    )
+    last_relevant_observation_at: datetime | None = Field(
+        description=(
+            "Event time of the newest RFID observation that changed or reaffirmed "
+            "this confirmed aggregate; null when historical evidence is unavailable."
+        )
+    )
 
 
 class InventoryBalanceListRead(ApiModel):

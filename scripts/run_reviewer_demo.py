@@ -36,6 +36,7 @@ DEFAULT_POLICY_PATH = ROOT / "examples" / "policies.json"
 STORE_IDEMPOTENCY_KEY = "reviewer-demo-stores-v1"
 CATALOG_IDEMPOTENCY_KEY = "reviewer-demo-catalog-v1"
 POLICY_IDEMPOTENCY_KEY = "reviewer-demo-policies-v1"
+EVALUATION_IDEMPOTENCY_KEY = "reviewer-demo-evaluation-v1"
 DEMO_SKU_CODE = "SKU-TRAIL-BLUE-M"
 TERMINAL_CATALOG_FAILURES = frozenset({"FAILED", "REJECTED"})
 TERMINAL_RFID_FAILURES = frozenset({"LATE_IGNORED", "QUARANTINED"})
@@ -394,7 +395,7 @@ class ReviewerDemo:
                 expected_store_id=location.store_id,
                 announce=False,
             )
-        task = self._claim_task(
+        task = self._complete_task(
             tenant_id,
             actor_token,
             location.store_id,
@@ -857,7 +858,7 @@ class ReviewerDemo:
         sku_id: str,
     ) -> JsonObject:
         path = f"/v1/tenants/{tenant_id}/replenishment/evaluations"
-        idempotency_key = f"reviewer-evaluation-{uuid.uuid4()}"
+        idempotency_key = EVALUATION_IDEMPOTENCY_KEY
         for attempt in range(3):
             try:
                 run = _as_object(
@@ -893,7 +894,7 @@ class ReviewerDemo:
             raise DemoError("Evaluation did not resolve the imported policy")
         return line
 
-    def _claim_task(
+    def _complete_task(
         self,
         tenant_id: str,
         token: str,
@@ -920,27 +921,77 @@ class ReviewerDemo:
             raise DemoError("The generated replenishment task was not readable by the task actor")
         task = matches[0]
         current_status = _required_string(task, "status")
-        if current_status == "CLAIMED":
+        if current_status == "VERIFIED":
+            return task
+        if current_status in {"CANCELLED", "EXCEPTION"}:
+            raise DemoError(f"The demo task ended in terminal status {current_status}")
+        if current_status in {"CLAIMED", "IN_PROGRESS", "AWAITING_VERIFICATION"}:
             owner = _optional_string(task.get("claimed_by_subject"))
             if owner not in {None, actor_user_id}:
-                # A rerun must not steal a reviewer-visible task from its owner.
-                return task
-            return task
-        if current_status != "OPEN":
-            raise DemoError(f"Expected an OPEN task, but task is {current_status}")
-        return _as_object(
-            self.client.json(
-                "PATCH",
-                f"/v1/tenants/{tenant_id}/replenishment/tasks/{task_id}",
-                headers=self._bearer_headers(token),
-                payload={
-                    "status": "CLAIMED",
-                    "expected_version": _required_int(task, "version"),
-                    "note": "Claimed by reviewer demo",
-                },
-            ),
-            "task update response",
-        )
+                raise DemoError(f"The demo task is already owned by user {owner}")
+
+        quantity = _required_int(task, "quantity")
+
+        def patch_task(
+            status: str,
+            note: str,
+            *,
+            moved_quantity: int | None = None,
+        ) -> JsonObject:
+            payload: JsonObject = {
+                "status": status,
+                "expected_version": _required_int(task, "version"),
+                "note": note,
+            }
+            if moved_quantity is not None:
+                payload["moved_quantity"] = moved_quantity
+            return _as_object(
+                self.client.json(
+                    "PATCH",
+                    f"/v1/tenants/{tenant_id}/replenishment/tasks/{task_id}",
+                    headers=self._bearer_headers(token),
+                    payload=payload,
+                ),
+                "task update response",
+            )
+
+        if current_status == "OPEN":
+            task = patch_task("CLAIMED", "Claimed by reviewer demo")
+            current_status = _required_string(task, "status")
+
+        if current_status == "CLAIMED":
+            task = patch_task(
+                "IN_PROGRESS",
+                "Execution started by reviewer demo",
+            )
+            current_status = _required_string(task, "status")
+
+        if current_status == "IN_PROGRESS":
+            moved_quantity = _required_int(task, "moved_quantity")
+            if moved_quantity < quantity:
+                task = patch_task(
+                    "IN_PROGRESS",
+                    "Physical movement completed by reviewer demo",
+                    moved_quantity=quantity,
+                )
+            elif moved_quantity > quantity:
+                raise DemoError("The demo task reports movement above its requested quantity")
+            task = patch_task(
+                "AWAITING_VERIFICATION",
+                "Full movement submitted for verification",
+            )
+            current_status = _required_string(task, "status")
+
+        if current_status == "AWAITING_VERIFICATION":
+            task = patch_task(
+                "VERIFIED",
+                "Full movement verified by reviewer demo",
+            )
+            current_status = _required_string(task, "status")
+
+        if current_status != "VERIFIED":
+            raise DemoError(f"The demo task could not be completed from {current_status}")
+        return task
 
     def _poll(
         self,

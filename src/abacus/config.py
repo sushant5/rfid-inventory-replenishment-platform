@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     jwt_issuer: str = "abacus-assignment"
     jwt_audience: str = "abacus-api"
     access_token_minutes: int = Field(default=15, ge=1, le=1440)
+    login_throttle_enabled: bool = True
+    login_throttle_window_seconds: int = Field(default=60, ge=1, le=3600)
+    login_throttle_ip_limit: int = Field(default=30, ge=1, le=10_000)
+    login_throttle_account_limit: int = Field(default=5, ge=1, le=1000)
+    login_throttle_max_entries: int = Field(default=10_000, ge=2, le=1_000_000)
     platform_api_key: str = Field(
         default="local-platform-key-change-before-deploy",
         min_length=24,

@@ -119,6 +119,13 @@ observations from regressing current state. Reject inactive devices during
 authentication. Quarantine unknown EPCs, missing effective assignments, excessive
 future skew, suspended-tenant queued work and EPC rebinds requiring reconciliation.
 A reused event ID with different content receives an explicit conflict disposition.
+Serialize acceptance per tenant/EPC and let PostgreSQL assign a unique monotonic
+acceptance sequence. The lowest sequence among non-quarantined observations is the
+deterministic winner when cross-reader locations conflict at one `observed_at`;
+quarantine later conflicts and process same-location repeats without advancing
+movement evidence. Retain `reader_sequence` as device-local diagnostics rather than a
+global tie-breaker. The sequence uses `CACHE 1` so pooled connections cannot reserve
+out-of-order value blocks; gaps after rolled-back transactions are harmless.
 
 **Why:** Retries and failures make duplicates normal. Idempotency and version checks produce safe outcomes without an unverifiable exactly-once claim.
 
@@ -159,11 +166,21 @@ tie. A full before/after policy history is not implemented.
 **Decision:** Enqueue a targeted recalculation on confirmed RFID inventory changes
 and expose an on-demand explanation API for policy/configuration changes. Enforce at
 most one active task per tenant/store/SKU, reserve backroom stock for already-open
-work, and subtract reserved work from new recommendations. Preserve the full active
-reservation even after partial movement is recorded, and preserve verified work until
-a later RFID aggregate transition prevents an immediate duplicate task.
+work, and subtract reserved work from new recommendations. A task enters `IN_PROGRESS`
+before movement is recorded. Link each confirmed
+same-store `BACKROOM -> SALES_FLOOR` EPC change to at most one reserved unit, preferring
+the executing task and then the oldest terminal task. Reserve active `quantity` and
+terminal `moved_quantity` only to the extent not already linked. Store managers and
+corporate admins may override ownership only to cancel or record an exception.
+Verified, cancelled and exception outcomes are immutable; a remediated exception
+receives one fresh task on reevaluation instead of rewriting history. Same-zone and
+reverse movements do not consume reservations.
 
 **Why:** Repeated RFID events must not generate duplicate work for associates.
+
+**Trade-off:** Store/SKU FIFO attribution is deterministic but inferred. A production
+associate scan should capture both `task_id` and EPC when exact movement attribution is
+required.
 
 ### D14. API style
 
@@ -187,12 +204,12 @@ These rules are needed to make a demonstrable v1, but they are **not stated by t
 
 | ID | Provisional assumption | How the design limits risk |
 |---|---|---|
-| A1 | The hosted slice targets accepted observations becoming queryable within 10 seconds at p95 under the documented test load. | Return inventory `as_of`; derive lag from stored observation/job timestamps and publish measured results rather than claiming the target untested. |
+| A1 | The hosted slice targets accepted observations becoming queryable within 10 seconds at p95 under the documented test load. | Return both projection processing time and latest relevant observation-event time; derive lag from stored observation/job timestamps and publish measured results rather than claiming the target untested. |
 | A2 | RFID devices or an edge gateway can batch observations, buffer during loss of connectivity and retry with stable event IDs. | The API is idempotent; the production design identifies edge buffering as required. |
 | A3 | Source-supplied SKU, UPC and EPC mappings are authoritative unless a reconciliation conflict is detected. | Reject conflicting imports or quarantine an unsafe live EPC rebind; retain evidence instead of guessing a mapping. |
 | A4 | Product imports can be incremental as well as initial full loads; absence from an incremental file does not delete data. | Require an explicit import mode and explicit delete/end-date operation. |
 | A5 | A product-master batch is promoted all-or-nothing; invalid rows prevent every canonical catalog mutation. | Preserve all staged rows and errors so the source can be corrected and resubmitted safely. |
-| A6 | A move between zones requires consecutive confirmation within a bounded window; a single missing or weak read does not prove absence. | Keep candidate and confirmed state internally; expose inventory `as_of`. Confirmation count/window remain configuration. |
+| A6 | A move between zones requires consecutive confirmation within a bounded window; a single missing or weak read does not prove absence. | Keep candidate and confirmed state internally; expose distinct projection and observation freshness. Confirmation count/window remain configuration. |
 | A7 | A policy supplies at least a minimum floor quantity and target floor quantity; maximum is optional. | Validate `0 <= minimum <= target <= maximum` when maximum exists. Model supports later rule changes. |
 | A8 | When floor quantity is below minimum, the v1 recommendation is `min(target - floor - open_task_qty, backroom - reserved_backroom)`, bounded below by zero. | Return the inputs, chosen rule and formula in the explanation response. Replace once Orange confirms semantics. |
 | A9 | A selector at style/category/size scope yields a target for each matched SKU, not one pool to allocate across SKUs. | Document this limitation; aggregate allocation requires an explicit allocation strategy from the customer. |

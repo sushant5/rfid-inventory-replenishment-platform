@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from abacus.enums import JobKind, JobStatus
 from abacus.models.jobs import DurableJob
+from abacus.services.cutover import ensure_reservation_cutover_ready
 
 
 def enqueue_job(
@@ -38,6 +39,9 @@ def claim_jobs(
     limit: int,
     lease_seconds: int,
 ) -> list[DurableJob]:
+    # Readiness does not stop a separately deployed worker. Refuse to lease any
+    # durable work while legacy replenishment reservations await reconciliation.
+    ensure_reservation_cutover_ready(db)
     now = datetime.now(UTC)
     claimable = or_(
         and_(

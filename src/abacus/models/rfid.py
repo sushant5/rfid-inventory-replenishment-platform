@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     Enum,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -24,7 +26,22 @@ class RfidObservation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "rfid_observations"
     __table_args__ = (
         UniqueConstraint("tenant_id", "event_id", name="uq_rfid_observations_tenant_event"),
-        Index("ix_rfid_observations_epc_time", "tenant_id", "epc", "observed_at"),
+        UniqueConstraint(
+            "acceptance_sequence",
+            name="uq_rfid_observations_acceptance_sequence",
+        ),
+        Index(
+            "ix_rfid_observations_epc_time_acceptance",
+            "tenant_id",
+            "epc",
+            "observed_at",
+            "acceptance_sequence",
+        ),
+        Index(
+            "ix_rfid_observations_tenant_acceptance",
+            "tenant_id",
+            "acceptance_sequence",
+        ),
         Index("ix_rfid_observations_status_time", "status", "ingested_at"),
     )
 
@@ -53,6 +70,11 @@ class RfidObservation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     resolution_strategy: Mapped[str | None] = mapped_column(String(32), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    acceptance_sequence: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("nextval('rfid_observation_acceptance_seq'::regclass)"),
+    )
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     reader_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
     antenna_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -158,6 +180,20 @@ class InventoryBalance(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Processing time of the last quantity transition. Replenishment uses this
+    # instead of ``updated_at`` so a same-location freshness refresh cannot make
+    # verified physical work appear in the RFID quantity projection.
+    quantity_changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    # Event time for the newest RFID observation that changed or reaffirmed this
+    # confirmed projection. This is intentionally separate from ``updated_at``,
+    # which is database/projection processing time.
+    last_relevant_observation_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
 
 class InventoryChange(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -165,6 +201,11 @@ class InventoryChange(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("observation_id", name="uq_inventory_changes_observation"),
         Index("ix_inventory_changes_store_time", "tenant_id", "to_store_id", "observed_at"),
+        Index(
+            "ix_inventory_changes_replenishment_task",
+            "replenishment_task_id",
+            postgresql_where=text("replenishment_task_id IS NOT NULL"),
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -179,6 +220,10 @@ class InventoryChange(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     observation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("rfid_observations.id", ondelete="RESTRICT"),
         nullable=False,
+    )
+    replenishment_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("replenishment_tasks.id", ondelete="RESTRICT"),
+        nullable=True,
     )
     from_store_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("stores.id", ondelete="RESTRICT"),

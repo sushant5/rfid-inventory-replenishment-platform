@@ -13,6 +13,7 @@ from abacus.db import SessionLocal
 from abacus.enums import JobKind
 from abacus.logging import configure_logging
 from abacus.models.jobs import DurableJob
+from abacus.services.cutover import ReservationCutoverPending
 from abacus.services.jobs import claim_jobs, mark_completed, mark_failed, renew_lease
 
 configure_logging()
@@ -87,6 +88,7 @@ def run() -> None:
     settings = get_settings()
     worker_id = f"{socket.gethostname()}-{uuid.uuid4()}"
     logger.info("worker_started", worker_id=worker_id)
+    cutover_warning_emitted = False
 
     while not _stop_requested:
         claim_session = SessionLocal()
@@ -99,6 +101,14 @@ def run() -> None:
                 limit=1,
                 lease_seconds=settings.worker_lease_seconds,
             )
+            cutover_warning_emitted = False
+        except ReservationCutoverPending:
+            claim_session.rollback()
+            if not cutover_warning_emitted:
+                logger.warning("reservation_cutover_pending", worker_id=worker_id)
+                cutover_warning_emitted = True
+            time.sleep(min(5.0, settings.worker_poll_interval_ms / 1000))
+            continue
         except Exception:
             claim_session.rollback()
             logger.exception("job_claim_failed", worker_id=worker_id)
