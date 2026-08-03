@@ -33,8 +33,8 @@ jobs:
       JWT_SECRET: ci-only-secret-with-more-than-thirty-two-characters
       PLATFORM_API_KEY: ci-only-platform-key-long-enough
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13.14"
           cache: pip
@@ -49,7 +49,7 @@ jobs:
       - name: Migrate clean database
         run: alembic upgrade head
       - name: Test
-        run: pytest --cov=abacus --cov-report=term-missing --cov-report=xml
+        run: python -m pytest --cov=abacus --cov-report=term-missing --cov-report=xml
       - name: Verify migration metadata
         run: alembic check
       - name: Build recruiter response PDF

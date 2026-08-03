@@ -4,7 +4,7 @@ subtitle: GreyOrange - Abacus Engineering Exercise
 candidate: Sushant
 date: August 2, 2026
 status: SUBMISSION CANDIDATE - HOSTED URL PENDING
-release_note: Local verification is complete. Push the tested tag, grant reviewer repository access, and complete the hosted Render deployment before recruiter submission.
+release_note: Release verification is complete. Grant reviewer repository access and complete the hosted Render deployment before recruiter submission.
 ---
 
 # Executive Summary
@@ -16,7 +16,7 @@ The submitted vertical slice uses Python, FastAPI, PostgreSQL 17, SQLAlchemy, Al
 The design prioritizes tenant isolation, safe retries, transactional consistency, effective-dated hardware and EPC mappings, retained RFID evidence, at-least-once processing with idempotent effects, and explainable replenishment decisions. The implementation addresses the required 100-store scenario. A regional Kafka architecture is a future scale path when measured traffic, replay requirements, or multiple consumers justify its operational cost.
 
 :::callout
-Release candidate repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home` (private). The locally tested release is tagged `submission-code-v3`; pushing that tag, granting reviewer access, and publishing the hosted API URL remain account-level release steps before this document is sent to the recruiter.
+Release candidate repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home` (private). The locally tested release is tagged `submission-code-v4`; granting reviewer access and publishing the hosted API URL remain account-level release steps before this document is sent to the recruiter.
 :::
 
 ## Submitted Demo Scope
@@ -373,7 +373,7 @@ OpenAPI `3.1.0`, and `/openapi.json` is the authoritative contract rendered by `
 9. Repeat representative requests to demonstrate idempotency and negative authorization.
 
 :::callout
-Repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home` at local release tag `submission-code-v3`. Before submission, push the tag, verify reviewer access, and add the hosted base URL, Swagger/OpenAPI/version URLs, and dedicated reviewer credentials. Keep the platform integration key in the private recruiter email, never in the repository.
+Repository: `https://github.com/sushant5/greyorange-abacus-engineering-take-home` at release tag `submission-code-v4`. Before submission, verify reviewer access and add the hosted base URL, Swagger/OpenAPI/version URLs, and dedicated reviewer credentials. Keep the platform integration key in the private recruiter email, never in the repository.
 :::
 
 # Deployment and Operations
@@ -460,7 +460,7 @@ Kafka provides partitioned ordering, replay, and independent consumers. Regional
 
 ## Honest Implementation Boundaries
 
-- The locally tagged source release still requires a remote push and reviewer access; no hosted URL is claimed before a verified deployment exists.
+- The private source release still requires reviewer access; no hosted URL is claimed before a verified deployment exists.
 - The submitted worker polls PostgreSQL; Kafka and SQS are not implemented.
 - Processing is at-least-once with idempotent effects, not exactly once.
 - Comprehensive PostgreSQL RLS and composite tenant foreign keys are not implemented.
@@ -481,9 +481,9 @@ Local release verification on August 2, 2026 passed all 73 tests against Postgre
 drift checks also passed. The one-command reviewer runner completed the full path twice
 against a clean local API, worker, and database, including a safe idempotent rerun.
 
-The locally verified code release is tagged `submission-code-v3`. Before recruiter
-submission, push the tag and add the hosted URL and matching `/version` value after
-rerunning the same verifier against the deployed build.
+The verified code release is tagged `submission-code-v4`. Before recruiter submission,
+add the hosted URL and matching `/version` value after rerunning the same verifier
+against the deployed build.
 
 ---
 
