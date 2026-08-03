@@ -155,6 +155,7 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                 admin_email=admin_email,
                 admin_password=admin_password,
                 request_timeout=2.0,
+                startup_timeout=2.0,
                 poll_timeout=2.0,
             )
         )

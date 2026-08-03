@@ -3,18 +3,34 @@ import uuid
 import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
+from sqlalchemy import delete, update
+from sqlalchemy.orm import Session, sessionmaker
 
+from abacus.api.errors import ApiError
 from abacus.api.routes.canonical_replenishment import router
-from abacus.models.architecture import CanonicalTaskStatus
+from abacus.models.architecture import (
+    CanonicalTaskStatus,
+    PolicyDefinition,
+    PolicyRule,
+    PolicyVersion,
+    PolicyVersionStatus,
+)
+from abacus.models.identity import IdentityRole
+from abacus.models.tenancy import Tenant
 from abacus.schemas.canonical_replenishment import (
     PolicyCreate,
     PolicyRuleWrite,
     ReplenishmentEvaluationCreate,
 )
+from abacus.security import Principal, RoleScope
 from abacus.services.canonical_replenishment import (
+    PolicyBundle,
     RuleDescriptor,
     SkuContext,
+    _visible_bundle,
     calculate_replenishment_quantity,
+    get_policy_bundle,
+    list_policy_bundles,
     rule_precedence,
     rules_overlap,
     select_policy_rule,
@@ -170,12 +186,187 @@ def test_canonical_bodies_reject_client_supplied_tenant_id() -> None:
         )
 
 
+def test_store_scoped_policy_reader_sees_only_global_and_assigned_store_rules() -> None:
+    tenant_id = uuid.uuid4()
+    assigned_store_id = uuid.uuid4()
+    other_store_id = uuid.uuid4()
+    policy_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    policy = PolicyDefinition(
+        id=policy_id,
+        tenant_id=tenant_id,
+        name="Scoped policy",
+        description=None,
+    )
+    version = PolicyVersion(
+        id=version_id,
+        tenant_id=tenant_id,
+        policy_id=policy_id,
+        version_number=1,
+        status=PolicyVersionStatus.ACTIVE,
+    )
+
+    def rule(store_id: uuid.UUID | None) -> PolicyRule:
+        return PolicyRule(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            version_id=version_id,
+            store_id=store_id,
+            category="APPAREL",
+            min_floor_qty=1,
+            target_floor_qty=2,
+            priority=0,
+        )
+
+    global_rule = rule(None)
+    assigned_rule = rule(assigned_store_id)
+    hidden_rule = rule(other_store_id)
+    principal = Principal(
+        user_id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        email="associate@example.com",
+        display_name="Associate",
+        role_scopes=(RoleScope(IdentityRole.STORE_ASSOCIATE, assigned_store_id),),
+    )
+
+    visible = _visible_bundle(
+        PolicyBundle(policy, version, (global_rule, assigned_rule, hidden_rule)),
+        principal,
+    )
+    assert visible is not None
+    assert visible.rules == (global_rule, assigned_rule)
+    assert _visible_bundle(PolicyBundle(policy, version, (hidden_rule,)), principal) is None
+
+
+@pytest.mark.integration
+def test_policy_discovery_prefers_active_and_can_select_latest_draft(
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    tenant_id = uuid.uuid4()
+    policy_id = uuid.uuid4()
+    active_version_id = uuid.uuid4()
+    draft_version_id = uuid.uuid4()
+    principal = Principal(
+        user_id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        email="admin@example.com",
+        display_name="Admin",
+        role_scopes=(RoleScope(IdentityRole.CORPORATE_ADMIN, None),),
+    )
+
+    with postgres_session_factory() as db:
+        db.add(Tenant(id=tenant_id, code=f"policy-{tenant_id.hex}", name="Policy test"))
+        db.flush()
+        db.add(
+            PolicyDefinition(
+                id=policy_id,
+                tenant_id=tenant_id,
+                name="Effective version selection",
+                description=None,
+            )
+        )
+        db.flush()
+        db.add_all(
+            [
+                PolicyVersion(
+                    id=active_version_id,
+                    tenant_id=tenant_id,
+                    policy_id=policy_id,
+                    version_number=1,
+                    status=PolicyVersionStatus.DRAFT,
+                ),
+                PolicyVersion(
+                    id=draft_version_id,
+                    tenant_id=tenant_id,
+                    policy_id=policy_id,
+                    version_number=2,
+                    status=PolicyVersionStatus.DRAFT,
+                ),
+            ]
+        )
+        db.flush()
+        for version_id in (active_version_id, draft_version_id):
+            db.add(
+                PolicyRule(
+                    id=uuid.uuid4(),
+                    tenant_id=tenant_id,
+                    version_id=version_id,
+                    min_floor_qty=1,
+                    target_floor_qty=2,
+                    priority=0,
+                )
+            )
+        db.flush()
+        active_version = db.get(PolicyVersion, active_version_id)
+        assert active_version is not None
+        active_version.status = PolicyVersionStatus.ACTIVE
+        db.commit()
+
+        try:
+            effective = get_policy_bundle(db, principal, policy_id)
+            draft = get_policy_bundle(
+                db,
+                principal,
+                policy_id,
+                version_status=PolicyVersionStatus.DRAFT,
+            )
+            effective_list, total = list_policy_bundles(
+                db,
+                principal,
+                limit=10,
+                offset=0,
+            )
+            draft_list, draft_total = list_policy_bundles(
+                db,
+                principal,
+                limit=10,
+                offset=0,
+                version_status=PolicyVersionStatus.DRAFT,
+            )
+            read_only_principal = Principal(
+                user_id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                email="associate@example.com",
+                display_name="Associate",
+                role_scopes=(RoleScope(IdentityRole.STORE_ASSOCIATE, uuid.uuid4()),),
+            )
+            read_only_effective = get_policy_bundle(db, read_only_principal, policy_id)
+
+            assert effective.version.id == active_version_id
+            assert draft.version.id == draft_version_id
+            assert read_only_effective.version.id == active_version_id
+            assert total == draft_total == 1
+            assert [bundle.version.id for bundle in effective_list] == [active_version_id]
+            assert [bundle.version.id for bundle in draft_list] == [draft_version_id]
+            with pytest.raises(ApiError) as forbidden:
+                get_policy_bundle(
+                    db,
+                    read_only_principal,
+                    policy_id,
+                    version_status=PolicyVersionStatus.DRAFT,
+                )
+            assert forbidden.value.status_code == 403
+            assert forbidden.value.code == "policy_version_status_forbidden"
+        finally:
+            db.execute(
+                update(PolicyVersion)
+                .where(PolicyVersion.tenant_id == tenant_id)
+                .values(status=PolicyVersionStatus.DRAFT)
+            )
+            db.commit()
+            db.execute(delete(PolicyRule).where(PolicyRule.tenant_id == tenant_id))
+            db.execute(delete(Tenant).where(Tenant.id == tenant_id))
+            db.commit()
+
+
 def test_canonical_replenishment_api_is_versioned_and_jwt_secured() -> None:
     app = FastAPI()
     app.include_router(router)
     paths = app.openapi()["paths"]
     expected = {
+        ("get", "/v1/replenishment-policies"),
         ("post", "/v1/replenishment-policies"),
+        ("get", "/v1/replenishment-policies/{policy_id}"),
         ("post", "/v1/replenishment-policies/{policy_id}/versions"),
         ("patch", "/v1/replenishment-policy-versions/{version_id}"),
         ("post", "/v1/replenishment-policy-versions/{version_id}/activate"),

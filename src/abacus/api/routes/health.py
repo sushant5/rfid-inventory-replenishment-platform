@@ -12,7 +12,7 @@ from abacus.config import get_settings
 from abacus.db import get_db
 
 router = APIRouter(tags=["Operations"])
-EXPECTED_SCHEMA_REVISION = "e9b7c1a4d205"
+EXPECTED_SCHEMA_REVISION = "f0c1d2e3a4b5"
 
 
 class HealthResponse(BaseModel):

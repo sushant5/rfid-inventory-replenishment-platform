@@ -12,7 +12,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import abacus.processes.event_worker as event_worker
 from abacus.api.errors import ApiError
-from abacus.api.routes.rfid import get_store_inventory_endpoint
+from abacus.api.routes.rfid import (
+    get_item_state_endpoint,
+    get_store_inventory_endpoint,
+    list_rfid_quarantine_endpoint,
+)
 from abacus.config import Settings
 from abacus.enums import DeviceStatus, StoreStatus, TenantStatus, ZoneKind
 from abacus.events.rfid import RfidObservationEvent
@@ -362,7 +366,62 @@ def test_inventory_api_reads_bucket_metadata_from_current_item_state(
         assert projection.confidence > 0.7
 
 
-def test_replenishment_suppresses_stale_projection_with_low_current_state_confidence(
+def test_item_and_bucket_confidence_age_while_store_remains_live(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    _establish_projection(postgres_session_factory, durable_pipeline)
+    now = datetime.now(UTC)
+    settings = Settings(rfid_confidence_half_life_seconds=1800)
+
+    with postgres_session_factory() as db:
+        state = db.get(CurrentItemState, (durable_pipeline.tenant_id, durable_pipeline.epc))
+        connectivity = db.get(
+            StoreConnectivity,
+            (durable_pipeline.tenant_id, durable_pipeline.store_id),
+        )
+        assert state is not None
+        assert connectivity is not None
+        state.confidence = 1.0
+        state.last_observed_at = now - timedelta(minutes=30)
+        connectivity.gateway_last_heartbeat = now
+        connectivity.last_live_event_at = now
+        connectivity.oldest_buffered_event_at = None
+        connectivity.backlog_drained = True
+        connectivity.reader_coverage_ok = True
+        db.commit()
+
+        inventory = get_store_inventory_endpoint(
+            durable_pipeline.store_id,
+            db,
+            settings,
+            _tenant_admin(durable_pipeline),
+        )
+        item = get_item_state_endpoint(
+            durable_pipeline.epc,
+            db,
+            settings,
+            _tenant_admin(durable_pipeline),
+        )
+
+        assert inventory[0].freshness_status == FreshnessStatus.LIVE
+        assert inventory[0].confidence == pytest.approx(0.5, abs=0.001)
+        assert item.freshness_status == FreshnessStatus.LIVE
+        assert item.confidence == pytest.approx(0.5, abs=0.001)
+
+        # Rebuilding snapshot metadata must not make old item evidence look fresh.
+        assert rebuild_inventory_projection(db, durable_pipeline.tenant_id) == 1
+        db.commit()
+        rebuilt_inventory = get_store_inventory_endpoint(
+            durable_pipeline.store_id,
+            db,
+            settings,
+            _tenant_admin(durable_pipeline),
+        )
+        assert rebuilt_inventory[0].confidence == pytest.approx(0.5, abs=0.001)
+
+
+def test_replenishment_suppresses_old_item_evidence_while_store_remains_live(
     postgres_session_factory: sessionmaker[Session],
     durable_pipeline: DurablePipelineFixture,
 ) -> None:
@@ -393,10 +452,10 @@ def test_replenishment_suppresses_stale_projection_with_low_current_state_confid
         assert connectivity is not None
         assert floor_projection.confidence > 0.7
 
-        # Ambiguous evidence can lower item confidence without a quantity transition,
-        # so the materialized projection intentionally still has its prior confidence.
-        floor_state.confidence = 0.2
-        floor_state.last_observed_at = now
+        # The materialized projection keeps its prior snapshot confidence, while
+        # current item evidence ages independently without a quantity transition.
+        floor_state.confidence = 1.0
+        floor_state.last_observed_at = now - timedelta(minutes=30)
         connectivity.gateway_last_heartbeat = now
         connectivity.last_live_event_at = now
         connectivity.oldest_buffered_event_at = None
@@ -469,7 +528,7 @@ def test_replenishment_suppresses_stale_projection_with_low_current_state_confid
             db,
             _tenant_admin(durable_pipeline),
             ReplenishmentEvaluationCreate(store_id=durable_pipeline.store_id),
-            settings=Settings(),
+            settings=Settings(rfid_confidence_half_life_seconds=1800),
             minimum_confidence=0.7,
         )
 
@@ -1128,6 +1187,102 @@ def test_unknown_epc_rejects_every_link_and_completes_retry_batches(
             )
         )
         assert quarantine is not None
+        other_tenant_id = uuid.uuid4()
+        other_store_id = uuid.uuid4()
+        other_zone_id = uuid.uuid4()
+        other_device_id = uuid.uuid4()
+        other_batch_id = uuid.uuid4()
+        db.add(
+            Tenant(
+                id=other_tenant_id,
+                code=f"quarantine-{other_tenant_id.hex}",
+                name="Other quarantine tenant",
+                status=TenantStatus.ACTIVE,
+            )
+        )
+        db.flush()
+        db.add_all(
+            [
+                Store(
+                    id=other_store_id,
+                    tenant_id=other_tenant_id,
+                    code="other-store",
+                    name="Other store",
+                    timezone="UTC",
+                    status=StoreStatus.ACTIVE,
+                    configuration={},
+                ),
+                Device(
+                    id=other_device_id,
+                    tenant_id=other_tenant_id,
+                    serial_number=f"OTHER-{other_tenant_id.hex}",
+                    display_name="Other device",
+                    status=DeviceStatus.ACTIVE,
+                ),
+            ]
+        )
+        db.flush()
+        db.add(
+            Zone(
+                id=other_zone_id,
+                tenant_id=other_tenant_id,
+                store_id=other_store_id,
+                code="other-zone",
+                name="Other zone",
+                kind=ZoneKind.SALES_FLOOR,
+            )
+        )
+        db.flush()
+        db.add(
+            RfidObservationBatch(
+                id=other_batch_id,
+                tenant_id=other_tenant_id,
+                device_id=other_device_id,
+                store_id=other_store_id,
+                zone_id=other_zone_id,
+                status=ObservationBatchStatus.COMPLETED_WITH_ERRORS,
+                accepted_count=1,
+                processed_count=0,
+                rejected_count=1,
+                received_at=received_at,
+                completed_at=received_at,
+            )
+        )
+        db.flush()
+        db.add(
+            RfidQuarantine(
+                tenant_id=other_tenant_id,
+                batch_id=other_batch_id,
+                event_id=event_id,
+                reason="OTHER_TENANT_EVENT",
+                payload={"tenant_marker": "other"},
+            )
+        )
+        db.commit()
+        try:
+            page = list_rfid_quarantine_endpoint(
+                db,
+                _tenant_admin(durable_pipeline),
+                event_id=event_id,
+            )
+            assert page.total == 1
+            assert page.items[0].event_id == event_id
+            assert page.items[0].reason == "UNKNOWN_EPC"
+            assert page.items[0].payload.get("tenant_marker") is None
+            store_reader = Principal(
+                user_id=uuid.uuid4(),
+                tenant_id=durable_pipeline.tenant_id,
+                email="store-reader@example.test",
+                display_name="Store reader",
+                role_scopes=(RoleScope(IdentityRole.STORE_ASSOCIATE, durable_pipeline.store_id),),
+            )
+            with pytest.raises(ApiError) as forbidden:
+                list_rfid_quarantine_endpoint(db, store_reader)
+            assert forbidden.value.status_code == 403
+            assert forbidden.value.code == "tenant_inventory_scope_required"
+        finally:
+            db.execute(delete(Tenant).where(Tenant.id == other_tenant_id))
+            db.commit()
 
     terminal_retry_id = _accept(
         postgres_session_factory,

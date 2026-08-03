@@ -85,6 +85,39 @@ class UserStoreAssignmentsRead(ApiModel):
     store_ids: list[uuid.UUID]
 
 
+class UserAccessReplace(ApiModel):
+    """Atomically replace roles and store assignments as one valid access state."""
+
+    roles: list[CanonicalIdentityRole] = Field(min_length=1, max_length=4)
+    store_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_access_pair(self) -> "UserAccessReplace":
+        if len(self.roles) != len(set(self.roles)):
+            raise ValueError("roles cannot contain duplicates")
+        if len(self.store_ids) != len(set(self.store_ids)):
+            raise ValueError("store_ids cannot contain duplicates")
+        has_store_role = bool(
+            set(self.roles).intersection(
+                {
+                    CanonicalIdentityRole.STORE_ASSOCIATE,
+                    CanonicalIdentityRole.STORE_MANAGER,
+                }
+            )
+        )
+        if has_store_role and not self.store_ids:
+            raise ValueError("store-scoped roles require at least one store_id")
+        if not has_store_role and self.store_ids:
+            raise ValueError("store_ids require a store-scoped role")
+        return self
+
+
+class UserAccessRead(ApiModel):
+    user_id: uuid.UUID
+    roles: list[CanonicalIdentityRole]
+    store_ids: list[uuid.UUID]
+
+
 class UserCreate(ApiModel):
     email: EmailStr
     display_name: str = Field(min_length=1, max_length=255)

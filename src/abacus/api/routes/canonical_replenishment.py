@@ -4,8 +4,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, status
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
-from abacus.models.architecture import CanonicalTaskStatus
+from abacus.models.architecture import CanonicalTaskStatus, PolicyVersionStatus
 from abacus.schemas.canonical_replenishment import (
+    PolicyBundlePage,
     PolicyBundleRead,
     PolicyCreate,
     PolicyDefinitionRead,
@@ -24,6 +25,8 @@ from abacus.services.canonical_replenishment import (
     clone_policy_version,
     create_policy,
     evaluate_replenishment,
+    get_policy_bundle,
+    list_policy_bundles,
     list_store_tasks,
     patch_policy_version,
     patch_replenishment_task,
@@ -34,6 +37,10 @@ router = APIRouter(prefix="/v1", tags=["5. Canonical replenishment"])
 CanManagePolicies = Annotated[
     Principal,
     Depends(require_permission(Permission.POLICY_MANAGE)),
+]
+CanReadPolicies = Annotated[
+    Principal,
+    Depends(require_permission(Permission.POLICY_READ)),
 ]
 CanEvaluateReplenishment = Annotated[
     Principal,
@@ -54,6 +61,54 @@ def _bundle_read(bundle: PolicyBundle) -> PolicyBundleRead:
         policy=PolicyDefinitionRead.model_validate(bundle.policy),
         version=PolicyVersionRead.model_validate(bundle.version),
         rules=[PolicyRuleRead.model_validate(rule) for rule in bundle.rules],
+    )
+
+
+@router.get(
+    "/replenishment-policies",
+    response_model=PolicyBundlePage,
+    operation_id="listReplenishmentPolicies",
+)
+def list_policies_endpoint(
+    db: DatabaseSession,
+    principal: CanReadPolicies,
+    version_status: Annotated[PolicyVersionStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> PolicyBundlePage:
+    bundles, total = list_policy_bundles(
+        db,
+        principal,
+        limit=limit,
+        offset=offset,
+        version_status=version_status,
+    )
+    return PolicyBundlePage(
+        items=[_bundle_read(bundle) for bundle in bundles],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/replenishment-policies/{policy_id}",
+    response_model=PolicyBundleRead,
+    operation_id="getReplenishmentPolicy",
+)
+def get_policy_endpoint(
+    policy_id: uuid.UUID,
+    db: DatabaseSession,
+    principal: CanReadPolicies,
+    version_status: Annotated[PolicyVersionStatus | None, Query(alias="status")] = None,
+) -> PolicyBundleRead:
+    return _bundle_read(
+        get_policy_bundle(
+            db,
+            principal,
+            policy_id,
+            version_status=version_status,
+        )
     )
 
 

@@ -25,6 +25,7 @@ from abacus.models.identity import (
 from abacus.models.tenancy import Store, Tenant
 from abacus.schemas.identity import (
     CanonicalUserCreate,
+    UserAccessReplace,
     UserCreate,
     UserRolesReplace,
     UserStoreAssignmentsReplace,
@@ -872,6 +873,178 @@ def _ensure_valid_canonical_access_pair(
         )
 
 
+def _ensure_valid_store_ids(
+    db: Session,
+    tenant_id: uuid.UUID,
+    store_ids: frozenset[uuid.UUID],
+) -> None:
+    if not store_ids:
+        return
+    valid_store_ids = frozenset(
+        db.scalars(
+            select(Store.id).where(
+                Store.tenant_id == tenant_id,
+                Store.id.in_(store_ids),
+                Store.status != StoreStatus.INACTIVE,
+            )
+        ).all()
+    )
+    if valid_store_ids != store_ids:
+        raise ApiError(
+            422,
+            "Invalid store scope",
+            "Every assignment must reference a non-inactive store in the current tenant.",
+            code="invalid_store_scope",
+        )
+
+
+def _ensure_not_removing_last_tenant_admin(
+    db: Session,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    existing_roles: frozenset[CanonicalIdentityRole],
+    requested_roles: frozenset[CanonicalIdentityRole],
+) -> None:
+    if not (
+        CanonicalIdentityRole.TENANT_ADMIN in existing_roles
+        and CanonicalIdentityRole.TENANT_ADMIN not in requested_roles
+    ):
+        return
+    another_canonical_admin = db.scalar(
+        select(UserRole.user_id)
+        .join(User, User.id == UserRole.user_id)
+        .where(
+            UserRole.tenant_id == tenant_id,
+            UserRole.user_id != user_id,
+            UserRole.role == CanonicalIdentityRole.TENANT_ADMIN,
+            User.status == UserStatus.ACTIVE,
+        )
+        .limit(1)
+    )
+    another_legacy_admin = db.scalar(
+        select(UserAccessGrant.user_id)
+        .join(User, User.id == UserAccessGrant.user_id)
+        .where(
+            UserAccessGrant.tenant_id == tenant_id,
+            UserAccessGrant.user_id != user_id,
+            UserAccessGrant.role == IdentityRole.CORPORATE_ADMIN,
+            UserAccessGrant.store_id.is_(None),
+            User.status == UserStatus.ACTIVE,
+        )
+        .limit(1)
+    )
+    if another_canonical_admin is None and another_legacy_admin is None:
+        raise ApiError(
+            409,
+            "Last tenant administrator",
+            "Assign another tenant administrator before removing this role.",
+            code="last_tenant_admin",
+        )
+
+
+def _audit_access_change(
+    db: Session,
+    *,
+    principal: Principal,
+    user: User,
+    previous_roles: frozenset[CanonicalIdentityRole],
+    previous_store_ids: frozenset[uuid.UUID],
+    requested_roles: frozenset[CanonicalIdentityRole],
+    requested_store_ids: frozenset[uuid.UUID],
+) -> None:
+    _add_audit_record(
+        db,
+        tenant_id=principal.tenant_id,
+        actor_user_id=principal.user_id,
+        action=IdentityAuditAction.USER_ACCESS_CHANGED,
+        target_user_id=user.id,
+        details={
+            "previous_roles": sorted(role.value for role in previous_roles),
+            "previous_store_ids": sorted(str(store_id) for store_id in previous_store_ids),
+            "roles": sorted(role.value for role in requested_roles),
+            "store_ids": sorted(str(store_id) for store_id in requested_store_ids),
+            "new_token_version": user.token_version,
+        },
+    )
+
+
+def replace_user_access(
+    db: Session,
+    principal: Principal,
+    user_id: uuid.UUID,
+    request: UserAccessReplace,
+) -> CanonicalUserAccess:
+    """Replace roles and scopes atomically so valid transitions cannot deadlock."""
+
+    if not principal.has_tenant_permission(Permission.USERS_CREATE):
+        raise ApiError(
+            403,
+            "Forbidden",
+            "Only a tenant administrator may replace complete user access.",
+            code="role_assignment_forbidden",
+        )
+    db.scalar(select(Tenant.id).where(Tenant.id == principal.tenant_id).with_for_update())
+    user = _lock_access_target(db, principal, user_id)
+    existing_roles, existing_store_ids, roles_missing, assignments_missing, grants = (
+        _load_canonical_access(db, principal.tenant_id, user.id)
+    )
+    requested_roles = frozenset(request.roles)
+    requested_store_ids = frozenset(request.store_ids)
+    _ensure_valid_canonical_access_pair(requested_roles, requested_store_ids)
+    _ensure_valid_store_ids(db, principal.tenant_id, requested_store_ids)
+    _ensure_not_removing_last_tenant_admin(
+        db,
+        principal.tenant_id,
+        user.id,
+        existing_roles,
+        requested_roles,
+    )
+
+    existing_specs = frozenset((grant.role, grant.store_id) for grant in grants)
+    desired_specs = _compatibility_grant_specs(requested_roles, requested_store_ids)
+    access_changed = (
+        requested_roles != existing_roles
+        or requested_store_ids != existing_store_ids
+        or desired_specs != existing_specs
+    )
+    if not access_changed and not roles_missing and not assignments_missing:
+        return CanonicalUserAccess(
+            user_id=user.id,
+            roles=tuple(sorted(requested_roles, key=lambda item: item.value)),
+            store_ids=tuple(sorted(requested_store_ids, key=str)),
+        )
+
+    try:
+        _persist_role_rows(db, principal.tenant_id, user.id, requested_roles)
+        _persist_assignment_rows(db, principal.tenant_id, user.id, requested_store_ids)
+        _persist_compatibility_grants(db, principal.tenant_id, user.id, desired_specs)
+        if access_changed:
+            user.token_version += 1
+            _audit_access_change(
+                db,
+                principal=principal,
+                user=user,
+                previous_roles=existing_roles,
+                previous_store_ids=existing_store_ids,
+                requested_roles=requested_roles,
+                requested_store_ids=requested_store_ids,
+            )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Access update conflict",
+            "The user's access changed concurrently.",
+            code="user_access_update_conflict",
+        ) from exc
+    return CanonicalUserAccess(
+        user_id=user.id,
+        roles=tuple(sorted(requested_roles, key=lambda item: item.value)),
+        store_ids=tuple(sorted(requested_store_ids, key=str)),
+    )
+
+
 def replace_user_roles(
     db: Session,
     principal: Principal,
@@ -895,40 +1068,13 @@ def replace_user_roles(
     requested_roles = frozenset(request.roles)
     _ensure_valid_canonical_access_pair(requested_roles, store_ids)
 
-    if (
-        CanonicalIdentityRole.TENANT_ADMIN in existing_roles
-        and CanonicalIdentityRole.TENANT_ADMIN not in requested_roles
-    ):
-        another_canonical_admin = db.scalar(
-            select(UserRole.user_id)
-            .join(User, User.id == UserRole.user_id)
-            .where(
-                UserRole.tenant_id == principal.tenant_id,
-                UserRole.user_id != user.id,
-                UserRole.role == CanonicalIdentityRole.TENANT_ADMIN,
-                User.status == UserStatus.ACTIVE,
-            )
-            .limit(1)
-        )
-        another_legacy_admin = db.scalar(
-            select(UserAccessGrant.user_id)
-            .join(User, User.id == UserAccessGrant.user_id)
-            .where(
-                UserAccessGrant.tenant_id == principal.tenant_id,
-                UserAccessGrant.user_id != user.id,
-                UserAccessGrant.role == IdentityRole.CORPORATE_ADMIN,
-                UserAccessGrant.store_id.is_(None),
-                User.status == UserStatus.ACTIVE,
-            )
-            .limit(1)
-        )
-        if another_canonical_admin is None and another_legacy_admin is None:
-            raise ApiError(
-                409,
-                "Last tenant administrator",
-                "Assign another tenant administrator before removing this role.",
-                code="last_tenant_admin",
-            )
+    _ensure_not_removing_last_tenant_admin(
+        db,
+        principal.tenant_id,
+        user.id,
+        existing_roles,
+        requested_roles,
+    )
 
     existing_specs = frozenset((grant.role, grant.store_id) for grant in grants)
     desired_specs = _compatibility_grant_specs(requested_roles, store_ids)
@@ -948,6 +1094,15 @@ def replace_user_roles(
             _persist_compatibility_grants(db, principal.tenant_id, user.id, desired_specs)
         if access_changed:
             user.token_version += 1
+            _audit_access_change(
+                db,
+                principal=principal,
+                user=user,
+                previous_roles=existing_roles,
+                previous_store_ids=store_ids,
+                requested_roles=requested_roles,
+                requested_store_ids=store_ids,
+            )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -984,23 +1139,7 @@ def replace_user_store_assignments(
     requested_store_ids = frozenset(request.store_ids)
     _ensure_valid_canonical_access_pair(roles, requested_store_ids)
 
-    if requested_store_ids:
-        valid_store_ids = frozenset(
-            db.scalars(
-                select(Store.id).where(
-                    Store.tenant_id == principal.tenant_id,
-                    Store.id.in_(requested_store_ids),
-                    Store.status != StoreStatus.INACTIVE,
-                )
-            ).all()
-        )
-        if valid_store_ids != requested_store_ids:
-            raise ApiError(
-                422,
-                "Invalid store scope",
-                "Every assignment must reference a non-inactive store in the current tenant.",
-                code="invalid_store_scope",
-            )
+    _ensure_valid_store_ids(db, principal.tenant_id, requested_store_ids)
 
     if not principal.has_tenant_permission(Permission.USERS_CREATE):
         allowed_store_ids = principal.store_ids_for_permission(Permission.USERS_CREATE)
@@ -1033,6 +1172,15 @@ def replace_user_store_assignments(
             _persist_compatibility_grants(db, principal.tenant_id, user.id, desired_specs)
         if access_changed:
             user.token_version += 1
+            _audit_access_change(
+                db,
+                principal=principal,
+                user=user,
+                previous_roles=roles,
+                previous_store_ids=existing_store_ids,
+                requested_roles=roles,
+                requested_store_ids=requested_store_ids,
+            )
         db.commit()
     except IntegrityError as exc:
         db.rollback()

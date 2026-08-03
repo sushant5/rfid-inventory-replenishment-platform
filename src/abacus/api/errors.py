@@ -1,9 +1,11 @@
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -84,3 +86,46 @@ def install_error_handlers(app: FastAPI) -> None:
             content=problem.model_dump(exclude_none=True),
             media_type="application/problem+json",
         )
+
+
+def install_openapi_error_contract(app: FastAPI) -> None:
+    """Make generated clients see the validation envelope returned at runtime."""
+
+    def custom_openapi() -> dict[str, Any]:
+        if app.openapi_schema is not None:
+            return app.openapi_schema
+        schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            description=app.description,
+            routes=app.routes,
+        )
+        components = schema.setdefault("components", {}).setdefault("schemas", {})
+        components["ProblemDetail"] = ProblemDetail.model_json_schema(
+            ref_template="#/components/schemas/{model}"
+        )
+        validation_response = {
+            "description": "Request validation failed",
+            "content": {
+                "application/problem+json": {
+                    "schema": {"$ref": "#/components/schemas/ProblemDetail"}
+                }
+            },
+        }
+        for path_item in schema.get("paths", {}).values():
+            for operation in path_item.values():
+                if not isinstance(operation, dict) or "responses" not in operation:
+                    continue
+                responses = operation["responses"]
+                current_validation = responses.get("422", {})
+                current_schema = (
+                    current_validation.get("content", {})
+                    .get("application/json", {})
+                    .get("schema", {})
+                )
+                if current_schema.get("$ref") == "#/components/schemas/HTTPValidationError":
+                    responses["422"] = deepcopy(validation_response)
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = custom_openapi  # type: ignore[method-assign]

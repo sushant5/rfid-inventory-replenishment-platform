@@ -11,6 +11,8 @@ from abacus.schemas.identity import (
     CanonicalUserRead,
     IdentityAuditPage,
     IdentityAuditRecordRead,
+    UserAccessRead,
+    UserAccessReplace,
     UserRolesRead,
     UserRolesReplace,
     UserStoreAssignmentsRead,
@@ -24,6 +26,7 @@ from abacus.services.identity import (
     get_user,
     list_audit_records,
     list_users,
+    replace_user_access,
     replace_user_roles,
     replace_user_store_assignments,
     suspend_user,
@@ -132,6 +135,25 @@ def get_user_endpoint(
     principal: CanReadUsers,
 ) -> CanonicalUserRead:
     return _user_read(canonicalize_user_record(db, get_user(db, principal, user_id), principal))
+
+
+@router.put(
+    "/{user_id}/access",
+    response_model=UserAccessRead,
+    operation_id="replaceUserAccess",
+)
+def replace_user_access_endpoint(
+    user_id: uuid.UUID,
+    request: UserAccessReplace,
+    db: DatabaseSession,
+    principal: CanCreateUsers,
+) -> UserAccessRead:
+    access = replace_user_access(db, principal, user_id, request)
+    return UserAccessRead(
+        user_id=access.user_id,
+        roles=list(access.roles),
+        store_ids=list(access.store_ids),
+    )
 
 
 @router.put(

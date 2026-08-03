@@ -65,6 +65,22 @@ class ObservationBatchRead(ApiModel):
     pending: int
 
 
+class RfidQuarantineRead(ApiModel):
+    id: uuid.UUID
+    batch_id: uuid.UUID
+    event_id: str | None
+    reason: str
+    payload: dict[str, object]
+    quarantined_at: datetime
+
+
+class RfidQuarantinePage(ApiModel):
+    items: list[RfidQuarantineRead]
+    total: int
+    limit: int
+    offset: int
+
+
 class InventoryProjectionRead(ApiModel):
     sku_id: uuid.UUID
     sku: str
@@ -72,7 +88,9 @@ class InventoryProjectionRead(ApiModel):
     zone: str
     quantity: int
     as_of: datetime
-    confidence: float
+    confidence: float = Field(
+        description="Effective item-location confidence after read-time recency decay."
+    )
     freshness_status: FreshnessStatus
 
 
@@ -84,6 +102,8 @@ class ItemStateRead(ApiModel):
     zone_id: uuid.UUID | None
     last_observed_at: datetime
     last_received_at: datetime
-    confidence: float
+    confidence: float = Field(
+        description="Effective item-location confidence after read-time recency decay."
+    )
     state_version: int
     freshness_status: FreshnessStatus

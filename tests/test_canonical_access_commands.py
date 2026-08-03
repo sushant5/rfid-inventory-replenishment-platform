@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from abacus.api.errors import ApiError
 from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.identity import IdentityRole
-from abacus.schemas.identity import UserRolesReplace, UserStoreAssignmentsReplace
+from abacus.schemas.identity import UserAccessReplace, UserRolesReplace, UserStoreAssignmentsReplace
 from abacus.schemas.tenancy import StoreDeviceCreate
 from abacus.security import Principal, RoleScope
 from abacus.services.identity import (
@@ -56,6 +56,11 @@ def test_access_replace_bodies_reject_duplicates() -> None:
         )
     with pytest.raises(ValidationError):
         UserStoreAssignmentsReplace(store_ids=[store_id, store_id])
+    with pytest.raises(ValidationError):
+        UserAccessReplace(
+            roles=[CanonicalIdentityRole.CORPORATE_USER],
+            store_ids=[store_id],
+        )
 
 
 def test_corporate_user_compatibility_never_escalates_to_admin() -> None:

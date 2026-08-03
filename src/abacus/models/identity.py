@@ -37,6 +37,7 @@ class IdentityAuditAction(StrEnum):
     LOGIN_FAILED = "LOGIN_FAILED"
     USER_CREATED = "USER_CREATED"
     USER_SUSPENDED = "USER_SUSPENDED"
+    USER_ACCESS_CHANGED = "USER_ACCESS_CHANGED"
 
 
 class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):

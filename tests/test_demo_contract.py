@@ -39,7 +39,7 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.3.0"
+    assert __version__ == "0.4.0"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",
@@ -62,16 +62,23 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
             "get",
             "/v1/rfid/observation-batches/{batch_id}",
         ): "getRfidObservationBatch",
+        ("get", "/v1/rfid/quarantine"): "listRfidQuarantine",
         ("get", "/v1/stores/{store_id}/inventory"): "getStoreInventory",
         ("get", "/v1/items/{epc}"): "getCurrentItemState",
         ("post", "/v1/users"): "createUser",
         ("put", "/v1/users/{user_id}/roles"): "replaceUserRoles",
+        ("put", "/v1/users/{user_id}/access"): "replaceUserAccess",
         (
             "put",
             "/v1/users/{user_id}/store-assignments",
         ): "replaceUserStoreAssignments",
         ("get", "/v1/me"): "getCurrentUser",
         ("post", "/v1/replenishment-policies"): "createReplenishmentPolicy",
+        ("get", "/v1/replenishment-policies"): "listReplenishmentPolicies",
+        (
+            "get",
+            "/v1/replenishment-policies/{policy_id}",
+        ): "getReplenishmentPolicy",
         (
             "post",
             "/v1/replenishment-policies/{policy_id}/versions",
@@ -162,3 +169,10 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
         "CANCELED",
         "EXPIRED",
     ]
+
+    validation = paths["/v1/items/{epc}"]["get"]["responses"]["422"]
+    assert "ProblemDetail" in schema["components"]["schemas"]
+    assert set(validation["content"]) == {"application/problem+json"}
+    assert validation["content"]["application/problem+json"]["schema"] == {
+        "$ref": "#/components/schemas/ProblemDetail"
+    }

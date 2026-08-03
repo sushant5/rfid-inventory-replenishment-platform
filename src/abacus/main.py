@@ -9,7 +9,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from structlog.contextvars import bind_contextvars, clear_contextvars
 
 from abacus import __version__
-from abacus.api.errors import install_error_handlers
+from abacus.api.errors import install_error_handlers, install_openapi_error_contract
 from abacus.api.router import api_router, legacy_test_router
 from abacus.config import get_settings
 from abacus.logging import configure_logging
@@ -74,6 +74,7 @@ def create_app(*, include_legacy_test_routes: bool = False) -> FastAPI:
     application.include_router(api_router)
     if include_legacy_test_routes:
         application.include_router(legacy_test_router)
+    install_openapi_error_contract(application)
 
     @application.get("/", include_in_schema=False)
     def service_discovery() -> dict[str, str]:
@@ -84,6 +85,7 @@ def create_app(*, include_legacy_test_routes: bool = False) -> FastAPI:
             "version": __version__,
             "docs": "/docs",
             "openapi": "/openapi.json",
+            "login": "/v1/auth/login",
             "liveness": "/health/live",
             "readiness": "/health/ready",
         }

@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     rfid_removal_timeout_seconds: int = Field(default=1800, ge=60, le=604_800)
     rfid_removal_sweep_interval_seconds: int = Field(default=60, ge=1, le=3600)
     rfid_last_seen_flush_seconds: int = Field(default=30, ge=1, le=3600)
+    rfid_confidence_half_life_seconds: int = Field(default=1800, ge=60, le=604_800)
     connectivity_live_window_seconds: int = Field(default=120, ge=10, le=3600)
     connectivity_stale_window_seconds: int = Field(default=600, ge=30, le=86_400)
     replenishment_minimum_confidence: float = Field(default=0.70, ge=0.0, le=1.0)

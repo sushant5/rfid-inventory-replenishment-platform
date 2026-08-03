@@ -15,9 +15,27 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.3.0` on Render with PostgreSQL 16. Render may need
+The hosted demo runs release `0.4.0` on Render with PostgreSQL 16. Render may need
 about a minute to wake the free web service after inactivity. Reviewer credentials
 are provided separately and are intentionally not stored in this public repository.
+
+Authenticated hosted walkthrough: load `PLATFORM_API_KEY`, `BOOTSTRAP_ADMIN_EMAIL`,
+and `BOOTSTRAP_ADMIN_PASSWORD` into the current environment from the private reviewer
+credential bundle, then run:
+
+```bash
+python scripts/run_architecture_demo.py --base-url https://abacus-take-home-api.onrender.com
+```
+
+The command intentionally keeps secrets out of command-line arguments and process
+listings. Its readiness probe retries for two minutes, so a sleeping free Render
+instance can wake before the workflow begins.
+
+For Swagger, call `POST /v1/auth/login` with tenant code `orange`, then paste the
+returned access token into `HTTPBearer` under **Authorize**. The separately supplied
+platform key goes into `PlatformApiKey`; it is required for tenant, store-import, and
+catalog-import operations. Keeping these credentials outside GitHub prevents arbitrary
+visitors from mutating or exhausting the shared reviewer database.
 
 ## Reviewer quick start
 
@@ -103,10 +121,13 @@ streaming and S3 source-file retention are production extensions, not demo depen
 - Freshness is derived from heartbeat age, live-event age, backlog drain, and reader
   coverage. It decays without needing another event. Non-live stores cannot trigger
   automatic replenishment or RFID timeout removals.
+- Role and store-scope changes are atomic, invalidate existing JWTs, and append an
+  audit record. The corresponding migration downgrade deliberately refuses to narrow
+  the action constraint after such records exist rather than discard audit history.
 
 ## Canonical API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.3.0`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.4.0`).
 Earlier prototype routes are retained only as migration-test fixtures and are not
 mounted by the submitted application.
 
@@ -114,10 +135,10 @@ The visible contract includes all required endpoints:
 
 - Onboarding: tenants, store imports, zones, devices
 - Catalog: create import, status, row errors, SKU discovery
-- RFID: submit batch, batch status
+- RFID: submit batch, batch status, tenant-wide quarantine inspection
 - Inventory: store projection, physical item state
-- Identity: create user, replace roles, replace store assignments, current user
-- Replenishment: policy/version/activation, evaluation, task list/lifecycle
+- Identity: create user, atomically replace access, replace roles/store assignments, current user
+- Replenishment: policy discovery/version/activation, evaluation, task list/lifecycle
 - Operations: liveness, readiness, version
 
 Demo authentication uses a platform key, one-time device credentials, and short-lived
@@ -145,8 +166,11 @@ Hosted stable-zone defaults are configurable:
 - median-RSSI tie-break across competing observed zones
 - previous zone retained with lower confidence when evidence is ambiguous
 - 30-minute absence before confirmed removal, only while the store is live
+- 30-minute confidence half-life, evaluated at read time without rewriting item rows
 
-Production thresholds require pilot calibration. Recent evidence is intentionally
+Production thresholds require pilot calibration. The confidence half-life and removal
+timeout are independently configurable: confidence can suppress automation before a
+location is confirmed absent. Recent evidence is intentionally
 process-local for this hosted slice. The event ledger and current state are durable;
 after a worker restart, new reads rebuild the evidence window while database
 watermarks and conditional state updates prevent state regression. The demo uses
@@ -166,6 +190,9 @@ Active policy versions are immutable. Rule precedence is:
 7. Tenant default
 
 Equal-specificity rules use explicit priority; equal-priority overlaps are rejected.
+Policy discovery returns the active version by default (or the latest draft before
+first activation for policy managers). Read-only roles see active policy only; policy
+managers may use the optional `status` filter for draft or retired versions.
 Evaluation is per SKU/size and uses:
 
 ```text
@@ -179,6 +206,11 @@ else:
 A partial unique index permits only one `OPEN`, `CLAIMED`, or `IN_PROGRESS` task per
 tenant/store/SKU. The lifecycle is `OPEN → CLAIMED → IN_PROGRESS → COMPLETED`, with
 `CANCELED` and `EXPIRED` terminal alternatives.
+
+Quarantined RFID records expose their reason and original payload through
+`GET /v1/rfid/quarantine` to tenant-wide inventory readers. A terminal event ID is
+never silently reset: after remediation, the operator resubmits the physical
+observation with a new event ID so the original idempotency and audit trail remain intact.
 
 ## Tests and utilities
 

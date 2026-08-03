@@ -113,6 +113,13 @@ class PolicyBundleRead(ApiModel):
     rules: list[PolicyRuleRead]
 
 
+class PolicyBundlePage(ApiModel):
+    items: list[PolicyBundleRead]
+    total: int
+    limit: int
+    offset: int
+
+
 class ReplenishmentEvaluationCreate(ApiModel):
     store_id: uuid.UUID
     sku_ids: list[uuid.UUID] = Field(default_factory=list, max_length=5000)

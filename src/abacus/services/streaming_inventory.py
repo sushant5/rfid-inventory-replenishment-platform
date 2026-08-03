@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import delete, func, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.selectable import Subquery
@@ -50,13 +50,45 @@ class StableZoneDecision:
     received_at: datetime
 
 
-def current_inventory_bucket_metadata(*, tenant_id: uuid.UUID, store_id: uuid.UUID) -> Subquery:
+def effective_item_confidence(
+    *,
+    stored_confidence: float,
+    last_observed_at: datetime,
+    evaluated_at: datetime,
+    half_life_seconds: int,
+) -> float:
+    """Age location evidence without rewriting the authoritative item-state row."""
+
+    age_seconds = max(0.0, (evaluated_at - last_observed_at).total_seconds())
+    decay = 0.5 ** (age_seconds / half_life_seconds)
+    return float(max(0.0, min(1.0, stored_confidence * decay)))
+
+
+def current_inventory_bucket_metadata(
+    *,
+    tenant_id: uuid.UUID,
+    store_id: uuid.UUID,
+    evaluated_at: datetime,
+    confidence_half_life_seconds: int,
+) -> Subquery:
     """Aggregate authoritative metadata for each currently occupied inventory bucket.
 
     ``inventory_projection`` is an eventually consistent quantity projection. Item
     confidence and observation time can change without a quantity transition, so its
     copied metadata is not authoritative for reads or replenishment decisions.
     """
+
+    age_seconds = func.greatest(
+        0.0,
+        func.extract(
+            "epoch",
+            literal(evaluated_at) - CurrentItemState.last_observed_at,
+        ),
+    )
+    effective_confidence = CurrentItemState.confidence * func.power(
+        0.5,
+        age_seconds / confidence_half_life_seconds,
+    )
 
     return (
         select(
@@ -66,7 +98,7 @@ def current_inventory_bucket_metadata(*, tenant_id: uuid.UUID, store_id: uuid.UU
             CurrentItemState.zone_id.label("zone_id"),
             func.count(CurrentItemState.epc).label("item_count"),
             func.max(CurrentItemState.last_observed_at).label("as_of"),
-            func.min(CurrentItemState.confidence).label("confidence"),
+            func.min(effective_confidence).label("confidence"),
         )
         .where(
             CurrentItemState.tenant_id == tenant_id,

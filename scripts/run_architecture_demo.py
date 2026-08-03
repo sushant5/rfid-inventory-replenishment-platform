@@ -65,7 +65,13 @@ class Client:
         except urllib.error.URLError as exc:
             raise DemoFailure(f"Cannot reach {self.base_url}: {exc.reason}") from exc
         expected_codes = {expected} if isinstance(expected, int) else expected
-        decoded = json.loads(response_body) if response_body else None
+        try:
+            decoded = json.loads(response_body) if response_body else None
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            preview = " ".join(response_body.decode("utf-8", errors="replace").split())[:256]
+            raise DemoFailure(
+                f"{method} {path} returned {status_code} with a non-JSON response: {preview!r}"
+            ) from exc
         if status_code not in expected_codes:
             raise DemoFailure(f"{method} {path} returned {status_code}: {decoded}")
         return status_code, decoded
@@ -221,10 +227,26 @@ def wait_for_batch(client: Client, token: str, batch_id: str, timeout: float) ->
         raise DemoFailure(f"RFID batch rejected records: {result}")
 
 
+def wait_for_readiness(client: Client, timeout: float) -> None:
+    """Wake a sleeping free-tier service using an idempotent readiness probe."""
+
+    deadline = time.monotonic() + timeout
+    last_error = "service has not answered"
+    while True:
+        try:
+            client.request("GET", "/health/ready")
+            return
+        except DemoFailure as exc:
+            last_error = str(exc)
+        if time.monotonic() >= deadline:
+            raise DemoFailure(f"timed out waiting for service readiness: {last_error}")
+        time.sleep(1)
+
+
 def run(args: argparse.Namespace) -> None:
     client = Client(args.base_url, timeout=args.request_timeout)
     platform_headers = {"X-Platform-Key": args.platform_key}
-    client.request("GET", "/health/ready")
+    wait_for_readiness(client, args.startup_timeout)
 
     _, tenant = client.request(
         "POST",
@@ -320,7 +342,22 @@ def run(args: argparse.Namespace) -> None:
         },
     )
     policy = object_result(policy_value, "policy")
+    policy_id = str(required(object_result(required(policy, "policy"), "policy definition"), "id"))
     version_id = str(required(object_result(required(policy, "version"), "version"), "id"))
+    _, policy_list_value = client.request(
+        "GET",
+        "/v1/replenishment-policies",
+        headers=bearer(admin_token),
+    )
+    policy_list = object_result(policy_list_value, "policy list")
+    policy_items = list_result(required(policy_list, "items"), "policy items")
+    if not any(str(item["policy"]["id"]) == policy_id for item in policy_items):
+        raise DemoFailure("created replenishment policy was not discoverable")
+    client.request(
+        "GET",
+        f"/v1/replenishment-policies/{policy_id}",
+        headers=bearer(admin_token),
+    )
     client.request(
         "POST",
         f"/v1/replenishment-policy-versions/{version_id}/activate",
@@ -456,6 +493,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--admin-email", default=os.getenv("BOOTSTRAP_ADMIN_EMAIL"))
     result.add_argument("--admin-password", default=os.getenv("BOOTSTRAP_ADMIN_PASSWORD"))
     result.add_argument("--request-timeout", type=float, default=15)
+    result.add_argument("--startup-timeout", type=float, default=120)
     result.add_argument("--poll-timeout", type=float, default=90)
     return result
 

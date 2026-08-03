@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from abacus.api.errors import ApiError
-from abacus.api.routes.rfid import get_item_state_endpoint
+from abacus.api.routes.rfid import get_item_state_endpoint, list_rfid_quarantine_endpoint
 from abacus.config import Settings
 from abacus.enums import DeviceStatus
 from abacus.events.rfid import RfidObservationEvent
@@ -22,6 +22,7 @@ from abacus.services.streaming_inventory import (
     _resolve_effective_assignment,
     effective_bucket_confidence,
     effective_freshness,
+    effective_item_confidence,
     process_observation,
 )
 
@@ -108,6 +109,35 @@ def test_effective_freshness_decays_without_a_database_write() -> None:
         effective_freshness(connectivity, settings, now=now + timedelta(seconds=601))
         == FreshnessStatus.STALE
     )
+
+
+def test_item_confidence_decays_without_a_database_write() -> None:
+    now = datetime(2026, 8, 2, 12, tzinfo=UTC)
+
+    assert effective_item_confidence(
+        stored_confidence=0.8,
+        last_observed_at=now,
+        evaluated_at=now,
+        half_life_seconds=1800,
+    ) == pytest.approx(0.8)
+    assert effective_item_confidence(
+        stored_confidence=0.8,
+        last_observed_at=now - timedelta(minutes=30),
+        evaluated_at=now,
+        half_life_seconds=1800,
+    ) == pytest.approx(0.4)
+    assert effective_item_confidence(
+        stored_confidence=0.8,
+        last_observed_at=now - timedelta(minutes=60),
+        evaluated_at=now,
+        half_life_seconds=1800,
+    ) == pytest.approx(0.2)
+    assert effective_item_confidence(
+        stored_confidence=0.8,
+        last_observed_at=now + timedelta(minutes=1),
+        evaluated_at=now,
+        half_life_seconds=1800,
+    ) == pytest.approx(0.8)
 
 
 def test_effective_freshness_requires_drained_backlog_and_healthy_coverage() -> None:
@@ -399,3 +429,39 @@ def test_unlocated_item_requires_tenant_wide_inventory_permission() -> None:
         get_item_state_endpoint(item.epc, db, _settings(), principal)
 
     assert error.value.code == "tenant_inventory_scope_required"
+
+
+def test_invalid_item_epc_is_a_client_error() -> None:
+    db = MagicMock(spec=Session)
+    principal = Principal(
+        user_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        email="admin@example.com",
+        display_name="Administrator",
+        role_scopes=(RoleScope(IdentityRole.CORPORATE_ADMIN, None),),
+    )
+
+    with pytest.raises(ApiError) as error:
+        get_item_state_endpoint("not-an-epc", db, _settings(), principal)
+
+    assert error.value.status_code == 422
+    assert error.value.code == "invalid_epc"
+    db.execute.assert_not_called()
+
+
+def test_store_scoped_user_cannot_inspect_tenant_quarantine() -> None:
+    db = MagicMock(spec=Session)
+    principal = Principal(
+        user_id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        email="associate@example.com",
+        display_name="Associate",
+        role_scopes=(RoleScope(IdentityRole.STORE_ASSOCIATE, uuid.uuid4()),),
+    )
+
+    with pytest.raises(ApiError) as error:
+        list_rfid_quarantine_endpoint(db, principal)
+
+    assert error.value.status_code == 403
+    assert error.value.code == "tenant_inventory_scope_required"
+    db.scalar.assert_not_called()

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, exists, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -405,6 +405,153 @@ def _load_bundle(
     return PolicyBundle(policy=policy, version=version, rules=rules)
 
 
+def _visible_bundle(bundle: PolicyBundle, principal: Principal) -> PolicyBundle | None:
+    if principal.has_tenant_permission(Permission.POLICY_READ):
+        return bundle
+    allowed_store_ids = principal.store_ids_for_permission(Permission.POLICY_READ)
+    visible_rules = tuple(
+        rule for rule in bundle.rules if rule.store_id is None or rule.store_id in allowed_store_ids
+    )
+    if not visible_rules:
+        return None
+    return PolicyBundle(policy=bundle.policy, version=bundle.version, rules=visible_rules)
+
+
+def _selected_policy_versions(
+    tenant_id: uuid.UUID,
+    version_status: PolicyVersionStatus | None,
+) -> Any:
+    """Select one discoverable version per policy.
+
+    The default is the effective version: ACTIVE first, then the latest DRAFT for a
+    policy that has not gone live. Callers may request a specific lifecycle status
+    when inspecting drafts or retired history.
+    """
+
+    if version_status is None:
+        lifecycle_order = case(
+            (PolicyVersion.status == PolicyVersionStatus.ACTIVE, 0),
+            (PolicyVersion.status == PolicyVersionStatus.DRAFT, 1),
+            else_=2,
+        )
+        version_order: tuple[Any, ...] = (
+            lifecycle_order.asc(),
+            PolicyVersion.version_number.desc(),
+        )
+    else:
+        version_order = (PolicyVersion.version_number.desc(),)
+
+    ranked = select(
+        PolicyVersion.policy_id.label("policy_id"),
+        PolicyVersion.id.label("version_id"),
+        func.row_number()
+        .over(
+            partition_by=PolicyVersion.policy_id,
+            order_by=version_order,
+        )
+        .label("selection_rank"),
+    ).where(PolicyVersion.tenant_id == tenant_id)
+    if version_status is not None:
+        ranked = ranked.where(PolicyVersion.status == version_status)
+    return ranked.subquery("selected_policy_versions")
+
+
+def _authorized_policy_version_status(
+    principal: Principal,
+    requested_status: PolicyVersionStatus | None,
+) -> PolicyVersionStatus | None:
+    """Keep draft and retired policy configuration out of read-only roles."""
+
+    if principal.has_permission(Permission.POLICY_MANAGE):
+        return requested_status
+    if requested_status not in (None, PolicyVersionStatus.ACTIVE):
+        raise ApiError(
+            403,
+            "Forbidden",
+            "Draft and retired policy versions require policy-management permission.",
+            code="policy_version_status_forbidden",
+        )
+    return PolicyVersionStatus.ACTIVE
+
+
+def get_policy_bundle(
+    db: Session,
+    principal: Principal,
+    policy_id: uuid.UUID,
+    *,
+    version_status: PolicyVersionStatus | None = None,
+) -> PolicyBundle:
+    version_status = _authorized_policy_version_status(principal, version_status)
+    selected_versions = _selected_policy_versions(principal.tenant_id, version_status)
+    version_id = db.scalar(
+        select(selected_versions.c.version_id)
+        .where(
+            selected_versions.c.policy_id == policy_id,
+            selected_versions.c.selection_rank == 1,
+        )
+        .limit(1)
+    )
+    if version_id is None:
+        raise ApiError(404, "Policy not found", "The policy does not exist.")
+    visible = _visible_bundle(_load_bundle(db, principal.tenant_id, version_id), principal)
+    if visible is None:
+        raise ApiError(404, "Policy not found", "The policy does not exist.")
+    return visible
+
+
+def list_policy_bundles(
+    db: Session,
+    principal: Principal,
+    *,
+    limit: int,
+    offset: int,
+    version_status: PolicyVersionStatus | None = None,
+) -> tuple[list[PolicyBundle], int]:
+    version_status = _authorized_policy_version_status(principal, version_status)
+    selected_versions = _selected_policy_versions(principal.tenant_id, version_status)
+    query = (
+        select(PolicyDefinition.id, selected_versions.c.version_id)
+        .join(
+            selected_versions,
+            (selected_versions.c.policy_id == PolicyDefinition.id)
+            & (selected_versions.c.selection_rank == 1),
+        )
+        .where(PolicyDefinition.tenant_id == principal.tenant_id)
+    )
+    if not principal.has_tenant_permission(Permission.POLICY_READ):
+        allowed_store_ids = principal.store_ids_for_permission(Permission.POLICY_READ)
+        query = query.where(
+            exists(
+                select(PolicyRule.id).where(
+                    PolicyRule.tenant_id == principal.tenant_id,
+                    PolicyRule.version_id == selected_versions.c.version_id,
+                    or_(
+                        PolicyRule.store_id.is_(None),
+                        PolicyRule.store_id.in_(allowed_store_ids),
+                    ),
+                )
+            )
+        )
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = db.execute(
+        query.order_by(PolicyDefinition.updated_at.desc(), PolicyDefinition.id.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    bundles = [
+        visible
+        for _policy_id, version_id in rows
+        if (
+            visible := _visible_bundle(
+                _load_bundle(db, principal.tenant_id, version_id),
+                principal,
+            )
+        )
+        is not None
+    ]
+    return bundles, total
+
+
 def create_policy(
     db: Session,
     principal: Principal,
@@ -683,7 +830,8 @@ def evaluate_replenishment(
             StoreConnectivity.store_id == store.id,
         )
     )
-    if effective_freshness(connectivity, settings) != FreshnessStatus.LIVE:
+    evaluated_at = datetime.now(UTC)
+    if effective_freshness(connectivity, settings, now=evaluated_at) != FreshnessStatus.LIVE:
         return EvaluationResult(store.id, (), True, 0)
 
     rules = tuple(
@@ -703,6 +851,8 @@ def evaluate_replenishment(
     current_metadata = current_inventory_bucket_metadata(
         tenant_id=principal.tenant_id,
         store_id=store.id,
+        evaluated_at=evaluated_at,
+        confidence_half_life_seconds=settings.rfid_confidence_half_life_seconds,
     )
     projection_query = (
         select(

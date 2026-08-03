@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.security import APIKeyHeader
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from abacus.api.dependencies import (
     DatabaseSession,
@@ -17,6 +17,7 @@ from abacus.models.architecture import (
     CurrentItemState,
     InventoryProjection,
     RfidObservationBatch,
+    RfidQuarantine,
     StoreConnectivity,
 )
 from abacus.models.catalog import Sku
@@ -27,6 +28,8 @@ from abacus.schemas.architecture import (
     ItemStateRead,
     ObservationBatchAccepted,
     ObservationBatchRead,
+    RfidQuarantinePage,
+    RfidQuarantineRead,
 )
 from abacus.schemas.catalog import normalize_epc
 from abacus.schemas.rfid import (
@@ -50,6 +53,7 @@ from abacus.services.streaming_inventory import (
     current_inventory_bucket_metadata,
     effective_bucket_confidence,
     effective_freshness,
+    effective_item_confidence,
 )
 
 device_router = APIRouter(prefix="/v1/device", tags=["3. RFID Ingestion"])
@@ -134,6 +138,55 @@ def get_observation_batch_endpoint(
 
 
 @canonical_router.get(
+    "/rfid/quarantine",
+    response_model=RfidQuarantinePage,
+    operation_id="listRfidQuarantine",
+)
+def list_rfid_quarantine_endpoint(
+    db: DatabaseSession,
+    principal: CanReadInventory,
+    batch_id: Annotated[uuid.UUID | None, Query()] = None,
+    event_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    reason: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> RfidQuarantinePage:
+    if not principal.has_tenant_permission(Permission.INVENTORY_READ):
+        raise ApiError(
+            403,
+            "Forbidden",
+            "Quarantine inspection requires tenant-wide inventory access.",
+            code="tenant_inventory_scope_required",
+        )
+    predicates = [RfidQuarantine.tenant_id == principal.tenant_id]
+    if batch_id is not None:
+        predicates.append(RfidQuarantine.batch_id == batch_id)
+    if event_id is not None:
+        predicates.append(RfidQuarantine.event_id == event_id)
+    if reason is not None:
+        predicates.append(RfidQuarantine.reason == reason)
+    total = db.scalar(select(func.count(RfidQuarantine.id)).where(*predicates)) or 0
+    records = list(
+        db.scalars(
+            select(RfidQuarantine)
+            .where(*predicates)
+            .order_by(
+                RfidQuarantine.quarantined_at.desc(),
+                RfidQuarantine.id.desc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        ).all()
+    )
+    return RfidQuarantinePage(
+        items=[RfidQuarantineRead.model_validate(record) for record in records],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@canonical_router.get(
     "/stores/{store_id}/inventory",
     response_model=list[InventoryProjectionRead],
     operation_id="getStoreInventory",
@@ -164,9 +217,12 @@ def get_store_inventory_endpoint(
         predicates.append(InventoryProjection.sku_id == sku_id)
     if zone_id is not None:
         predicates.append(InventoryProjection.zone_id == zone_id)
+    evaluated_at = datetime.now(UTC)
     current_metadata = current_inventory_bucket_metadata(
         tenant_id=principal.tenant_id,
         store_id=store_id,
+        evaluated_at=evaluated_at,
+        confidence_half_life_seconds=settings.rfid_confidence_half_life_seconds,
     )
     rows = db.execute(
         select(
@@ -190,7 +246,7 @@ def get_store_inventory_endpoint(
         .order_by(Sku.code, Zone.code)
     ).all()
     connectivity = db.get(StoreConnectivity, (principal.tenant_id, store_id))
-    freshness = effective_freshness(connectivity, settings)
+    freshness = effective_freshness(connectivity, settings, now=evaluated_at)
     return [
         InventoryProjectionRead(
             sku_id=projection.sku_id,
@@ -221,7 +277,15 @@ def get_item_state_endpoint(
     settings: SettingsDependency,
     principal: CanReadInventory,
 ) -> ItemStateRead:
-    normalized_epc = normalize_epc(epc)
+    try:
+        normalized_epc = normalize_epc(epc)
+    except ValueError as exc:
+        raise ApiError(
+            422,
+            "Invalid EPC",
+            str(exc),
+            code="invalid_epc",
+        ) from exc
     row = db.execute(
         select(CurrentItemState, Sku)
         .join(Sku, Sku.id == CurrentItemState.sku_id)
@@ -249,6 +313,7 @@ def get_item_state_endpoint(
         if item.store_id is not None
         else None
     )
+    evaluated_at = datetime.now(UTC)
     return ItemStateRead(
         epc=item.epc,
         sku_id=item.sku_id,
@@ -257,9 +322,14 @@ def get_item_state_endpoint(
         zone_id=item.zone_id,
         last_observed_at=item.last_observed_at,
         last_received_at=item.last_received_at,
-        confidence=item.confidence,
+        confidence=effective_item_confidence(
+            stored_confidence=item.confidence,
+            last_observed_at=item.last_observed_at,
+            evaluated_at=evaluated_at,
+            half_life_seconds=settings.rfid_confidence_half_life_seconds,
+        ),
         state_version=item.state_version,
-        freshness_status=effective_freshness(connectivity, settings),
+        freshness_status=effective_freshness(connectivity, settings, now=evaluated_at),
     )
 
 

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from abacus.api.routes.health import EXPECTED_SCHEMA_REVISION
 from abacus.enums import JobKind, JobStatus, ObservationStatus, TenantStatus, ZoneKind
+from abacus.models.architecture import Product
 from abacus.models.catalog import CatalogImport, EpcBinding, Sku
 from abacus.models.identity import IdentityRole
 from abacus.models.jobs import DurableJob
@@ -313,7 +314,7 @@ def test_postgres_end_to_end(
     assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
     version = _expect(client.get("/version"), 200)
     assert isinstance(version, dict)
-    assert version["version"] == "0.3.0"
+    assert version["version"] == "0.4.0"
     assert (
         client.get(
             "/v1/platform/tenants/00000000-0000-0000-0000-000000000000/stores",
@@ -582,6 +583,32 @@ def test_postgres_end_to_end(
     )
     assert invalid_assignment_replacement.status_code == 422
     assert invalid_assignment_replacement.json()["code"] == "store_assignment_required"
+    corporate_access = _expect(
+        client.put(
+            f"/v1/users/{manager_id}/access",
+            headers=_bearer(admin_a_token),
+            json={"roles": ["CORPORATE_USER"], "store_ids": []},
+        ),
+        200,
+    )
+    assert corporate_access == {
+        "user_id": manager_id,
+        "roles": ["CORPORATE_USER"],
+        "store_ids": [],
+    }
+    manager_access = _expect(
+        client.put(
+            f"/v1/users/{manager_id}/access",
+            headers=_bearer(admin_a_token),
+            json={"roles": ["STORE_MANAGER"], "store_ids": [store_1_id]},
+        ),
+        200,
+    )
+    assert manager_access == {
+        "user_id": manager_id,
+        "roles": ["STORE_MANAGER"],
+        "store_ids": [store_1_id],
+    }
     valid_role_replacement = _expect(
         client.put(
             f"/v1/users/{manager_id}/roles",
@@ -742,7 +769,97 @@ def test_postgres_end_to_end(
     )
     assert isinstance(audit, dict)
     assert audit["total"] >= 6
+    assert any(item["action"] == "USER_ACCESS_CHANGED" for item in audit["items"])
     assert client.get("/v1/users/audit-records", headers=_bearer(manager_token)).status_code == 403
+
+    # Policy discovery exposes effective rules within the caller's tenant/store scope.
+    with postgres_session_factory() as db:
+        db.add(
+            Product(
+                tenant_id=uuid.UUID(tenant_a_id),
+                style_code="POLICY-SCOPE-CATALOG",
+                name="Policy scope catalog fixture",
+                category="APPAREL",
+                attributes={},
+                active=True,
+            )
+        )
+        db.commit()
+    canonical_policy = _expect(
+        client.post(
+            "/v1/replenishment-policies",
+            headers=_bearer(admin_a_token),
+            json={
+                "name": "Orange scoped discovery",
+                "rules": [
+                    {
+                        "category": "APPAREL",
+                        "min_floor_qty": 1,
+                        "target_floor_qty": 3,
+                        "priority": 10,
+                    },
+                    {
+                        "store_id": store_1_id,
+                        "category": "APPAREL",
+                        "min_floor_qty": 2,
+                        "target_floor_qty": 4,
+                        "priority": 20,
+                    },
+                    {
+                        "store_id": store_2_id,
+                        "category": "APPAREL",
+                        "min_floor_qty": 3,
+                        "target_floor_qty": 5,
+                        "priority": 30,
+                    },
+                ],
+            },
+        ),
+        201,
+    )
+    assert isinstance(canonical_policy, dict)
+    policy_id = str(canonical_policy["policy"]["id"])
+    policy_version_id = str(canonical_policy["version"]["id"])
+    assert (
+        client.get(
+            f"/v1/replenishment-policies/{policy_id}",
+            headers=_bearer(manager_token),
+        ).status_code
+        == 404
+    )
+    forbidden_draft = client.get(
+        f"/v1/replenishment-policies/{policy_id}",
+        headers=_bearer(manager_token),
+        params={"status": "DRAFT"},
+    )
+    assert forbidden_draft.status_code == 403
+    assert forbidden_draft.json()["code"] == "policy_version_status_forbidden"
+    _expect(
+        client.post(
+            f"/v1/replenishment-policy-versions/{policy_version_id}/activate",
+            headers=_bearer(admin_a_token),
+        ),
+        200,
+    )
+    manager_policy = _expect(
+        client.get(
+            f"/v1/replenishment-policies/{policy_id}",
+            headers=_bearer(manager_token),
+        ),
+        200,
+    )
+    assert isinstance(manager_policy, dict)
+    assert {rule["store_id"] for rule in manager_policy["rules"]} == {
+        None,
+        store_1_id,
+    }
+    assert (
+        client.get(
+            f"/v1/replenishment-policies/{policy_id}",
+            headers=_bearer(admin_b_token),
+        ).status_code
+        == 404
+    )
 
     # 2. CSV validation is atomic; a durable job promotes valid staged data.
     invalid_catalog = _stage_catalog(
