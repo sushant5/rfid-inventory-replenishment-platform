@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from abacus.api.errors import ApiError
 from abacus.config import get_settings
+from abacus.db import TenantSession, pin_session_to_tenant
 from abacus.enums import DeviceStatus, JobKind, ObservationStatus, TenantStatus, ZoneKind
 from abacus.models.catalog import Sku
 from abacus.models.replenishment import ReplenishmentTask, ReplenishmentTaskStatus
@@ -50,6 +51,15 @@ def authenticate_device(db: Session, raw_api_key: str | None) -> Device:
         device_id = uuid.UUID(raw_id)
     except ValueError as exc:
         raise ApiError(401, "Unauthorized device", "The device API key is malformed.") from exc
+    if isinstance(db, TenantSession):
+        tenant_id = db.scalar(
+            text("SELECT abacus_resolve_device_tenant(:device_id)"),
+            {"device_id": device_id},
+        )
+        db.rollback()
+        if tenant_id is None:
+            raise ApiError(401, "Unauthorized device", "The device API key is invalid.")
+        pin_session_to_tenant(db, uuid.UUID(str(tenant_id)))
     device = db.get(Device, device_id)
     candidate = hashlib.sha256(secret.encode()).hexdigest()
     tenant_status = (
@@ -656,6 +666,8 @@ def list_balances(
     limit: int,
     offset: int,
 ) -> tuple[list[tuple[InventoryBalance, Zone, Sku]], int]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     predicates: list[Any] = [InventoryBalance.tenant_id == tenant_id]
     if store_id is not None:
         predicates.append(InventoryBalance.store_id == store_id)
@@ -681,6 +693,8 @@ def list_observations(
     limit: int,
     offset: int,
 ) -> tuple[list[RfidObservation], int]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     predicates: list[Any] = [RfidObservation.tenant_id == tenant_id]
     if status is not None:
         predicates.append(RfidObservation.status == status)
@@ -704,6 +718,8 @@ def replay_quarantined_observation(
     tenant_id: uuid.UUID,
     observation_id: uuid.UUID,
 ) -> RfidObservation:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     require_reservation_cutover_ready(db)
     observation = db.scalar(
         select(RfidObservation).where(

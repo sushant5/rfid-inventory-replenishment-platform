@@ -12,7 +12,7 @@ from abacus.config import get_settings
 from abacus.db import get_db
 
 router = APIRouter(tags=["Operations"])
-EXPECTED_SCHEMA_REVISION = "b6e3f19a2d44"
+EXPECTED_SCHEMA_REVISION = "a6f0c4d1e537"
 
 
 class HealthResponse(BaseModel):
@@ -22,6 +22,7 @@ class HealthResponse(BaseModel):
 class VersionResponse(BaseModel):
     version: str
     build_sha: str
+    environment: str
 
 
 @router.get("/health/live", response_model=HealthResponse, operation_id="liveness")
@@ -30,12 +31,30 @@ def liveness() -> HealthResponse:
 
 
 @router.get("/health/ready", response_model=HealthResponse, operation_id="readiness")
-def readiness(db: Annotated[Session, Depends(get_db)]) -> HealthResponse:
+async def readiness(db: Annotated[Session, Depends(get_db)]) -> HealthResponse:
+    settings = get_settings()
     try:
+        if settings.app_env == "production":
+            runtime_role_ready = db.scalar(
+                text(
+                    "SELECT current_user = :expected_role "
+                    "AND NOT rolsuper AND NOT rolbypassrls "
+                    "FROM pg_catalog.pg_roles WHERE rolname = current_user"
+                ),
+                {"expected_role": settings.application_database_role},
+            )
+            if runtime_role_ready is not True:
+                raise ApiError(
+                    503,
+                    "Service unavailable",
+                    "The runtime database credential is not the configured restricted role.",
+                    code="database_role_not_ready",
+                )
         required_tables_ready = db.scalar(
             text(
                 "SELECT to_regclass('public.tenants') IS NOT NULL "
-                "AND to_regclass('public.durable_jobs') IS NOT NULL "
+                "AND to_regclass('public.current_item_state') IS NOT NULL "
+                "AND to_regclass('public.inventory_transition_outbox') IS NOT NULL "
                 "AND to_regclass('public.alembic_version') IS NOT NULL"
             )
         )
@@ -63,7 +82,7 @@ def readiness(db: Annotated[Session, Depends(get_db)]) -> HealthResponse:
         cutover_ready = db.scalar(
             text(
                 "SELECT NOT EXISTS ("
-                "SELECT 1 FROM replenishment_tasks "
+                "SELECT 1 FROM legacy_replenishment_tasks "
                 "WHERE reservation_cutover_reviewed = false)"
             )
         )
@@ -88,4 +107,8 @@ def readiness(db: Annotated[Session, Depends(get_db)]) -> HealthResponse:
 @router.get("/version", response_model=VersionResponse, operation_id="version")
 def version() -> VersionResponse:
     settings = get_settings()
-    return VersionResponse(version=__version__, build_sha=settings.build_sha)
+    return VersionResponse(
+        version=__version__,
+        build_sha=settings.build_sha,
+        environment=settings.app_env,
+    )

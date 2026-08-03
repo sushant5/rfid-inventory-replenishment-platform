@@ -2,10 +2,12 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, Header, Query, UploadFile, status
+from sqlalchemy import select, text
 
 from abacus.api.dependencies import DatabaseSession, PlatformAccess
 from abacus.api.errors import ApiError
-from abacus.models.catalog import CatalogImportMode, ProductStyle, Sku
+from abacus.db import TenantSession, pin_session_to_tenant
+from abacus.models.catalog import CatalogImport, CatalogImportMode, ProductStyle, Sku
 from abacus.schemas.catalog import (
     CatalogImportErrorListRead,
     CatalogImportErrorRead,
@@ -26,6 +28,7 @@ from abacus.services.catalog import (
 )
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/catalog", tags=["2. Product catalog"])
+canonical_router = APIRouter(tags=["2. Product catalog"])
 CanReadCatalog = Annotated[Principal, Depends(require_permission(Permission.CATALOG_READ))]
 
 
@@ -45,6 +48,32 @@ def _sku_read(sku: Sku, style: ProductStyle) -> SkuRead:
     )
 
 
+def _catalog_import_tenant_id(db: DatabaseSession, import_id: uuid.UUID) -> uuid.UUID:
+    """Resolve the owner under the trusted platform boundary for canonical lookups."""
+
+    if isinstance(db, TenantSession):
+        tenant_id = db.scalar(
+            text("SELECT abacus_resolve_catalog_import_tenant(:import_id)"),
+            {"import_id": import_id},
+        )
+        db.rollback()
+        if tenant_id is not None:
+            tenant_id = uuid.UUID(str(tenant_id))
+            pin_session_to_tenant(db, tenant_id)
+    else:
+        tenant_id = db.scalar(select(CatalogImport.tenant_id).where(CatalogImport.id == import_id))
+    if tenant_id is None:
+        raise ApiError(404, "Catalog import not found", "The requested import does not exist.")
+    return uuid.UUID(str(tenant_id))
+
+
+@canonical_router.post(
+    "/v1/tenants/{tenant_id}/catalog-imports",
+    response_model=CatalogImportRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    operation_id="createCatalogImportCanonical",
+    summary="Stage and validate a product-master CSV",
+)
 @router.post(
     "/imports",
     response_model=CatalogImportRead,
@@ -116,6 +145,20 @@ def get_catalog_import_endpoint(
     return CatalogImportRead.model_validate(get_catalog_import(db, tenant_id, import_id))
 
 
+@canonical_router.get(
+    "/v1/catalog-imports/{import_id}",
+    response_model=CatalogImportRead,
+    operation_id="getCatalogImportCanonical",
+)
+def get_catalog_import_canonical_endpoint(
+    import_id: uuid.UUID,
+    db: DatabaseSession,
+    _: PlatformAccess,
+) -> CatalogImportRead:
+    tenant_id = _catalog_import_tenant_id(db, import_id)
+    return CatalogImportRead.model_validate(get_catalog_import(db, tenant_id, import_id))
+
+
 @router.get(
     "/imports/{import_id}/errors",
     response_model=CatalogImportErrorListRead,
@@ -129,6 +172,34 @@ def list_catalog_import_errors_endpoint(
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> CatalogImportErrorListRead:
+    errors, total = list_catalog_import_errors(
+        db,
+        tenant_id,
+        import_id,
+        limit=limit,
+        offset=offset,
+    )
+    return CatalogImportErrorListRead(
+        items=[CatalogImportErrorRead.model_validate(item) for item in errors],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@canonical_router.get(
+    "/v1/catalog-imports/{import_id}/errors",
+    response_model=CatalogImportErrorListRead,
+    operation_id="listCatalogImportErrorsCanonical",
+)
+def list_catalog_import_errors_canonical_endpoint(
+    import_id: uuid.UUID,
+    db: DatabaseSession,
+    _: PlatformAccess,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> CatalogImportErrorListRead:
+    tenant_id = _catalog_import_tenant_id(db, import_id)
     errors, total = list_catalog_import_errors(
         db,
         tenant_id,

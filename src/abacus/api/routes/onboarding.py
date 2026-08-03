@@ -1,10 +1,12 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Header, status
+from fastapi import APIRouter, Depends, Header, status
+from sqlalchemy import select
 
 from abacus.api.dependencies import DatabaseSession, PlatformAccess
 from abacus.api.errors import ApiError
+from abacus.models.tenancy import Zone
 from abacus.schemas.tenancy import (
     BulkStoreOnboardingRequest,
     DeviceAssignmentCreate,
@@ -12,23 +14,42 @@ from abacus.schemas.tenancy import (
     DeviceCredentialRead,
     DeviceRead,
     OnboardingBatchRead,
+    StoreDeviceCreate,
+    StoreDeviceRegistrationRead,
     StoreRead,
     TenantCreate,
     TenantRead,
+    ZoneCreate,
+    ZoneRead,
 )
+from abacus.security import Permission, Principal, require_permission
 from abacus.services.onboarding import (
     assign_device,
+    create_store_zone,
     create_tenant,
     list_device_assignments,
     list_devices,
     list_stores,
     onboard_stores,
+    register_store_device,
     rotate_device_credential,
 )
 
 router = APIRouter(prefix="/v1/platform", tags=["1. Onboarding"])
+canonical_router = APIRouter(prefix="/v1", tags=["1. Onboarding"])
+
+CanConfigureTenant = Annotated[
+    Principal,
+    Depends(require_permission(Permission.TENANT_CONFIGURE)),
+]
 
 
+@canonical_router.post(
+    "/tenants",
+    response_model=TenantRead,
+    status_code=status.HTTP_201_CREATED,
+    operation_id="createTenantCanonical",
+)
 @router.post(
     "/tenants",
     response_model=TenantRead,
@@ -43,6 +64,12 @@ def create_tenant_endpoint(
     return TenantRead.model_validate(create_tenant(db, request))
 
 
+@canonical_router.post(
+    "/tenants/{tenant_id}/store-imports",
+    response_model=OnboardingBatchRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    operation_id="createStoreImport",
+)
 @router.post(
     "/tenants/{tenant_id}/stores:bulk-onboard",
     response_model=OnboardingBatchRead,
@@ -62,10 +89,50 @@ def bulk_onboard_stores_endpoint(
     return OnboardingBatchRead.model_validate(batch)
 
 
+@canonical_router.post(
+    "/stores/{store_id}/zones",
+    response_model=ZoneRead,
+    status_code=status.HTTP_201_CREATED,
+    operation_id="createStoreZone",
+)
+def create_store_zone_endpoint(
+    store_id: uuid.UUID,
+    request: ZoneCreate,
+    db: DatabaseSession,
+    principal: CanConfigureTenant,
+) -> ZoneRead:
+    return ZoneRead.model_validate(create_store_zone(db, principal, store_id, request))
+
+
+@canonical_router.post(
+    "/stores/{store_id}/devices",
+    response_model=StoreDeviceRegistrationRead,
+    status_code=status.HTTP_201_CREATED,
+    operation_id="registerStoreDevice",
+)
+def register_store_device_endpoint(
+    store_id: uuid.UUID,
+    request: StoreDeviceCreate,
+    db: DatabaseSession,
+    principal: CanConfigureTenant,
+) -> StoreDeviceRegistrationRead:
+    registration = register_store_device(db, principal, store_id, request)
+    return StoreDeviceRegistrationRead(
+        device=DeviceRead.model_validate(registration.device),
+        assignment=DeviceAssignmentRead.model_validate(registration.assignment),
+        api_key=registration.api_key,
+    )
+
+
 @router.get(
     "/tenants/{tenant_id}/stores",
     response_model=list[StoreRead],
     operation_id="listTenantStores",
+)
+@canonical_router.get(
+    "/tenants/{tenant_id}/stores",
+    response_model=list[StoreRead],
+    operation_id="listCanonicalTenantStores",
 )
 def list_tenant_stores_endpoint(
     tenant_id: uuid.UUID,
@@ -73,6 +140,27 @@ def list_tenant_stores_endpoint(
     _: PlatformAccess,
 ) -> list[StoreRead]:
     return [StoreRead.model_validate(store) for store in list_stores(db, tenant_id)]
+
+
+@canonical_router.get(
+    "/stores/{store_id}/zones",
+    response_model=list[ZoneRead],
+    operation_id="listStoreZones",
+)
+def list_store_zones_endpoint(
+    store_id: uuid.UUID,
+    db: DatabaseSession,
+    principal: CanConfigureTenant,
+) -> list[ZoneRead]:
+    zones = db.scalars(
+        select(Zone)
+        .where(
+            Zone.tenant_id == principal.tenant_id,
+            Zone.store_id == store_id,
+        )
+        .order_by(Zone.code)
+    ).all()
+    return [ZoneRead.model_validate(zone) for zone in zones]
 
 
 @router.get(

@@ -16,7 +16,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from abacus.api.errors import ApiError
+from abacus.db import TenantSession, pin_session_to_tenant
 from abacus.enums import JobKind
+from abacus.models.architecture import Product, ProductVariant, RfidTag
 from abacus.models.catalog import (
     CatalogImport,
     CatalogImportError,
@@ -654,6 +656,8 @@ def stage_catalog_import(
 ) -> CatalogImport:
     """Persist, validate, and reconcile a CSV without mutating canonical products."""
 
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     _get_tenant(db, tenant_id)
     normalized_key = idempotency_key.strip()
     if len(normalized_key) < 8 or len(normalized_key) > 128:
@@ -780,6 +784,8 @@ def get_catalog_import(
     tenant_id: uuid.UUID,
     import_id: uuid.UUID,
 ) -> CatalogImport:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     catalog_import = db.scalar(
         select(CatalogImport).where(
             CatalogImport.id == import_id,
@@ -798,6 +804,8 @@ def list_catalog_imports(
     limit: int,
     offset: int,
 ) -> tuple[list[CatalogImport], int]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     _get_tenant(db, tenant_id)
     total = db.scalar(
         select(func.count()).select_from(CatalogImport).where(CatalogImport.tenant_id == tenant_id)
@@ -822,6 +830,8 @@ def list_catalog_import_errors(
     limit: int,
     offset: int,
 ) -> tuple[list[CatalogImportError], int]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     get_catalog_import(db, tenant_id, import_id)
     predicate = (
         CatalogImportError.tenant_id == tenant_id,
@@ -854,6 +864,8 @@ def list_skus(
     limit: int,
     offset: int,
 ) -> tuple[list[tuple[Sku, ProductStyle]], int]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     _get_tenant(db, tenant_id)
     predicates: list[Any] = [
         Sku.tenant_id == tenant_id,
@@ -889,6 +901,8 @@ def get_sku(
     tenant_id: uuid.UUID,
     sku_id: uuid.UUID,
 ) -> tuple[Sku, ProductStyle]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     row = db.execute(
         select(Sku, ProductStyle)
         .join(ProductStyle, ProductStyle.id == Sku.product_style_id)
@@ -1046,6 +1060,120 @@ def _apply_promotion(
     }
 
 
+def _sync_canonical_catalog(
+    db: Session,
+    catalog_import: CatalogImport,
+    rows: list[CatalogRowData],
+) -> None:
+    """Materialize Product -> Variant -> SKU -> EPC after legacy reconciliation.
+
+    The pre-existing style/binding tables remain the effective-dated audit history.
+    These tables are the active, architecture-facing catalog used by stream workers.
+    """
+
+    tenant_id = catalog_import.tenant_id
+    products = {
+        product.style_code: product
+        for product in db.scalars(select(Product).where(Product.tenant_id == tenant_id)).all()
+    }
+    supplied_products: set[str] = set()
+    supplied_variants: set[tuple[str, str]] = set()
+    supplied_epcs: set[str] = set()
+
+    first_row_by_style = {row.style_code: row for row in rows}
+    for style_code, row in first_row_by_style.items():
+        supplied_products.add(style_code)
+        category = str(row.style_attributes.get("category") or "UNCATEGORIZED").strip()
+        product = products.get(style_code)
+        if product is None:
+            product = Product(
+                tenant_id=tenant_id,
+                style_code=style_code,
+                name=row.style_name,
+                category=category,
+                attributes=row.style_attributes,
+                active=True,
+            )
+            db.add(product)
+            products[style_code] = product
+        else:
+            product.name = row.style_name
+            product.category = category
+            product.attributes = row.style_attributes
+            product.active = True
+    db.flush()
+
+    variants = {
+        (variant.product_id, variant.color): variant
+        for variant in db.scalars(
+            select(ProductVariant).where(ProductVariant.tenant_id == tenant_id)
+        ).all()
+    }
+    skus = {
+        sku.code: sku for sku in db.scalars(select(Sku).where(Sku.tenant_id == tenant_id)).all()
+    }
+    tags = {
+        tag.epc: tag
+        for tag in db.scalars(select(RfidTag).where(RfidTag.tenant_id == tenant_id)).all()
+    }
+
+    for row in rows:
+        supplied_products.add(row.style_code)
+        product = products[row.style_code]
+
+        variant_key = (row.style_code, row.color)
+        supplied_variants.add(variant_key)
+        variant = variants.get((product.id, row.color))
+        if variant is None:
+            variant = ProductVariant(
+                tenant_id=tenant_id,
+                product_id=product.id,
+                color=row.color,
+                attributes={},
+                active=True,
+            )
+            db.add(variant)
+            db.flush()
+            variants[(product.id, row.color)] = variant
+        else:
+            variant.active = True
+
+        sku = skus.get(row.sku)
+        if sku is None:  # pragma: no cover - legacy promotion created it in this transaction
+            raise PromotionConflictError(f"canonical SKU {row.sku} was not promoted")
+        sku.product_variant_id = variant.id
+
+        supplied_epcs.add(row.epc)
+        tag = tags.get(row.epc)
+        if tag is None:
+            db.add(
+                RfidTag(
+                    tenant_id=tenant_id,
+                    epc=row.epc,
+                    sku_id=sku.id,
+                    source_import_id=catalog_import.id,
+                    active=True,
+                )
+            )
+        else:
+            tag.sku_id = sku.id
+            tag.source_import_id = catalog_import.id
+            tag.active = True
+
+    if catalog_import.mode is CatalogImportMode.FULL:
+        for product in products.values():
+            if product.style_code not in supplied_products:
+                product.active = False
+        products_by_id = {product.id: product for product in products.values()}
+        for variant in variants.values():
+            product = products_by_id[variant.product_id]
+            if (product.style_code, variant.color) not in supplied_variants:
+                variant.active = False
+        for tag in tags.values():
+            if tag.epc not in supplied_epcs:
+                tag.active = False
+
+
 def promote_catalog_import(db: Session, import_id: uuid.UUID) -> CatalogImport:
     """Atomically promote a READY import; intended to be called by a durable worker."""
 
@@ -1096,6 +1224,7 @@ def promote_catalog_import(db: Session, import_id: uuid.UUID) -> CatalogImport:
     try:
         with db.begin_nested():
             outcome = _apply_promotion(db, catalog_import, rows, effective_at)
+            _sync_canonical_catalog(db, catalog_import, rows)
             db.flush()
     except (IntegrityError, PromotionConflictError) as exc:
         catalog_import.status = CatalogImportStatus.FAILED
@@ -1135,6 +1264,8 @@ def resolve_active_epc(
 
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     try:
         normalized_epc = normalize_epc(epc)
     except ValueError:

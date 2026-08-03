@@ -14,179 +14,118 @@ def test_assignment_sized_store_fixture_is_valid_and_deterministic() -> None:
     assert build_store_batch(100) == payload
 
 
-def test_openapi_contains_the_frozen_public_contract() -> None:
+def test_openapi_contains_the_canonical_submission_contract() -> None:
     schema = create_app().openapi()
     assert schema["openapi"] == "3.1.0"
-    assert schema["info"]["title"] == API_TITLE == "Abacus RFID Platform"
-    assert schema["info"]["version"] == __version__ == "0.1.0"
+    assert schema["info"] == {
+        **schema["info"],
+        "title": API_TITLE,
+        "version": __version__,
+    }
+    assert __version__ == "0.2.0"
 
-    paths = schema["paths"]
     expected_operations = {
         ("get", "/health/live"): "liveness",
         ("get", "/health/ready"): "readiness",
         ("get", "/version"): "version",
-        ("post", "/v1/platform/tenants"): "createTenant",
+        ("post", "/v1/tenants"): "createTenantCanonical",
+        ("post", "/v1/tenants/{tenant_id}/store-imports"): "createStoreImport",
+        ("post", "/v1/stores/{store_id}/zones"): "createStoreZone",
+        ("post", "/v1/stores/{store_id}/devices"): "registerStoreDevice",
+        ("post", "/v1/tenants/{tenant_id}/catalog-imports"): "createCatalogImportCanonical",
+        ("get", "/v1/catalog-imports/{import_id}"): "getCatalogImportCanonical",
         (
             "get",
-            "/v1/platform/tenants/{tenant_id}/stores",
-        ): "listTenantStores",
-        (
-            "post",
-            "/v1/platform/tenants/{tenant_id}/stores:bulk-onboard",
-        ): "bulkOnboardStores",
+            "/v1/catalog-imports/{import_id}/errors",
+        ): "listCatalogImportErrorsCanonical",
+        ("post", "/v1/rfid/observation-batches"): "submitRfidObservationBatch",
         (
             "get",
-            "/v1/platform/tenants/{tenant_id}/devices",
-        ): "listTenantDevices",
-        (
-            "post",
-            "/v1/platform/tenants/{tenant_id}/devices/{device_id}/assignments",
-        ): "assignDevice",
-        (
-            "get",
-            "/v1/platform/tenants/{tenant_id}/devices/{device_id}/assignments",
-        ): "listDeviceAssignments",
-        (
-            "post",
-            "/v1/platform/tenants/{tenant_id}/devices/{device_id}/credentials:rotate",
-        ): "rotateDeviceCredential",
-        ("post", "/v1/auth/login"): "login",
-        ("get", "/v1/auth/me"): "getCurrentUser",
+            "/v1/rfid/observation-batches/{batch_id}",
+        ): "getRfidObservationBatch",
+        ("get", "/v1/stores/{store_id}/inventory"): "getStoreInventory",
+        ("get", "/v1/items/{epc}"): "getCurrentItemState",
         ("post", "/v1/users"): "createUser",
+        ("put", "/v1/users/{user_id}/roles"): "replaceUserRoles",
+        (
+            "put",
+            "/v1/users/{user_id}/store-assignments",
+        ): "replaceUserStoreAssignments",
+        ("get", "/v1/me"): "getCurrentUserCanonical",
+        ("post", "/v1/replenishment-policies"): "createCanonicalReplenishmentPolicy",
+        (
+            "post",
+            "/v1/replenishment-policies/{policy_id}/versions",
+        ): "createReplenishmentPolicyVersion",
+        (
+            "patch",
+            "/v1/replenishment-policy-versions/{version_id}",
+        ): "patchReplenishmentPolicyVersion",
+        (
+            "post",
+            "/v1/replenishment-policy-versions/{version_id}/activate",
+        ): "activateReplenishmentPolicyVersion",
+        ("post", "/v1/replenishment/evaluations"): "evaluateCanonicalReplenishment",
+        (
+            "get",
+            "/v1/stores/{store_id}/replenishment-tasks",
+        ): "listCanonicalReplenishmentTasks",
+        ("patch", "/v1/replenishment-tasks/{task_id}"): "patchCanonicalReplenishmentTask",
+    }
+    optional_operations = {
+        ("post", "/v1/auth/login"): "login",
+        ("get", "/v1/tenants/{tenant_id}/stores"): "listCanonicalTenantStores",
+        ("get", "/v1/stores/{store_id}/zones"): "listStoreZones",
         ("get", "/v1/users"): "listUsers",
         ("get", "/v1/users/audit-records"): "listIdentityAuditRecords",
         ("get", "/v1/users/{user_id}"): "getUser",
         ("post", "/v1/users/{user_id}:suspend"): "suspendUser",
-        (
-            "post",
-            "/v1/tenants/{tenant_id}/catalog/imports",
-        ): "createCatalogImport",
-        (
-            "get",
-            "/v1/tenants/{tenant_id}/catalog/imports",
-        ): "listCatalogImports",
-        (
-            "get",
-            "/v1/tenants/{tenant_id}/catalog/imports/{import_id}",
-        ): "getCatalogImport",
-        (
-            "get",
-            "/v1/tenants/{tenant_id}/catalog/imports/{import_id}/errors",
-        ): "listCatalogImportErrors",
-        ("get", "/v1/tenants/{tenant_id}/catalog/skus"): "listCatalogSkus",
-        (
-            "get",
-            "/v1/tenants/{tenant_id}/catalog/skus/{sku_id}",
-        ): "getCatalogSku",
-        ("post", "/v1/device/read-batches"): "ingestRfidReadBatch",
-        (
-            "get",
-            "/v1/platform/tenants/{tenant_id}/rfid/observations",
-        ): "listRfidObservations",
-        (
-            "post",
-            "/v1/platform/tenants/{tenant_id}/rfid/observations/{observation_id}:replay",
-        ): "replayQuarantinedObservation",
-        ("get", "/v1/tenants/{tenant_id}/inventory"): "listInventoryBalances",
-        (
-            "post",
-            "/v1/tenants/{tenant_id}/replenishment/policies",
-        ): "createReplenishmentPolicy",
-        (
-            "get",
-            "/v1/tenants/{tenant_id}/replenishment/policies",
-        ): "listReplenishmentPolicies",
-        (
-            "get",
-            "/v1/tenants/{tenant_id}/replenishment/policies/{policy_id}",
-        ): "getReplenishmentPolicy",
-        (
-            "patch",
-            "/v1/tenants/{tenant_id}/replenishment/policies/{policy_id}",
-        ): "updateReplenishmentPolicy",
-        (
-            "delete",
-            "/v1/tenants/{tenant_id}/replenishment/policies/{policy_id}",
-        ): "deactivateReplenishmentPolicy",
-        (
-            "post",
-            "/v1/tenants/{tenant_id}/replenishment/policies:bulk-upsert",
-        ): "bulkUpsertReplenishmentPolicies",
-        (
-            "get",
-            "/v1/tenants/{tenant_id}/replenishment/policy-imports/{import_id}",
-        ): "getReplenishmentPolicyImport",
-        (
-            "post",
-            "/v1/tenants/{tenant_id}/replenishment/evaluations",
-        ): "evaluateReplenishment",
-        (
-            "get",
-            "/v1/tenants/{tenant_id}/replenishment/evaluations/{run_id}",
-        ): "getReplenishmentEvaluation",
-        ("get", "/v1/tenants/{tenant_id}/replenishment/tasks"): "listReplenishmentTasks",
-        (
-            "patch",
-            "/v1/tenants/{tenant_id}/replenishment/tasks/{task_id}",
-        ): "updateReplenishmentTask",
     }
-
     http_methods = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
     actual_operations = {
         (method, path): operation["operationId"]
-        for path, path_item in paths.items()
+        for path, path_item in schema["paths"].items()
         for method, operation in path_item.items()
         if method in http_methods
     }
-    assert actual_operations == expected_operations
+    assert actual_operations == expected_operations | optional_operations
+
+    paths = schema["paths"]
+    assert not any("/v1/platform/" in path for path in paths)
+    assert "/v1/device/read-batches" not in paths
+    assert "/v1/tenants/{tenant_id}/replenishment/tasks" not in paths
 
     security_schemes = schema["components"]["securitySchemes"]
-    assert security_schemes["PlatformApiKey"] == {
-        "type": "apiKey",
-        "description": "Trusted platform integration key for onboarding and operational APIs.",
-        "in": "header",
-        "name": "X-Platform-Key",
-    }
-    assert security_schemes["DeviceApiKey"] == {
-        "type": "apiKey",
-        "description": (
-            "RFID reader or gateway API key; plaintext is returned once and remains valid "
-            "until rotation."
-        ),
-        "in": "header",
-        "name": "X-Device-Key",
-    }
-    assert security_schemes["HTTPBearer"] == {
-        "type": "http",
-        "description": "Short-lived Abacus access token",
-        "scheme": "bearer",
-    }
-    assert paths["/v1/platform/tenants"]["post"]["security"] == [{"PlatformApiKey": []}]
-    assert paths["/v1/device/read-batches"]["post"]["security"] == [{"DeviceApiKey": []}]
+    assert security_schemes["DeviceToken"]["name"] == "X-Device-Token"
+    assert security_schemes["PlatformApiKey"]["name"] == "X-Platform-Key"
+    assert security_schemes["HTTPBearer"]["scheme"] == "bearer"
+    assert paths["/v1/rfid/observation-batches"]["post"]["security"] == [{"DeviceToken": []}]
+    for path, method in (
+        ("/v1/tenants", "post"),
+        ("/v1/tenants/{tenant_id}/store-imports", "post"),
+        ("/v1/tenants/{tenant_id}/catalog-imports", "post"),
+        ("/v1/catalog-imports/{import_id}", "get"),
+        ("/v1/catalog-imports/{import_id}/errors", "get"),
+    ):
+        assert paths[path][method]["security"] == [{"PlatformApiKey": []}]
+    for path, method in (
+        ("/v1/me", "get"),
+        ("/v1/stores/{store_id}/inventory", "get"),
+        ("/v1/items/{epc}", "get"),
+        ("/v1/replenishment-policies", "post"),
+        ("/v1/replenishment/evaluations", "post"),
+        ("/v1/stores/{store_id}/replenishment-tasks", "get"),
+        ("/v1/replenishment-tasks/{task_id}", "patch"),
+    ):
+        assert paths[path][method]["security"] == [{"HTTPBearer": []}]
 
-    onboarding_parameters = paths["/v1/platform/tenants/{tenant_id}/stores:bulk-onboard"]["post"][
-        "parameters"
-    ]
-    assert any(
-        parameter["name"] == "Idempotency-Key" and parameter["in"] == "header"
-        for parameter in onboarding_parameters
-    )
-
-    inventory_properties = schema["components"]["schemas"]["InventoryBalanceRead"]["properties"]
-    assert "as_of" not in inventory_properties
-    assert "projection_updated_at" in inventory_properties
-    assert "last_relevant_observation_at" in inventory_properties
-
-    observation_properties = schema["components"]["schemas"]["RfidObservationRead"]["properties"]
-    assert observation_properties["acceptance_sequence"]["type"] == "integer"
-
-    task_status = schema["components"]["schemas"]["ReplenishmentTaskStatus"]
-    assert task_status["enum"] == [
+    inventory_fields = schema["components"]["schemas"]["InventoryProjectionRead"]["properties"]
+    assert {"quantity", "as_of", "confidence", "freshness_status"}.issubset(inventory_fields)
+    assert schema["components"]["schemas"]["CanonicalTaskStatus"]["enum"] == [
         "OPEN",
         "CLAIMED",
         "IN_PROGRESS",
-        "AWAITING_VERIFICATION",
-        "VERIFIED",
-        "CANCELLED",
-        "EXCEPTION",
+        "COMPLETED",
+        "CANCELED",
+        "EXPIRED",
     ]

@@ -304,12 +304,12 @@ def test_postgres_end_to_end(
     assert stale_schema_health.status_code == 503
     assert stale_schema_health.json()["code"] == "schema_not_ready"
     with postgres_session_factory() as db:
-        db.execute(text("UPDATE alembic_version SET version_num = 'b6e3f19a2d44'"))
+        db.execute(text("UPDATE alembic_version SET version_num = 'a6f0c4d1e537'"))
         db.commit()
     assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
     version = _expect(client.get("/version"), 200)
     assert isinstance(version, dict)
-    assert version["version"] == "0.1.0"
+    assert version["version"] == "0.2.0"
     assert (
         client.get(
             "/v1/platform/tenants/00000000-0000-0000-0000-000000000000/stores",
@@ -929,6 +929,22 @@ def test_postgres_end_to_end(
         assert repeated_candidate_state.candidate_count == 1
         assert repeated_candidate_state.last_event_id == repeated_candidate["candidate_event_id"]
 
+    # The hosted stable-zone default requires three distinct observations. Add a
+    # second temporal confirmation for each candidate before the equal-time pair
+    # below supplies the third read.
+    for scenario_index, scenario in enumerate(ambiguity_scenarios):
+        candidate_time = scenario["candidate_time"]
+        assert isinstance(candidate_time, datetime)
+        _ingest(
+            client,
+            floor_device_key,
+            event_id=str(uuid.uuid4()),
+            epc=str(scenario["epc"]),
+            observed_at=candidate_time + timedelta(milliseconds=500),
+            batch_id=f"ambiguity-second-candidate-{scenario_index}",
+        )
+    _drain_jobs(postgres_session_factory)
+
     for scenario_index, scenario in enumerate(ambiguity_scenarios):
         epc = str(scenario["epc"])
         conflict_time = scenario["conflict_time"]
@@ -1006,7 +1022,7 @@ def test_postgres_end_to_end(
     for scenario_index, scenario in enumerate(ambiguity_scenarios):
         conflict_time = scenario["conflict_time"]
         assert isinstance(conflict_time, datetime)
-        for read_index in range(1, 3):
+        for read_index in range(1, 4):
             _ingest(
                 client,
                 back_device_key,
@@ -1030,7 +1046,7 @@ def test_postgres_end_to_end(
             floor_zone_id: 1,
         }
 
-    # A single cross-zone read is noisy evidence; the second confirms the move.
+    # The first two cross-zone reads are candidate evidence; the third confirms.
     moving_epc = KNOWN_EPCS[0]
     first_move_event = str(uuid.uuid4())
     _ingest(
@@ -1058,6 +1074,25 @@ def test_postgres_end_to_end(
         event_id=second_move_event,
         epc=moving_epc,
         observed_at=base_time + timedelta(seconds=31),
+        batch_id="move-second-candidate",
+    )
+    _drain_jobs(postgres_session_factory)
+    with postgres_session_factory() as db:
+        candidate_state = db.scalar(
+            select(InventoryItemState).where(InventoryItemState.epc == moving_epc)
+        )
+        assert candidate_state is not None
+        assert candidate_state.zone_id == backroom_zone_id
+        assert candidate_state.candidate_zone_id == floor_zone_id
+        assert candidate_state.candidate_count == 2
+
+    third_move_event = str(uuid.uuid4())
+    _ingest(
+        client,
+        floor_device_key,
+        event_id=third_move_event,
+        epc=moving_epc,
+        observed_at=base_time + timedelta(seconds=32),
         batch_id="move-confirmed",
     )
     _drain_jobs(postgres_session_factory)
@@ -1133,7 +1168,7 @@ def test_postgres_end_to_end(
         assert isinstance(item["last_relevant_observation_at"], str)
         datetime.fromisoformat(item["projection_updated_at"])
         assert datetime.fromisoformat(item["last_relevant_observation_at"]) == (
-            base_time + timedelta(seconds=31)
+            base_time + timedelta(seconds=32)
         )
     quantities = {str(item["zone_kind"]): int(item["quantity"]) for item in inventory["items"]}
     assert quantities == {"BACKROOM": 3, "SALES_FLOOR": 2}
@@ -1398,14 +1433,15 @@ def test_postgres_end_to_end(
     with postgres_session_factory() as db:
         reviewed_before_toggle = db.scalar(
             text(
-                "SELECT reservation_cutover_reviewed FROM replenishment_tasks WHERE id = :task_id"
+                "SELECT reservation_cutover_reviewed "
+                "FROM legacy_replenishment_tasks WHERE id = :task_id"
             ),
             {"task_id": uuid.UUID(task_id)},
         )
         assert reviewed_before_toggle is True
         db.execute(
             text(
-                "UPDATE replenishment_tasks "
+                "UPDATE legacy_replenishment_tasks "
                 "SET reservation_cutover_reviewed = false WHERE id = :task_id"
             ),
             {"task_id": uuid.UUID(task_id)},
@@ -1432,7 +1468,7 @@ def test_postgres_end_to_end(
     with postgres_session_factory() as db:
         db.execute(
             text(
-                "UPDATE replenishment_tasks "
+                "UPDATE legacy_replenishment_tasks "
                 "SET reservation_cutover_reviewed = true WHERE id = :task_id"
             ),
             {"task_id": uuid.UUID(task_id)},
@@ -1727,7 +1763,7 @@ def test_postgres_end_to_end(
     # a unit before the associate records moved_quantity, that one-unit change links
     # to the executing task and reduces its unreflected reservation exactly once.
     active_reflection_event_id = ""
-    for read_index in range(1, 3):
+    for read_index in range(1, 4):
         active_reflection_event_id = str(uuid.uuid4())
         _ingest(
             client,
@@ -1926,7 +1962,7 @@ def test_postgres_end_to_end(
     # One confirmed backroom-to-floor EPC movement consumes exactly one FIFO task
     # reservation. It must not release all three terminal moved units at once.
     reflected_event_id = ""
-    for read_index in range(1, 3):
+    for read_index in range(1, 4):
         reflected_event_id = str(uuid.uuid4())
         _ingest(
             client,

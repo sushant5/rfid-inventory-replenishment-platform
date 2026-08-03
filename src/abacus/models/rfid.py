@@ -222,7 +222,7 @@ class InventoryChange(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     replenishment_task_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("replenishment_tasks.id", ondelete="RESTRICT"),
+        ForeignKey("legacy_replenishment_tasks.id", ondelete="RESTRICT"),
         nullable=True,
     )
     from_store_id: Mapped[uuid.UUID | None] = mapped_column(

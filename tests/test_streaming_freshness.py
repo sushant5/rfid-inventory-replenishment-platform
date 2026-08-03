@@ -1,0 +1,263 @@
+import uuid
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
+
+import pytest
+from sqlalchemy.orm import Session
+
+from abacus.api.errors import ApiError
+from abacus.api.routes.rfid import get_item_state_endpoint
+from abacus.config import Settings
+from abacus.enums import DeviceStatus
+from abacus.events.rfid import RfidObservationEvent
+from abacus.models.architecture import CurrentItemState, FreshnessStatus, StoreConnectivity
+from abacus.models.catalog import Sku
+from abacus.models.identity import IdentityRole
+from abacus.models.tenancy import Device, DeviceAssignment
+from abacus.security import Principal, RoleScope
+from abacus.services import streaming_inventory
+from abacus.services.streaming_inventory import (
+    ProcessingResult,
+    RecentObservationState,
+    _resolve_effective_assignment,
+    effective_freshness,
+    process_observation,
+)
+
+
+def _settings() -> Settings:
+    return Settings(
+        connectivity_live_window_seconds=120,
+        connectivity_stale_window_seconds=600,
+        rfid_move_confirmation_reads=1,
+        rfid_last_seen_flush_seconds=30,
+        rfid_max_future_skew_seconds=300,
+    )
+
+
+def _connectivity(now: datetime) -> StoreConnectivity:
+    return StoreConnectivity(
+        tenant_id=uuid.uuid4(),
+        store_id=uuid.uuid4(),
+        gateway_last_heartbeat=now,
+        last_live_event_at=now,
+        backlog_drained=True,
+        reader_coverage_ok=True,
+        freshness_status=FreshnessStatus.LIVE,
+    )
+
+
+def _event(
+    *,
+    observed_at: datetime,
+    received_at: datetime,
+    store_id: uuid.UUID | None = None,
+    zone_id: uuid.UUID | None = None,
+) -> RfidObservationEvent:
+    return RfidObservationEvent(
+        tenant_id=uuid.uuid4(),
+        batch_id=uuid.uuid4(),
+        event_id=str(uuid.uuid4()),
+        device_id=uuid.uuid4(),
+        store_id=store_id or uuid.uuid4(),
+        zone_id=zone_id or uuid.uuid4(),
+        epc="303400000000000000000001",
+        observed_at=observed_at,
+        received_at=received_at,
+        rssi=-42,
+    )
+
+
+def test_effective_freshness_decays_without_a_database_write() -> None:
+    now = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    settings = _settings()
+    connectivity = _connectivity(now)
+
+    assert effective_freshness(connectivity, settings, now=now) == FreshnessStatus.LIVE
+    assert (
+        effective_freshness(connectivity, settings, now=now + timedelta(seconds=121))
+        == FreshnessStatus.DEGRADED
+    )
+    assert (
+        effective_freshness(connectivity, settings, now=now + timedelta(seconds=601))
+        == FreshnessStatus.STALE
+    )
+
+
+def test_effective_freshness_requires_drained_backlog_and_healthy_coverage() -> None:
+    now = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    connectivity = _connectivity(now)
+    connectivity.backlog_drained = False
+    assert effective_freshness(connectivity, _settings(), now=now) == FreshnessStatus.STALE
+
+    connectivity.backlog_drained = True
+    connectivity.reader_coverage_ok = False
+    assert effective_freshness(connectivity, _settings(), now=now) == FreshnessStatus.DEGRADED
+
+    connectivity.reader_coverage_ok = True
+    connectivity.oldest_buffered_event_at = now - timedelta(minutes=1)
+    assert effective_freshness(connectivity, _settings(), now=now) == FreshnessStatus.STALE
+
+
+def test_assignment_is_resolved_at_event_time_and_payload_mismatch_is_rejected() -> None:
+    observed_at = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    event = _event(observed_at=observed_at, received_at=observed_at)
+    device = Device(
+        id=event.device_id,
+        tenant_id=event.tenant_id,
+        serial_number="READER-1",
+        display_name="Reader 1",
+        status=DeviceStatus.ACTIVE,
+    )
+    assignment = DeviceAssignment(
+        tenant_id=event.tenant_id,
+        device_id=event.device_id,
+        store_id=uuid.uuid4(),
+        zone_id=uuid.uuid4(),
+        effective_from=observed_at - timedelta(days=1),
+    )
+    db = MagicMock(spec=Session)
+    db.scalar.side_effect = [device, assignment]
+
+    resolved, error = _resolve_effective_assignment(db, event)
+
+    assert resolved is None
+    assert error == "DEVICE_ASSIGNMENT_MISMATCH"
+
+
+def test_inactive_device_is_rejected_before_assignment_resolution() -> None:
+    now = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    event = _event(observed_at=now, received_at=now)
+    device = Device(
+        id=event.device_id,
+        tenant_id=event.tenant_id,
+        serial_number="READER-1",
+        display_name="Reader 1",
+        status=DeviceStatus.INACTIVE,
+    )
+    db = MagicMock(spec=Session)
+    db.scalar.return_value = device
+
+    resolved, error = _resolve_effective_assignment(db, event)
+
+    assert resolved is None
+    assert error == "INACTIVE_DEVICE"
+    assert db.scalar.call_count == 1
+
+
+def test_future_observation_is_quarantined_before_connectivity_or_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_at = datetime.now(UTC)
+    event = _event(
+        observed_at=received_at + timedelta(seconds=301),
+        received_at=received_at,
+    )
+    quarantined: list[str] = []
+
+    def fake_quarantine(
+        _db: Session,
+        _event: RfidObservationEvent,
+        *,
+        reason: str,
+    ) -> ProcessingResult:
+        quarantined.append(reason)
+        return ProcessingResult("QUARANTINED", reason=reason)
+
+    monkeypatch.setattr(streaming_inventory, "_quarantine", fake_quarantine)
+    monkeypatch.setattr(
+        streaming_inventory,
+        "_resolve_effective_assignment",
+        MagicMock(side_effect=AssertionError("assignment must not be resolved")),
+    )
+    monkeypatch.setattr(
+        streaming_inventory,
+        "_update_connectivity",
+        MagicMock(side_effect=AssertionError("connectivity must not be updated")),
+    )
+
+    result = process_observation(
+        MagicMock(spec=Session), event, RecentObservationState(), _settings()
+    )
+
+    assert result.disposition == "QUARANTINED"
+    assert quarantined == ["OBSERVED_AT_TOO_FAR_IN_FUTURE"]
+
+
+def test_same_zone_read_advances_durable_event_watermark_but_throttles_received_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = datetime.now(UTC) - timedelta(minutes=1)
+    store_id = uuid.uuid4()
+    zone_id = uuid.uuid4()
+    event = _event(
+        observed_at=base + timedelta(seconds=10),
+        received_at=base + timedelta(seconds=10),
+        store_id=store_id,
+        zone_id=zone_id,
+    )
+    assignment = DeviceAssignment(
+        tenant_id=event.tenant_id,
+        device_id=event.device_id,
+        store_id=store_id,
+        zone_id=zone_id,
+        effective_from=base - timedelta(days=1),
+    )
+    state = CurrentItemState(
+        tenant_id=event.tenant_id,
+        epc=event.epc,
+        sku_id=uuid.uuid4(),
+        store_id=store_id,
+        zone_id=zone_id,
+        last_observed_at=base,
+        last_received_at=base,
+        confidence=0.9,
+        state_version=1,
+    )
+    tag = MagicMock(active=True, sku_id=state.sku_id)
+    db = MagicMock(spec=Session)
+    db.get.return_value = tag
+    db.scalar.return_value = state
+    monkeypatch.setattr(
+        streaming_inventory,
+        "_resolve_effective_assignment",
+        MagicMock(return_value=(assignment, None)),
+    )
+    monkeypatch.setattr(streaming_inventory, "_update_connectivity", MagicMock())
+    monkeypatch.setattr(streaming_inventory, "_advance_batch", MagicMock())
+
+    result = process_observation(db, event, RecentObservationState(), _settings())
+
+    assert result.disposition == "PROCESSED"
+    assert state.last_observed_at == event.observed_at
+    assert state.last_received_at == base
+
+
+def test_unlocated_item_requires_tenant_wide_inventory_permission() -> None:
+    tenant_id = uuid.uuid4()
+    item = CurrentItemState(
+        tenant_id=tenant_id,
+        epc="303400000000000000000001",
+        sku_id=uuid.uuid4(),
+        store_id=None,
+        zone_id=None,
+        last_observed_at=datetime.now(UTC),
+        last_received_at=datetime.now(UTC),
+        confidence=0.8,
+        state_version=2,
+    )
+    sku = MagicMock(spec=Sku, code="SKU-1")
+    db = MagicMock(spec=Session)
+    db.execute.return_value.one_or_none.return_value = (item, sku)
+    principal = Principal(
+        user_id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        email="associate@example.com",
+        display_name="Associate",
+        role_scopes=(RoleScope(IdentityRole.STORE_ASSOCIATE, uuid.uuid4()),),
+    )
+
+    with pytest.raises(ApiError) as error:
+        get_item_state_endpoint(item.epc, db, _settings(), principal)
+
+    assert error.value.code == "tenant_inventory_scope_required"

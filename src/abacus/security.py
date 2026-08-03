@@ -20,7 +20,13 @@ from sqlalchemy import select
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
 from abacus.api.errors import ApiError
+from abacus.db import TenantSession, pin_session_to_tenant
 from abacus.enums import TenantStatus
+from abacus.models.architecture import (
+    CanonicalIdentityRole,
+    UserRole,
+    UserStoreAssignment,
+)
 from abacus.models.identity import IdentityRole, User, UserAccessGrant, UserStatus
 from abacus.models.tenancy import Tenant
 
@@ -41,7 +47,9 @@ class Permission(StrEnum):
     REPLENISHMENT_EXECUTE = "replenishment:execute"
 
 
-ROLE_PERMISSIONS: dict[IdentityRole, frozenset[Permission]] = {
+AuthorizationRole = IdentityRole | CanonicalIdentityRole
+
+ROLE_PERMISSIONS: dict[AuthorizationRole, frozenset[Permission]] = {
     IdentityRole.CORPORATE_ADMIN: frozenset(Permission),
     IdentityRole.STORE_MANAGER: frozenset(
         {
@@ -65,12 +73,43 @@ ROLE_PERMISSIONS: dict[IdentityRole, frozenset[Permission]] = {
             Permission.REPLENISHMENT_EXECUTE,
         }
     ),
+    CanonicalIdentityRole.TENANT_ADMIN: frozenset(Permission),
+    CanonicalIdentityRole.CORPORATE_USER: frozenset(
+        {
+            Permission.CATALOG_READ,
+            Permission.INVENTORY_READ,
+            Permission.POLICY_READ,
+            Permission.REPLENISHMENT_READ,
+        }
+    ),
+    CanonicalIdentityRole.STORE_MANAGER: frozenset(
+        {
+            Permission.USERS_CREATE,
+            Permission.USERS_READ,
+            Permission.USERS_SUSPEND,
+            Permission.CATALOG_READ,
+            Permission.INVENTORY_READ,
+            Permission.POLICY_READ,
+            Permission.REPLENISHMENT_READ,
+            Permission.REPLENISHMENT_MANAGE,
+            Permission.REPLENISHMENT_EXECUTE,
+        }
+    ),
+    CanonicalIdentityRole.STORE_ASSOCIATE: frozenset(
+        {
+            Permission.CATALOG_READ,
+            Permission.INVENTORY_READ,
+            Permission.POLICY_READ,
+            Permission.REPLENISHMENT_READ,
+            Permission.REPLENISHMENT_EXECUTE,
+        }
+    ),
 }
 
 
 @dataclass(frozen=True, slots=True)
 class RoleScope:
-    role: IdentityRole
+    role: AuthorizationRole
     store_id: uuid.UUID | None
 
 
@@ -81,6 +120,8 @@ class Principal:
     email: str
     display_name: str
     role_scopes: tuple[RoleScope, ...]
+    canonical_roles: tuple[CanonicalIdentityRole, ...] = ()
+    assigned_store_ids: tuple[uuid.UUID, ...] = ()
 
     @property
     def permissions(self) -> frozenset[Permission]:
@@ -471,6 +512,8 @@ def get_current_principal(
         issuer=settings.jwt_issuer,
         audience=settings.jwt_audience,
     )
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, claims.tenant_id)
     user = db.scalar(
         select(User).where(
             User.id == claims.user_id,
@@ -486,7 +529,7 @@ def get_current_principal(
     ):
         raise _invalid_access_token()
 
-    grants = tuple(
+    legacy_grants = tuple(
         RoleScope(role=grant.role, store_id=grant.store_id)
         for grant in db.scalars(
             select(UserAccessGrant)
@@ -497,14 +540,71 @@ def get_current_principal(
             .order_by(UserAccessGrant.role.asc(), UserAccessGrant.store_id.asc())
         ).all()
     )
-    if not grants:
+    canonical_roles = tuple(
+        db.scalars(
+            select(UserRole.role)
+            .where(
+                UserRole.tenant_id == claims.tenant_id,
+                UserRole.user_id == claims.user_id,
+            )
+            .order_by(UserRole.role.asc())
+        ).all()
+    )
+    assigned_store_ids = tuple(
+        db.scalars(
+            select(UserStoreAssignment.store_id)
+            .where(
+                UserStoreAssignment.tenant_id == claims.tenant_id,
+                UserStoreAssignment.user_id == claims.user_id,
+            )
+            .order_by(UserStoreAssignment.store_id.asc())
+        ).all()
+    )
+    if canonical_roles:
+        scopes = tuple(
+            RoleScope(role=role, store_id=store_id)
+            for role in canonical_roles
+            for store_id in (
+                (None,)
+                if role
+                in {
+                    CanonicalIdentityRole.TENANT_ADMIN,
+                    CanonicalIdentityRole.CORPORATE_USER,
+                }
+                else assigned_store_ids
+            )
+        )
+    else:
+        scopes = legacy_grants
+        canonical_roles = tuple(
+            sorted(
+                {
+                    (
+                        CanonicalIdentityRole.TENANT_ADMIN
+                        if scope.role is IdentityRole.CORPORATE_ADMIN
+                        else CanonicalIdentityRole(scope.role.value)
+                    )
+                    for scope in legacy_grants
+                },
+                key=lambda role: role.value,
+            )
+        )
+        assigned_store_ids = tuple(
+            sorted(
+                {scope.store_id for scope in legacy_grants if scope.store_id is not None},
+                key=str,
+            )
+        )
+    if not canonical_roles:
         raise _invalid_access_token()
     return Principal(
         user_id=user.id,
         tenant_id=user.tenant_id,
         email=user.email,
         display_name=user.display_name,
-        role_scopes=grants,
+        role_scopes=scopes,
+        canonical_roles=canonical_roles,
+        assigned_store_ids=assigned_store_ids,
     )
 
 

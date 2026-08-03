@@ -12,6 +12,10 @@ from abacus.schemas.identity import (
     UserCreate,
     UserPage,
     UserRead,
+    UserRolesRead,
+    UserRolesReplace,
+    UserStoreAssignmentsRead,
+    UserStoreAssignmentsReplace,
 )
 from abacus.security import Permission, Principal, require_permission
 from abacus.services.identity import (
@@ -20,6 +24,8 @@ from abacus.services.identity import (
     get_user,
     list_audit_records,
     list_users,
+    replace_user_roles,
+    replace_user_store_assignments,
     suspend_user,
 )
 
@@ -129,6 +135,36 @@ def get_user_endpoint(
     principal: CanReadUsers,
 ) -> UserRead:
     return _user_read(get_user(db, principal, user_id))
+
+
+@router.put(
+    "/{user_id}/roles",
+    response_model=UserRolesRead,
+    operation_id="replaceUserRoles",
+)
+def replace_user_roles_endpoint(
+    user_id: uuid.UUID,
+    request: UserRolesReplace,
+    db: DatabaseSession,
+    principal: CanCreateUsers,
+) -> UserRolesRead:
+    access = replace_user_roles(db, principal, user_id, request)
+    return UserRolesRead(user_id=access.user_id, roles=list(access.roles))
+
+
+@router.put(
+    "/{user_id}/store-assignments",
+    response_model=UserStoreAssignmentsRead,
+    operation_id="replaceUserStoreAssignments",
+)
+def replace_user_store_assignments_endpoint(
+    user_id: uuid.UUID,
+    request: UserStoreAssignmentsReplace,
+    db: DatabaseSession,
+    principal: CanCreateUsers,
+) -> UserStoreAssignmentsRead:
+    access = replace_user_store_assignments(db, principal, user_id, request)
+    return UserStoreAssignmentsRead(user_id=access.user_id, store_ids=list(access.store_ids))
 
 
 @router.post(

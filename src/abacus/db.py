@@ -1,7 +1,9 @@
+import uuid
 from collections.abc import Generator
+from contextlib import contextmanager
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import Connection, create_engine, event, text
+from sqlalchemy.orm import Session, SessionTransaction, sessionmaker
 
 from abacus.config import get_settings
 
@@ -13,11 +15,87 @@ engine = create_engine(
     future=True,
 )
 
-SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
+TENANT_CONTEXT_KEY = "tenant_id"
+
+
+class TenantSession(Session):
+    """Session that can be permanently pinned to one tenant for its lifetime."""
+
+
+@event.listens_for(TenantSession, "after_begin")
+def _apply_transaction_tenant_context(
+    session: TenantSession,
+    _transaction: SessionTransaction,
+    connection: Connection,
+) -> None:
+    """Apply tenant context to every transaction opened by a pinned session.
+
+    PostgreSQL's ``set_config(..., true)`` is the parameter-safe equivalent of
+    ``SET LOCAL``. The value therefore disappears at commit or rollback, while the
+    session remains pinned so this listener can restore it for the next transaction.
+    """
+
+    tenant_id = session.info.get(TENANT_CONTEXT_KEY)
+    if tenant_id is None:
+        return
+    if not isinstance(tenant_id, uuid.UUID):
+        raise RuntimeError("TenantSession contains an invalid tenant context")
+    connection.execute(
+        text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+        {"tenant_id": str(tenant_id)},
+    )
+
+
+SessionLocal: sessionmaker[TenantSession] = sessionmaker(
+    bind=engine,
+    class_=TenantSession,
+    expire_on_commit=False,
+)
+
+
+def pin_session_to_tenant(session: TenantSession, tenant_id: uuid.UUID) -> TenantSession:
+    """Bind a new session to one verified tenant before its first transaction.
+
+    The binding is immutable. Callers must derive ``tenant_id`` from authenticated
+    claims or another trusted registry lookup, never directly from an untrusted body.
+    """
+
+    if not isinstance(tenant_id, uuid.UUID):
+        raise TypeError("tenant_id must be a UUID")
+
+    existing_tenant_id = session.info.get(TENANT_CONTEXT_KEY)
+    if existing_tenant_id is not None:
+        if existing_tenant_id != tenant_id:
+            raise RuntimeError("A TenantSession cannot be rebound to another tenant")
+        return session
+
+    if session.in_transaction():
+        raise RuntimeError("Tenant context must be set before the first database transaction")
+
+    session.info[TENANT_CONTEXT_KEY] = tenant_id
+    return session
 
 
 def get_db() -> Generator[Session]:
+    """Yield the existing unpinned session dependency.
+
+    This remains unpinned while authentication and platform dependencies are migrated
+    incrementally. Tenant-aware callers should use ``tenant_session_scope`` or pin the
+    yielded ``TenantSession`` before issuing any SQL.
+    """
+
     session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@contextmanager
+def tenant_session_scope(tenant_id: uuid.UUID) -> Generator[TenantSession]:
+    """Open a tenant-pinned session for trusted application and worker code."""
+
+    session = pin_session_to_tenant(SessionLocal(), tenant_id)
     try:
         yield session
     finally:

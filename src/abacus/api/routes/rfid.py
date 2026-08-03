@@ -1,12 +1,34 @@
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.security import APIKeyHeader
+from sqlalchemy import select
 
-from abacus.api.dependencies import DatabaseSession, PlatformAccess
+from abacus.api.dependencies import (
+    DatabaseSession,
+    PlatformAccess,
+    SettingsDependency,
+)
 from abacus.api.errors import ApiError
 from abacus.enums import ObservationStatus
+from abacus.models.architecture import (
+    CurrentItemState,
+    InventoryProjection,
+    RfidObservationBatch,
+    StoreConnectivity,
+)
+from abacus.models.catalog import Sku
+from abacus.models.tenancy import Zone
+from abacus.schemas.architecture import (
+    CanonicalObservationBatchCreate,
+    InventoryProjectionRead,
+    ItemStateRead,
+    ObservationBatchAccepted,
+    ObservationBatchRead,
+)
+from abacus.schemas.catalog import normalize_epc
 from abacus.schemas.rfid import (
     InventoryBalanceListRead,
     InventoryBalanceRead,
@@ -23,9 +45,12 @@ from abacus.services.rfid import (
     list_observations,
     replay_quarantined_observation,
 )
+from abacus.services.rfid_ingress import accept_observation_batch
+from abacus.services.streaming_inventory import effective_freshness
 
 device_router = APIRouter(prefix="/v1/device", tags=["3. RFID Ingestion"])
 platform_router = APIRouter(tags=["3. RFID Inventory"])
+canonical_router = APIRouter(prefix="/v1", tags=["3. RFID and Inventory"])
 CanReadInventory = Annotated[
     Principal,
     Depends(require_permission(Permission.INVENTORY_READ)),
@@ -40,6 +65,168 @@ _device_key_header = APIKeyHeader(
     auto_error=False,
 )
 DeviceKey = Annotated[str | None, Depends(_device_key_header)]
+_device_token_header = APIKeyHeader(
+    name="X-Device-Token",
+    scheme_name="DeviceToken",
+    description="Demo device credential returned once during registration.",
+    auto_error=False,
+)
+DeviceToken = Annotated[str | None, Depends(_device_token_header)]
+
+
+@canonical_router.post(
+    "/rfid/observation-batches",
+    response_model=ObservationBatchAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    operation_id="submitRfidObservationBatch",
+)
+def submit_observation_batch_endpoint(
+    request: CanonicalObservationBatchCreate,
+    db: DatabaseSession,
+    x_device_token: DeviceToken,
+) -> ObservationBatchAccepted:
+    device = authenticate_device(db, x_device_token)
+    batch, _events = accept_observation_batch(
+        db,
+        device=device,
+        request=request,
+        received_at=datetime.now(UTC),
+    )
+    return ObservationBatchAccepted(
+        batch_id=batch.id,
+        status=batch.status,
+        accepted=batch.accepted_count,
+    )
+
+
+@canonical_router.get(
+    "/rfid/observation-batches/{batch_id}",
+    response_model=ObservationBatchRead,
+    operation_id="getRfidObservationBatch",
+)
+def get_observation_batch_endpoint(
+    batch_id: uuid.UUID,
+    db: DatabaseSession,
+    principal: CanReadInventory,
+) -> ObservationBatchRead:
+    batch = db.scalar(
+        select(RfidObservationBatch).where(
+            RfidObservationBatch.id == batch_id,
+            RfidObservationBatch.tenant_id == principal.tenant_id,
+        )
+    )
+    if batch is None:
+        raise ApiError(404, "RFID batch not found", "The requested batch does not exist.")
+    if not principal.can_access_store(Permission.INVENTORY_READ, batch.store_id):
+        raise ApiError(403, "Forbidden", "The batch's store is outside the user's scope.")
+    return ObservationBatchRead(
+        batch_id=batch.id,
+        status=batch.status,
+        accepted=batch.accepted_count,
+        processed=batch.processed_count,
+        rejected=batch.rejected_count,
+        pending=batch.pending_count,
+    )
+
+
+@canonical_router.get(
+    "/stores/{store_id}/inventory",
+    response_model=list[InventoryProjectionRead],
+    operation_id="getStoreInventory",
+)
+def get_store_inventory_endpoint(
+    store_id: uuid.UUID,
+    db: DatabaseSession,
+    settings: SettingsDependency,
+    principal: CanReadInventory,
+    sku_id: uuid.UUID | None = None,
+    zone_id: uuid.UUID | None = None,
+) -> list[InventoryProjectionRead]:
+    if not principal.can_access_store(Permission.INVENTORY_READ, store_id):
+        raise ApiError(403, "Forbidden", "The store is outside the current user's scope.")
+    predicates = [
+        InventoryProjection.tenant_id == principal.tenant_id,
+        InventoryProjection.store_id == store_id,
+    ]
+    if sku_id is not None:
+        predicates.append(InventoryProjection.sku_id == sku_id)
+    if zone_id is not None:
+        predicates.append(InventoryProjection.zone_id == zone_id)
+    rows = db.execute(
+        select(InventoryProjection, Sku, Zone)
+        .join(Sku, Sku.id == InventoryProjection.sku_id)
+        .join(Zone, Zone.id == InventoryProjection.zone_id)
+        .where(*predicates)
+        .order_by(Sku.code, Zone.code)
+    ).all()
+    connectivity = db.get(StoreConnectivity, (principal.tenant_id, store_id))
+    freshness = effective_freshness(connectivity, settings)
+    return [
+        InventoryProjectionRead(
+            sku_id=projection.sku_id,
+            sku=sku.code,
+            zone_id=projection.zone_id,
+            zone=zone.code,
+            quantity=projection.quantity,
+            as_of=projection.as_of,
+            confidence=projection.confidence,
+            freshness_status=freshness,
+        )
+        for projection, sku, zone in rows
+    ]
+
+
+@canonical_router.get(
+    "/items/{epc}",
+    response_model=ItemStateRead,
+    operation_id="getCurrentItemState",
+)
+def get_item_state_endpoint(
+    epc: str,
+    db: DatabaseSession,
+    settings: SettingsDependency,
+    principal: CanReadInventory,
+) -> ItemStateRead:
+    normalized_epc = normalize_epc(epc)
+    row = db.execute(
+        select(CurrentItemState, Sku)
+        .join(Sku, Sku.id == CurrentItemState.sku_id)
+        .where(
+            CurrentItemState.tenant_id == principal.tenant_id,
+            CurrentItemState.epc == normalized_epc,
+        )
+    ).one_or_none()
+    if row is None:
+        raise ApiError(404, "Item not found", "The EPC has no confirmed current state.")
+    item, sku = row
+    if item.store_id is None and not principal.has_tenant_permission(Permission.INVENTORY_READ):
+        raise ApiError(
+            403,
+            "Forbidden",
+            "Unlocated items require tenant-wide inventory access.",
+            code="tenant_inventory_scope_required",
+        )
+    if item.store_id is not None and not principal.can_access_store(
+        Permission.INVENTORY_READ, item.store_id
+    ):
+        raise ApiError(403, "Forbidden", "The item's store is outside the user's scope.")
+    connectivity = (
+        db.get(StoreConnectivity, (principal.tenant_id, item.store_id))
+        if item.store_id is not None
+        else None
+    )
+    return ItemStateRead(
+        epc=item.epc,
+        sku_id=item.sku_id,
+        sku=sku.code,
+        store_id=item.store_id,
+        zone_id=item.zone_id,
+        last_observed_at=item.last_observed_at,
+        last_received_at=item.last_received_at,
+        confidence=item.confidence,
+        state_version=item.state_version,
+        freshness_status=effective_freshness(connectivity, settings),
+    )
 
 
 @device_router.post(

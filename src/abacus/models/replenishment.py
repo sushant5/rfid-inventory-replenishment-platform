@@ -71,7 +71,9 @@ ACTIVE_TASK_STATUSES = (
 
 
 class ReplenishmentPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "replenishment_policies"
+    # Compatibility model for the pre-versioned API. The architecture-aligned
+    # policy resources live in ``replenishment_policies`` and related tables.
+    __tablename__ = "legacy_replenishment_rules"
     __table_args__ = (
         UniqueConstraint(
             "tenant_id",
@@ -233,7 +235,8 @@ class ReplenishmentRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "replenishment_tasks"
+    # Compatibility model retained while clients migrate to the canonical task API.
+    __tablename__ = "legacy_replenishment_tasks"
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_replenishment_tasks_positive_quantity"),
         CheckConstraint(
@@ -264,7 +267,7 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ),
         CheckConstraint("version >= 1", name="ck_replenishment_tasks_positive_version"),
         Index(
-            "uq_replenishment_tasks_active_store_sku",
+            "uq_legacy_replenishment_tasks_active_store_sku",
             "tenant_id",
             "store_id",
             "sku_id",
@@ -273,9 +276,14 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
                 "status IN ('OPEN', 'CLAIMED', 'IN_PROGRESS', 'AWAITING_VERIFICATION')"
             ),
         ),
-        Index("ix_replenishment_tasks_tenant_store_status", "tenant_id", "store_id", "status"),
         Index(
-            "ix_replenishment_tasks_unreviewed_cutover",
+            "ix_legacy_replenishment_tasks_tenant_store_status",
+            "tenant_id",
+            "store_id",
+            "status",
+        ),
+        Index(
+            "ix_legacy_replenishment_tasks_unreviewed_cutover",
             "id",
             postgresql_where=text("reservation_cutover_reviewed = false"),
         ),
@@ -294,7 +302,7 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     source_policy_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("replenishment_policies.id", ondelete="RESTRICT"),
+        ForeignKey("legacy_replenishment_rules.id", ondelete="RESTRICT"),
         nullable=False,
     )
     status: Mapped[ReplenishmentTaskStatus] = mapped_column(
@@ -376,11 +384,11 @@ class ReplenishmentRunLine(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     policy_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("replenishment_policies.id", ondelete="RESTRICT"),
+        ForeignKey("legacy_replenishment_rules.id", ondelete="RESTRICT"),
         nullable=True,
     )
     task_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("replenishment_tasks.id", ondelete="SET NULL"),
+        ForeignKey("legacy_replenishment_tasks.id", ondelete="SET NULL"),
         nullable=True,
     )
     selector_type: Mapped[PolicySelectorType | None] = mapped_column(

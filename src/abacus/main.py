@@ -10,7 +10,7 @@ from structlog.contextvars import bind_contextvars, clear_contextvars
 
 from abacus import __version__
 from abacus.api.errors import install_error_handlers
-from abacus.api.router import api_router
+from abacus.api.router import api_router, legacy_test_router
 from abacus.config import get_settings
 from abacus.logging import configure_logging
 
@@ -22,11 +22,13 @@ logger = structlog.get_logger(__name__)
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     logger.info("application_started", environment=settings.app_env, build_sha=settings.build_sha)
-    yield
-    logger.info("application_stopped")
+    try:
+        yield
+    finally:
+        logger.info("application_stopped")
 
 
-def create_app() -> FastAPI:
+def create_app(*, include_legacy_test_routes: bool = False) -> FastAPI:
     settings = get_settings()
     application = FastAPI(
         title=settings.app_name,
@@ -70,6 +72,8 @@ def create_app() -> FastAPI:
             clear_contextvars()
 
     application.include_router(api_router)
+    if include_legacy_test_routes:
+        application.include_router(legacy_test_router)
 
     @application.get("/", include_in_schema=False)
     def service_discovery() -> dict[str, str]:

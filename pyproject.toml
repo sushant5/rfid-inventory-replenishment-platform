@@ -7,7 +7,7 @@ name = "abacus-rfid-platform"
 dynamic = ["version"]
 description = "GreyOrange Engineering take-home: multi-tenant RFID inventory and replenishment API"
 readme = "README.md"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.12,<3.14"
 dependencies = [
   "alembic==1.18.5",
   "email-validator==2.3.0",
@@ -33,8 +33,10 @@ dev = [
 ]
 
 [project.scripts]
-abacus-worker = "abacus.worker:main"
 abacus-cli = "abacus.cli:main"
+abacus-catalog-worker = "abacus.processes.catalog_worker:main"
+abacus-event-worker = "abacus.processes.event_worker:main"
+abacus-hosted = "abacus.processes.hosted:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -59,7 +61,7 @@ skip_covered = true
 fail_under = 80
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
 
@@ -71,7 +73,7 @@ ignore = ["S101"]
 "tests/**/*.py" = ["S101", "S105", "S106"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
 mypy_path = "src"

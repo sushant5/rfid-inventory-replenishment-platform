@@ -56,6 +56,14 @@ class ZoneCreate(ApiModel):
     def normalize_code(cls, value: str) -> str:
         return value.strip().lower()
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name cannot be blank")
+        return normalized
+
 
 class DeviceCreate(ApiModel):
     serial_number: str = Field(min_length=3, max_length=128)
@@ -65,12 +73,39 @@ class DeviceCreate(ApiModel):
     @field_validator("serial_number")
     @classmethod
     def normalize_serial(cls, value: str) -> str:
-        return value.strip().upper()
+        normalized = value.strip().upper()
+        if len(normalized) < 3:
+            raise ValueError("serial_number must contain at least 3 non-whitespace characters")
+        return normalized
 
     @field_validator("zone_code")
     @classmethod
     def normalize_zone_code(cls, value: str) -> str:
         return value.strip().lower()
+
+
+class StoreDeviceCreate(ApiModel):
+    """Register one device directly against a server-resolved store."""
+
+    serial_number: str = Field(min_length=3, max_length=128)
+    display_name: str = Field(min_length=1, max_length=255)
+    zone_id: uuid.UUID
+
+    @field_validator("serial_number")
+    @classmethod
+    def normalize_serial(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if len(normalized) < 3:
+            raise ValueError("serial_number must contain at least 3 non-whitespace characters")
+        return normalized
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_display_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("display_name cannot be blank")
+        return normalized
 
 
 class StoreCreate(ApiModel):
@@ -198,3 +233,10 @@ class DeviceAssignmentRead(ApiModel):
     zone_id: uuid.UUID
     effective_from: datetime
     effective_to: datetime | None
+
+
+class StoreDeviceRegistrationRead(ApiModel):
+    device: DeviceRead
+    assignment: DeviceAssignmentRead
+    api_key: str
+    warning: str = "This credential is shown once. Store it securely."

@@ -3,6 +3,7 @@ from datetime import datetime
 
 from pydantic import EmailStr, Field, SecretStr, field_validator, model_validator
 
+from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.identity import IdentityAuditAction, IdentityRole, UserStatus
 from abacus.schemas.common import ApiModel
 
@@ -47,6 +48,41 @@ class RoleAssignmentCreate(ApiModel):
 class RoleAssignmentRead(ApiModel):
     role: IdentityRole
     store_id: uuid.UUID | None
+
+
+class UserRolesReplace(ApiModel):
+    roles: list[CanonicalIdentityRole] = Field(min_length=1, max_length=4)
+
+    @field_validator("roles")
+    @classmethod
+    def reject_duplicate_roles(
+        cls,
+        value: list[CanonicalIdentityRole],
+    ) -> list[CanonicalIdentityRole]:
+        if len(value) != len(set(value)):
+            raise ValueError("roles cannot contain duplicates")
+        return value
+
+
+class UserRolesRead(ApiModel):
+    user_id: uuid.UUID
+    roles: list[CanonicalIdentityRole]
+
+
+class UserStoreAssignmentsReplace(ApiModel):
+    store_ids: list[uuid.UUID] = Field(max_length=500)
+
+    @field_validator("store_ids")
+    @classmethod
+    def reject_duplicate_store_ids(cls, value: list[uuid.UUID]) -> list[uuid.UUID]:
+        if len(value) != len(set(value)):
+            raise ValueError("store_ids cannot contain duplicates")
+        return value
+
+
+class UserStoreAssignmentsRead(ApiModel):
+    user_id: uuid.UUID
+    store_ids: list[uuid.UUID]
 
 
 class UserCreate(ApiModel):
@@ -103,6 +139,16 @@ class CurrentPrincipalRead(ApiModel):
     email: EmailStr
     display_name: str
     role_assignments: list[RoleAssignmentRead]
+    permissions: list[str]
+
+
+class CanonicalPrincipalRead(ApiModel):
+    user_id: uuid.UUID
+    tenant_id: uuid.UUID
+    email: EmailStr
+    display_name: str
+    roles: list[CanonicalIdentityRole]
+    store_ids: list[uuid.UUID]
     permissions: list[str]
 
 

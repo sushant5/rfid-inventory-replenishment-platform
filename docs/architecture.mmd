@@ -1,0 +1,26 @@
+flowchart LR
+    subgraph Demo[Submitted hosted scope]
+        Reviewer[Reviewer / Swagger] -->|JWT or platform key| API[FastAPI API]
+        Gateway[RFID gateway] -->|device token + batches| API
+
+        API -->|tenant-scoped transactions| PG[(PostgreSQL 17 + RLS)]
+        Catalog[Catalog worker] -->|validate staging + atomic promotion| PG
+
+        API -->|event ledger + durable inbox| PG
+        PG --> Events[Event worker]
+        Events -->|effective assignment + stable-zone state| PG
+        Events -->|deduped projection updates| PG
+        Events --> Quarantine[Quarantine records]
+
+        PG -->|fresh projection + active policy| Replenishment[Policy evaluation]
+        Replenishment -->|one active task per store / SKU| PG
+    end
+
+    subgraph Future[Production extensions - not deployed]
+        Stream[Kafka-compatible event stream]
+        Archive[S3-compatible raw archive]
+    end
+
+    API -. measured throughput / replay need .-> Stream
+    Stream -. independent consumers .-> Events
+    API -. retention requirement .-> Archive

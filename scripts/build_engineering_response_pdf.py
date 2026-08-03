@@ -506,6 +506,19 @@ def parse_markdown(path: Path) -> tuple[dict[str, str], list[object]]:
             story.append(make_callout(block) if kind == "callout" else make_diagram(block))
             continue
 
+        if stripped.startswith("```"):
+            flush_paragraph()
+            idx += 1
+            block = []
+            while idx < len(lines) and not lines[idx].strip().startswith("```"):
+                block.append(lines[idx])
+                idx += 1
+            if idx >= len(lines):
+                raise ValueError("Unterminated fenced code block")
+            idx += 1
+            story.append(make_diagram(block))
+            continue
+
         if stripped == "---":
             flush_paragraph()
             story.append(

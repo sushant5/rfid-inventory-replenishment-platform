@@ -296,7 +296,7 @@ def test_populated_active_task_cutover_requires_review_before_baselining() -> No
                 text(
                     "SELECT reconciled_before_tracking_quantity, "
                     "reservation_cutover_reviewed "
-                    "FROM replenishment_tasks WHERE id = :task_id"
+                    "FROM legacy_replenishment_tasks WHERE id = :task_id"
                 ),
                 {"task_id": task_id},
             ).one()
@@ -305,14 +305,14 @@ def test_populated_active_task_cutover_requires_review_before_baselining() -> No
             zero_moved_reviewed = connection.scalar(
                 text(
                     "SELECT reservation_cutover_reviewed "
-                    "FROM replenishment_tasks WHERE id = :task_id"
+                    "FROM legacy_replenishment_tasks WHERE id = :task_id"
                 ),
                 {"task_id": zero_moved_task_id},
             )
             assert zero_moved_reviewed is True
             connection.execute(
                 text(
-                    "INSERT INTO replenishment_tasks "
+                    "INSERT INTO legacy_replenishment_tasks "
                     "(id, tenant_id, store_id, sku_id, source_policy_id, status, "
                     "quantity, moved_quantity, version, completed_at) "
                     "VALUES (:id, :tenant_id, :store_id, :sku_id, :policy_id, "
@@ -329,7 +329,7 @@ def test_populated_active_task_cutover_requires_review_before_baselining() -> No
             direct_insert_reviewed = connection.scalar(
                 text(
                     "SELECT reservation_cutover_reviewed "
-                    "FROM replenishment_tasks WHERE id = :task_id"
+                    "FROM legacy_replenishment_tasks WHERE id = :task_id"
                 ),
                 {"task_id": direct_insert_task_id},
             )
@@ -387,7 +387,7 @@ def test_populated_active_task_cutover_requires_review_before_baselining() -> No
             # One unit is recorded after cutover, then the still-active task closes.
             connection.execute(
                 text(
-                    "UPDATE replenishment_tasks "
+                    "UPDATE legacy_replenishment_tasks "
                     "SET moved_quantity = 3, status = 'EXCEPTION', "
                     "completed_at = clock_timestamp() WHERE id = :task_id"
                 ),

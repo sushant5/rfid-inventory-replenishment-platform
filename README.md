@@ -1,419 +1,212 @@
-# Abacus RFID Platform
+# Abacus Engineering Take-Home
 
-GreyOrange Engineering Take-Home Exercise — engineering track only.
+Production-shaped backend for Orange's RFID inventory and replenishment workflow:
 
-Abacus is a testable multi-tenant retail backend for onboarding stores and RFID
-hardware, importing a product master, turning reader observations into floor and
-backroom inventory, controlling store-scoped access, and creating explainable
-replenishment work.
+`Tenant/Store → Zones/Devices → Catalog/EPCs → RFID → Item State → Inventory → Policy → Task`
 
-The repository intentionally uses one FastAPI deployment plus an independently
-scalable worker. PostgreSQL is both the system of record and the durable work inbox
-for the submitted slice. Kafka is the recommended evolution when measured event
-volume, replay, or multiple consumers justify operating it.
+The submitted API is Python 3.12, FastAPI, SQLAlchemy 2, PostgreSQL 17, Alembic,
+JWT, and Pytest. There is intentionally no frontend or external message broker.
 
-> Hosted status: the Render blueprint is ready, but no hosted URL is claimed in this
-> repository yet. Add the tested immutable URL and reviewer credentials only after
-> deployment verification.
+## Reviewer quick start
 
-## Published API contract
+Prerequisites: Docker with Compose v2. GNU Make is convenient but not required.
 
-- Product and OpenAPI title: `Abacus RFID Platform`
-- Python distribution: `abacus-rfid-platform`
-- Business API namespace: `/v1`; operational endpoints remain unversioned
-- Application/OpenAPI info version: `0.1.0`; OpenAPI document format: `3.1.0`
-- Authoritative contract: `GET /openapi.json`; interactive view: `GET /docs`
+```bash
+docker compose up --build
+```
 
-The namespace major version and application release version serve different purposes:
-`/v1` preserves HTTP contract compatibility, while `0.1.0` identifies this submitted
-software release. `GET /version` returns that release plus its deployed `build_sha`.
+In another terminal:
 
-## Assignment coverage
+```bash
+make seed
+make demo
+make test
+```
 
-The implementation follows the exercise in its original order:
+The demo prints six end-to-end checks, including duplicate/late RFID protection and
+store-level authorization. Swagger is at <http://localhost:8000/docs>; readiness is
+at <http://localhost:8000/health/ready>.
 
-1. **Brand/store onboarding** — active tenant creation, an idempotent 1–500 store batch,
-   organization hierarchy, zones, hardware registration, device-key rotation with plaintext
-   returned once,
-   and effective-dated reader assignments.
-2. **Product master** — staged CSV import, checksum/idempotency, normalization,
-   row-level error evidence, reconciliation preview, and atomic promotion of styles,
-   SKUs, UPCs, attributes, and effective-dated EPC mappings.
-3. **RFID observations** — authenticated batches, retained raw event evidence, durable
-   worker jobs, duplicate/conflict handling, late-event non-regression, future-clock
-   quarantine, bounded movement confirmation, inventory projections, and replay.
-4. **Identity and access** — Argon2id passwords, tenant-code login, short-lived JWTs,
-   corporate/manager/associate roles, store scopes, token invalidation, and audit.
-5. **Replenishment** — atomic policy import and CRUD, effective dates, deterministic
-   precedence, explainable evaluations, one active task per store/SKU, ownership,
-   optimistic concurrency, and task lifecycle.
+Required commands:
 
-Sections 4 and 5 are the explicitly required build focus. Sections 1–3 are also
-implemented as a coherent vertical slice so reviewers can exercise them end to end.
-The [engineering response](docs/Sushant_Engineering_Response.md) contains the detailed
-design rationale, tradeoffs, assumptions, and risks without a separate duplicate appendix.
+| Command | Purpose |
+|---|---|
+| `docker compose up --build` | Start the API, PostgreSQL, and both workers |
+| `make migrate` | Apply Alembic with the migration-owner credential |
+| `make seed` | Idempotently create Orange and its demo tenant administrator |
+| `make test` | Run unit and PostgreSQL integration tests in an isolated test database |
+| `make demo` | Build/start the stack and run the complete canonical workflow |
+
+Without Make, run the commands shown in the [Makefile](Makefile) directly. Local
+credentials in `docker-compose.yml` are deliberately marked local-only.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Admin[Platform integration] -->|X-Platform-Key| API[FastAPI API]
-    User[Corporate / manager / associate] -->|Bearer JWT| API
-    Reader[RFID reader or edge gateway] -->|batched HTTPS + device key| API
-    API -->|transactional domain writes + durable jobs| PG[(PostgreSQL 17)]
-    Worker[Background worker] -->|lease + SKIP LOCKED| PG
-    Worker -->|catalog promotion / RFID projection / replenishment| PG
-    API --> Docs[OpenAPI /docs]
+    Gateway[RFID gateway] -->|device token| API[FastAPI]
+    Reviewer[Reviewer / Swagger] -->|JWT / platform key| API
+    API --> PG[(PostgreSQL + RLS)]
+    API -->|durable event inbox| PG
+    PG --> CW[Catalog worker]
+    PG --> EW[Event worker]
+    EW -->|item state + deduped projection| PG
+    EW --> Q[Quarantine records]
+    PG --> POLICY[Policy evaluation / tasks]
 ```
 
-The API and worker share domain modules but run as separate processes. Accepted work
-survives restarts because the job row and source record commit together. Workers use
-the PostgreSQL clock, leases, heartbeats, `FOR UPDATE SKIP LOCKED`, retries with backoff,
-quarantine after the retry limit, and compare-and-set completion. Suspended-tenant jobs
-stay pending and resume after reactivation. Processing is **at least once**; idempotent
-state transitions provide safety. There is no exactly-once claim.
+The source diagram is [docs/architecture.mmd](docs/architecture.mmd).
 
-## Technology choices
+The three deployable processes share one image and codebase:
 
-| Concern | Submitted choice | Why |
-|---|---|---|
-| Language | Python 3.13 + FastAPI | Typed contracts, concise implementation, OpenAPI, and fast reviewability |
-| Persistence | PostgreSQL 17 | Transactions, relational integrity, JSONB for optional attributes, advisory locks, exclusion constraints |
-| Async work | PostgreSQL durable inbox | No external broker/credential failure mode in the reviewer-sized deployment |
-| Production stream | Regional Kafka, when justified | Partitioning by tenant/store/EPC, replay, fan-out, and independent consumers |
-| Identity | Local Argon2id + JWT for demo | Reproducible review; production direction is OIDC/SSO |
-| Deployment | Render web + worker + managed PostgreSQL | Small operational surface and a continuously running worker |
+1. FastAPI REST API
+2. Catalog/import worker
+3. Durable RFID/inventory event worker
 
-Java/Spring Boot would also be a sound enterprise implementation. Python was chosen
-because the exercise does not mandate Java, and the dominant scaling decisions here
-are batching, partitioning, queue semantics, database contention, and regional
-isolation—not request-handler language alone.
+PostgreSQL is the system of record and durable work inbox for the hosted take-home.
+Parsed catalog rows remain in staging until validation succeeds. Kafka-compatible
+streaming and S3 source-file retention are production extensions, not demo dependencies.
 
-## Run with Docker Compose
+## Correctness and failure handling
 
-Prerequisites: Docker with Compose v2.
+- Runtime SQL uses `abacus_app`, a `NOSUPERUSER`/`NOBYPASSRLS` role. Alembic alone
+  uses the owner credential.
+- Every tenant transaction sets `app.tenant_id`; forced RLS fails closed when the
+  context is absent. Tenant IDs in request bodies are never trusted.
+- Accepted RFID events, retry-batch links, and their durable inbox records commit
+  together. A worker outage therefore leaves recoverable work, not a false `202`.
+- `(tenant_id, event_id)` is a durable idempotency boundary. A conflicting reuse is
+  rejected; a byte-equivalent retry does not add stable-zone evidence twice.
+- Worker processing is at least once. Conditional item-state versions, deterministic
+  transition IDs, and unique delta IDs make retries safe; no exactly-once claim is made.
+- Item state and its inventory-transition outbox commit in one transaction. The event
+  worker deduplicates each delta before updating derived bucket counts.
+- Projection counts are rebuildable from `current_item_state` with
+  `abacus-cli rebuild-inventory-projection --tenant-id …`.
+- Freshness is derived from heartbeat age, live-event age, backlog drain, and reader
+  coverage. It decays without needing another event. Non-live stores cannot trigger
+  automatic replenishment or RFID timeout removals.
 
-1. Copy `.env.example` to `.env` and replace every `replace-with-...` value,
-   especially `BOOTSTRAP_ADMIN_PASSWORD`.
-2. Start PostgreSQL, run migrations, then start the API and worker:
+## Canonical API
 
-   ```bash
-   docker compose up --build -d
-   ```
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.2.0`).
+Earlier prototype routes are retained only as migration-test fixtures and are not
+mounted by the submitted application.
 
-3. Create the first tenant administrator through the trusted deployment command:
+The visible contract includes all required endpoints:
 
-   ```bash
-   docker compose run --rm api abacus-cli bootstrap-admin
-   ```
+- Onboarding: tenants, store imports, zones, devices
+- Catalog: create import, status, row errors
+- RFID: submit batch, batch status
+- Inventory: store projection, physical item state
+- Identity: create user, replace roles, replace store assignments, current user
+- Replenishment: policy/version/activation, evaluation, task list/lifecycle
+- Operations: liveness, readiness, version
 
-4. Open Swagger at <http://localhost:8000/docs>. Readiness is
-   <http://localhost:8000/health/ready> and the deployed build identity is
-   <http://localhost:8000/version>.
+Demo authentication uses a platform key, one-time device credentials, and short-lived
+JWTs. JWTs contain only user and tenant identity; current roles and store assignments
+are loaded from PostgreSQL on every authenticated request. Production SSO/SCIM is an
+explicit extension, not simulated here.
 
-If `.env` does not override it, local Compose uses the platform integration key
-`local-platform-key-change-before-deploy`. The setup instructions above require a
-replacement, and Render generates a deployment-only secret.
+## Catalog and RFID behavior
 
-## Run directly
+The sample catalog is [examples/catalog.csv](examples/catalog.csv). Required CSV
+columns are `style_code`, `style_name`, `sku`, `upc`, `color`, `size`, and `epc`;
+`style_attributes.category` enables category policies. Validation covers formats,
+duplicate EPCs, conflicting SKU/UPC mappings, and hierarchy consistency. The checksum
+plus idempotency key makes re-import safe.
 
-Prerequisites: Python 3.13 and PostgreSQL 17. Copy `.env.example` to `.env`, replace
-its placeholder secrets/password, and adjust `DATABASE_URL` before running:
+The durable event record retains the logical partition key `tenant_id:epc`, so a future
+Kafka deployment can preserve per-item order without changing the event contract.
+Hosted stable-zone defaults are configurable:
 
-```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-$env:DATABASE_URL = "postgresql+psycopg://abacus:abacus@localhost:5432/abacus"
-.\.venv\Scripts\alembic.exe upgrade head
-.\.venv\Scripts\abacus-cli.exe bootstrap-admin
-.\.venv\Scripts\uvicorn.exe abacus.main:app --host 0.0.0.0 --port 8000
-```
+- 3 consistent reads from a new zone
+- 10-second evidence window
+- median-RSSI adjacent-zone tie-break
+- previous zone retained with lower confidence when evidence is ambiguous
+- 30-minute absence before confirmed removal, only while the store is live
 
-Run the worker in a second terminal with the same environment:
+Production thresholds require pilot calibration. Recent evidence is intentionally
+process-local for this hosted slice. The event ledger and current state are durable;
+after a worker restart, new reads rebuild the evidence window while database
+compare-and-set updates prevent state regression.
 
-```powershell
-.\.venv\Scripts\python.exe -m abacus.worker
-```
+## Replenishment
 
-### Populated-database migration cutover
+Active policy versions are immutable. Rule precedence is:
 
-The RFID-to-task allocation migration is automatic for a clean deployment. For a
-populated upgrade, first stop the old API and worker, take a backup, run the migration,
-then inspect the deliberately blocked rows:
+1. Store + SKU/size
+2. Store + style
+3. Store + category
+4. Tenant + SKU/size
+5. Tenant + style
+6. Tenant + category
+7. Tenant default
 
-```powershell
-.\.venv\Scripts\abacus-cli.exe list-reservation-cutover
-.\.venv\Scripts\abacus-cli.exe reconcile-reservation-cutover `
-  --task-id <uuid> --baseline <0-to-moved_quantity> `
-  --reviewed-by <operator> --note "Evidence and change-ticket reference"
-```
-
-Compare each legacy task with RFID/physical evidence. The baseline is the number of
-legacy moved units already reflected in RFID; zero is conservative because it keeps
-uncertain units reserved rather than risking duplicate physical work. The command
-locks the store/SKU and task, records reviewer/time/note, and is safe to repeat with
-the same baseline. Until every row is reviewed, `/health/ready` returns 503, affected
-API mutations are rejected, and the worker refuses to lease jobs. Once the list is
-empty, start the new API, verify readiness, and then start the worker. The database
-default is also fail-closed, so a legacy binary or direct insert cannot silently
-create a task that appears reconciled.
-
-The bootstrap command reads:
-
-- `BOOTSTRAP_TENANT_CODE`
-- `BOOTSTRAP_TENANT_NAME`
-- `BOOTSTRAP_ADMIN_EMAIL`
-- `BOOTSTRAP_ADMIN_DISPLAY_NAME`
-- `BOOTSTRAP_ADMIN_PASSWORD` (minimum 12 characters)
-
-It is idempotent for the configured administrator and never resets an existing
-password silently.
-
-## Test
-
-Unit tests do not require a database. The end-to-end suite requires a disposable
-PostgreSQL database whose name contains `test`; its `public` schema is reset.
-
-```powershell
-$env:TEST_DATABASE_URL = "postgresql+psycopg://abacus:abacus@localhost:5432/abacus_test"
-.\.venv\Scripts\python.exe -m pytest --cov=abacus --cov-report=term-missing
-.\.venv\Scripts\python.exe -m ruff check .
-.\.venv\Scripts\python.exe -m ruff format --check .
-.\.venv\Scripts\python.exe -m mypy src
-$env:DATABASE_URL = $env:TEST_DATABASE_URL
-.\.venv\Scripts\alembic.exe check
-```
-
-The active GitHub Actions workflow in `.github/workflows/ci.yml` provisions PostgreSQL
-17, migrates a clean database, runs lint/format/strict mypy, the full test and coverage
-gate, `alembic check`, builds this PDF, and builds the Docker image.
-
-Build the recruiter-facing PDF from its Markdown source with:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\build_engineering_response_pdf.py `
-  docs\Sushant_Engineering_Response.md `
-  output\pdf\Sushant_GreyOrange_Engineering_Take_Home_Answers.pdf
-```
-
-ReportLab is pinned in the `dev` dependency group so this build is reproducible in CI.
-
-## Reviewer API path
-
-Swagger exposes every request/response schema. The deployment command bootstraps the
-Orange tenant and corporate administrator. The standard-library demo runner exercises
-the frozen 100-store path and is safe to rerun with the same fixtures:
-
-```powershell
-$env:DEMO_BASE_URL = "http://localhost:8000"
-$env:PLATFORM_API_KEY = "<deployment platform key>"
-$env:BOOTSTRAP_ADMIN_EMAIL = "reviewer@orange.example"
-$env:BOOTSTRAP_ADMIN_PASSWORD = "<deployment reviewer password>"
-# Optional: known, separate credentials let reviewers log in as scoped users.
-$env:DEMO_MANAGER_PASSWORD = "<manager password>"
-$env:DEMO_ASSOCIATE_PASSWORD = "<associate password>"
-.\.venv\Scripts\python.exe scripts\run_reviewer_demo.py
-```
-
-The runner never prints credentials. It verifies readiness, onboards 100 stores and
-200 readers, creates narrowly scoped users, waits for catalog/RFID worker projections,
-then evaluates and completes a replenishment task through verification. The equivalent
-manual path is:
-
-1. Log in at `POST /v1/auth/login`, then read the Orange `tenant_id` from
-   `GET /v1/auth/me`. On a deliberately empty database, the alternative is to create
-   the tenant at `POST /v1/platform/tenants` and then run `bootstrap-admin` with the
-   same tenant code.
-2. With `X-Platform-Key`, call
-   `POST /v1/platform/tenants/{tenant_id}/stores:bulk-onboard` with an
-   `Idempotency-Key`; include `SALES_FLOOR` and `BACKROOM` zones and readers.
-   `python scripts/generate_store_batch.py --count 100` produces the assignment-sized
-   deterministic request; `examples/stores.json` is the smaller hand-test fixture.
-3. With `X-Platform-Key`, discover readers at
-   `GET /v1/platform/tenants/{tenant_id}/devices`, then call the documented
-   `credentials:rotate` endpoint and securely retain the returned device API key.
-4. With the corporate JWT, use `POST /v1/users` to create store manager and associate
-   users after their stores exist.
-5. With `X-Platform-Key`, upload the CSV product master to
-   `POST /v1/tenants/{tenant_id}/catalog/imports`; poll its status until `COMPLETED`.
-6. Discover SKU UUIDs at `GET /v1/tenants/{tenant_id}/catalog/skus` with a JWT.
-7. Send UUID-keyed observations to `POST /v1/device/read-batches` using the device
-   credential. Inspect quarantine/progress via the platform observation endpoint.
-8. Query paginated inventory at `GET /v1/tenants/{tenant_id}/inventory`.
-9. With the corporate JWT and an `Idempotency-Key`, import policies; call
-   `POST /v1/tenants/{tenant_id}/replenishment/evaluations` with a
-   corporate/assigned-manager JWT, then
-   claim the generated task, record the full movement while it is `IN_PROGRESS`,
-   submit it for verification, and verify it with an assigned associate JWT.
-
-Authentication boundaries are deliberate:
-
-| Surface | Credential |
-|---|---|
-| Tenant/store/catalog integration and RFID remediation | `X-Platform-Key` |
-| Reader ingestion | rotated `X-Device-Key` (`device_uuid.secret`); plaintext returned once |
-| User/catalog lookup/inventory/replenishment | short-lived Bearer JWT |
-
-## Authorization matrix
-
-| Operation | Corporate admin | Store manager | Store associate |
-|---|---:|---:|---:|
-| Tenant-wide user administration/audit | Yes | No | No |
-| Create/suspend associates | Yes | Assigned stores only | No |
-| Read catalog | Yes | Yes | Yes |
-| Read inventory | All stores | Assigned stores | Assigned stores |
-| Manage policies | Yes | No | No |
-| Evaluate/list replenishment | All stores | Assigned stores | Read assigned stores |
-| Claim/execute tasks | Yes | Assigned stores | Assigned stores |
-| Cancel/place tasks in exception | Yes | Assigned stores | No |
-
-The tenant in a URL must match the verified token, and store-scoped principals must
-pass an assigned store. Platform integration routes are intentionally a separate,
-trusted administrative plane.
-
-## RFID behavior
-
-- A client-generated UUID is the tenant-wide event idempotency key.
-- Same UUID + same payload is a duplicate; same UUID + different payload is a
-  conflict. Neither creates a second effect.
-- Structurally valid unknown EPCs or missing historical assignments are durably
-  quarantined and can be replayed after correction.
-- A bounded future clock skew is allowed; larger skew is quarantined so one bad
-  reader cannot poison event-time state.
-- Older reads are retained but marked `LATE_IGNORED`; they never move current state
-  backward.
-- Device-local sequences cannot order different readers, so ingestion is serialized per
-  EPC and PostgreSQL assigns a unique monotonic acceptance sequence. The lowest
-  sequence among non-quarantined observations is the deterministic tie winner.
-  A later conflicting location at the same event time is quarantined as
-  `AMBIGUOUS_SAME_TIMESTAMP_LOCATION`, independent of worker lease order. Repeated
-  same-location evidence is a processed no-op and cannot count twice toward movement.
-- `reader_sequence` is retained as device-local diagnostic evidence only; sequences
-  from different readers are never used as a global ordering tie-breaker.
-- A location move requires consecutive evidence within a configurable time window.
-- Initial presence currently trusts one structurally valid, edge-filtered sighting;
-  RSSI is retained but no universal signal threshold is assumed. Production onboarding
-  should tune initial confirmation from Orange's reader/antenna measurements.
-- EPC-to-SKU rebinding while an item has live state is quarantined for explicit
-  reconciliation rather than silently moving counts between products.
-- Observations are evidence. Receiving, POS sales, transfers, returns, shrink, book
-  inventory, and variance workflows remain separate production integrations.
-
-Inventory responses expose `projection_updated_at` (database processing time) and
-`last_relevant_observation_at` (event time of the newest observation that changed or
-reaffirmed that confirmed aggregate). The latter may be null for migrated historical
-rows where event-time evidence cannot be reconstructed.
-
-## Replenishment semantics
-
-Policy winner order is deterministic:
-
-1. effective and active,
-2. store-specific before tenant-default,
-3. selector specificity `SKU > STYLE > CATEGORY > SIZE`,
-4. higher explicit priority,
-5. reject an unresolved tie instead of guessing.
-
-The provisional formula, because the exercise does not supply one, is:
+Equal-specificity rules use explicit priority; equal-priority overlaps are rejected.
+Evaluation is per SKU/size and uses:
 
 ```text
-if floor >= minimum:
-    recommendation = 0
+if floor_qty >= min_floor_qty:
+    required_qty = 0
 else:
-    recommendation = max(
-        0,
-        min(target - floor - open_work, backroom - reserved_for_open_work),
-    )
+    required_qty = min(backroom_qty,
+                       max(0, target_floor_qty - floor_qty - open_task_qty))
 ```
 
-Every evaluation persists its inputs, selected policy, formula, result, reason, and
-inventory timestamp. One active task is allowed per tenant/store/SKU. Re-evaluation
-adds only uncovered work. A task must enter `IN_PROGRESS` before movement is recorded.
-Each confirmed same-store `BACKROOM -> SALES_FLOOR` EPC transition consumes at most
-one task unit: the executing task first, then the oldest terminal reservation. Active
-work reserves `quantity - linked transitions`; terminal work reserves
-`moved_quantity - linked transitions`. Same-zone and opposite-direction reads consume
-nothing. Claim ownership and an expected version prevent silent concurrent overwrites;
-cancellation/exception transitions require manager-level permission.
+A partial unique index permits only one `OPEN`, `CLAIMED`, or `IN_PROGRESS` task per
+tenant/store/SKU. The lifecycle is `OPEN → CLAIMED → IN_PROGRESS → COMPLETED`, with
+`CANCELED` and `EXPIRED` terminal alternatives.
 
-## Hosting and immutable submission
+## Tests and utilities
 
-`render.yaml` defines a paid web service, paid worker, and managed PostgreSQL 17 in
-one region. The pre-deploy command applies migrations and requires the bootstrap
-password secret; deploys are intentionally not automatic. The database is private to
-Render services.
-
-Recommended submission release procedure:
-
-1. Set `BOOTSTRAP_ADMIN_PASSWORD` when applying the Blueprint.
-2. Deploy one reviewed commit with web, worker, and database healthy.
-3. Run the complete reviewer path and negative authorization checks against the
-   public URL.
-4. Record the commit SHA returned by `/version`, repository commit/tag, URL, and
-   credentials in the submission.
-5. Keep `autoDeployTrigger: off`; do not mutate code or schema after submission.
-6. Keep paid services and database backups active through the review window.
-
-A free-only deployment is useful for experimentation but is not recommended for an
-immutable reviewer link: sleeping/cold starts, worker availability, resource limits,
-and retention policies can change. Recheck [Render service types](https://render.com/docs/service-types),
-[free-instance limits](https://render.com/docs/free), and the
-[Blueprint specification](https://render.com/docs/blueprint-spec) immediately before
-deployment.
-
-## Scale path: 100 to 5,000 stores
-
-The submitted topology is intentionally sized only after measuring readers/store,
-filtered observations/second, burst factor, offline replay, retention, and freshness
-SLO. The first steps are larger batches, edge filtering/buffering, API/worker replicas,
-connection pooling, table partitioning, and archival.
-
-At sustained multi-consumer volume, evolve to regional cells:
-
-```mermaid
-flowchart LR
-    Edge[Store edge gateways] --> Kafka[(Regional Kafka)]
-    Kafka --> State[Keyed EPC state processors]
-    Kafka --> Audit[Raw-event archive]
-    Kafka --> Consumers[Variance / analytics / alerts]
-    State --> Regional[(Regional operational PostgreSQL)]
-    Regional --> Control[Global control and reporting plane]
+```bash
+python -m pytest
+ruff check .
+ruff format --check .
+mypy src scripts/run_architecture_demo.py scripts/rfid_simulator.py scripts/smoke_test.py scripts/generate_store_batch.py
 ```
 
-Kafka keys would use tenant/store/EPC according to the stream, with schema registry,
-dead-letter/quarantine topics, replay tooling, lag SLOs, and regional failure
-isolation. SQS is a good managed task-queue alternative, but it is less natural when
-ordered partitions, long replay, and several independent stream consumers become
-requirements.
+The suite covers RLS tenant isolation, store/corporate authorization, catalog
+idempotency, durable RFID dedupe, late/future events, stable and ambiguous zones,
+outbox transitions, delta dedupe, projection reconstruction, policy precedence, size
+curves, active-task uniqueness, and stale-store suppression.
 
-## Honest boundaries and risks
+`scripts/rfid_simulator.py` generates normal, duplicate, repeated, late/out-of-order,
+adjacent-conflict, unknown-EPC, outage/replay, and stationary-burst scenarios.
+`scripts/smoke_test.py` is a dependency-free hosted health/contract check.
 
-- The submitted service uses polling, not PostgreSQL `LISTEN/NOTIFY`.
-- Catalog, user, observation, inventory, policy and task collections use bounded
-  `limit`/`offset`. Platform store/device/assignment listings are intentionally small
-  submission APIs and still need pagination before large-estate operations.
-- Shared-schema tenant protection is enforced in authenticated services and queries;
-  the current schema does **not** yet have comprehensive composite tenant foreign
-  keys or RLS. Production hardening should add both before untrusted internal writers.
-- PostgreSQL exclusion constraints prevent overlapping device and EPC effective-date
-  intervals, but source/business correction workflows still require operator policy.
-- Policy mutations are serialized; policy change does not fan out millions of jobs
-  automatically. Evaluations take a consistent tenant-policy snapshot. Operators call
-  an explicit evaluation, while RFID inventory changes enqueue targeted store/SKU
-  recalculations.
-- The submitted single-service demo applies a bounded in-process login throttle to all
-  attempts per client IP and to failed attempts per normalized tenant/account. Render
-  alone sets `FORWARDED_ALLOW_IPS=*` because its load balancer is the only public
-  ingress, allowing Uvicorn to derive `request.client.host` from the forwarded chain.
-  Direct deployments retain Uvicorn's restrictive proxy default; they should trust
-  only their own proxy addresses. Multiple API instances still need a shared limiter
-  at the gateway or data store and bounded audit retention.
-- The hosted slice caps catalog files and synchronous validation. Production-scale
-  imports should land in object storage and use asynchronous chunked staging/COPY.
-- No custom UI is included; the exercise asks for accessible REST APIs, and Swagger
-  is the reviewer interface.
-- No 5,000-store throughput claim is made without a supplied workload and measured
-  load test.
+## Hosting
 
-Missing business facts and alternatives are explicit in the
-[engineering response](docs/Sushant_Engineering_Response.md).
+`render.yaml` defines a free-demo web service whose supervised launcher runs the API
+and both worker entry points in one container. Docker Compose keeps those processes
+separate, which is the production-shaped topology. Hosted deployment needs one
+managed PostgreSQL database with two credentials: a migration owner and a non-owner
+`abacus_app` runtime role.
+
+Create that role once with the database owner before the first deployment (replace
+the password and database name):
+
+```sql
+CREATE ROLE abacus_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT
+  NOBYPASSRLS PASSWORD '<random-runtime-password>';
+GRANT CONNECT ON DATABASE <database_name> TO abacus_app;
+```
+
+Use the owner connection for `MIGRATION_DATABASE_URL` and construct `DATABASE_URL`
+with the new `abacus_app` credential. `/health/ready` rejects a production runtime
+connection that is not exactly this configured non-superuser, non-`BYPASSRLS` role.
+
+Local Compose is free apart from the host machine. Hosted secrets must be supplied out
+of band. Create the application role before the first migration so Alembic can grant
+table, sequence, function, and RLS access. The Blueprint references database URLs as
+secrets instead of creating a provider-specific database. A free Render web instance
+sleeps when idle, so its workers sleep too; use a paid always-on instance for a more
+reliable reviewer URL. The free launcher must retain the owner URL to run migrations
+at startup because pre-deploy commands are paid-only. A production deployment keeps
+that credential out of the runtime container. Kafka/S3 can be added later without
+changing the item-state, transition-ID, delta-ID, or projection contracts.
+
+Kubernetes, Flink, regional cells, DynamoDB, enterprise OIDC/SAML/SCIM, X.509 device
+lifecycle, precise XY positioning, and real reader integration are documented production
+extensions only. They are intentionally outside this take-home's executable scope.

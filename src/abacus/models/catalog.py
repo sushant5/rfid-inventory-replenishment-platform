@@ -85,6 +85,10 @@ class Sku(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("product_styles.id", ondelete="RESTRICT"),
         nullable=False,
     )
+    product_variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("product_variants.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     code: Mapped[str] = mapped_column(String(128), nullable=False)
     upc: Mapped[str] = mapped_column(String(14), nullable=False)
     color: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -122,6 +126,8 @@ class CatalogImport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    source_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
     mode: Mapped[CatalogImportMode] = mapped_column(
         Enum(
             CatalogImportMode,

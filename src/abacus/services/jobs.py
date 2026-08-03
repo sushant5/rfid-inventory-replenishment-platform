@@ -49,6 +49,8 @@ def claim_jobs(
     limit: int,
     lease_seconds: int,
     max_attempts: int,
+    tenant_id: uuid.UUID | None = None,
+    kinds: tuple[JobKind, ...] | None = None,
 ) -> list[DurableJob]:
     # Readiness does not stop a separately deployed worker. Refuse to lease any
     # durable work while legacy replenishment reservations await reconciliation.
@@ -59,9 +61,15 @@ def claim_jobs(
     # lower the configured retry budget while retries are pending. Terminalize
     # due work that already consumed the current budget instead of executing or
     # reclaiming it forever.
+    scope_predicates: list[Any] = []
+    if tenant_id is not None:
+        scope_predicates.append(DurableJob.tenant_id == tenant_id)
+    if kinds is not None:
+        scope_predicates.append(DurableJob.kind.in_(kinds))
     exhausted_jobs = db.scalars(
         select(DurableJob)
         .where(
+            *scope_predicates,
             DurableJob.attempts >= max_attempts,
             or_(
                 and_(
@@ -106,7 +114,11 @@ def claim_jobs(
         db.scalars(
             select(DurableJob)
             .join(Tenant, Tenant.id == DurableJob.tenant_id)
-            .where(claimable, Tenant.status == TenantStatus.ACTIVE)
+            .where(
+                *scope_predicates,
+                claimable,
+                Tenant.status == TenantStatus.ACTIVE,
+            )
             .order_by(DurableJob.created_at.asc())
             .with_for_update(of=DurableJob, skip_locked=True)
             .limit(limit)

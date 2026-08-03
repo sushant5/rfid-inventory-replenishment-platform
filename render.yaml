@@ -1,33 +1,32 @@
+# Free hosted-demo topology: one supervised web container runs the same API and two
+# worker entry points that Docker Compose runs separately. The launcher performs
+# migrations because Render pre-deploy commands and background workers are paid-only.
+# A production deployment should use separate services and keep the owner credential
+# out of the long-running application container.
 services:
   - type: web
-    name: abacus-api
+    name: abacus-take-home
     runtime: docker
-    plan: starter
+    plan: free
     region: oregon
     dockerfilePath: ./Dockerfile
     dockerContext: .
+    dockerCommand: abacus-hosted
     autoDeployTrigger: "off"
     healthCheckPath: /health/ready
-    preDeployCommand: alembic upgrade head && abacus-cli bootstrap-admin
-    maxShutdownDelaySeconds: 30
     envVars:
       - key: APP_ENV
         value: production
-      - key: PORT
-        value: "8000"
-      # Render is the only public ingress to this container. Trust its forwarding
-      # header here—not in the portable image—so Uvicorn exposes the real client IP
-      # to the application login throttle.
-      - key: FORWARDED_ALLOW_IPS
-        value: "*"
       - key: DATABASE_URL
-        fromDatabase:
-          name: abacus-postgres
-          property: connectionString
+        sync: false
+      - key: MIGRATION_DATABASE_URL
+        sync: false
+      - key: APPLICATION_DATABASE_ROLE
+        value: abacus_app
       - key: JWT_SECRET
         generateValue: true
       - key: PLATFORM_API_KEY
-        generateValue: true
+        sync: false
       - key: BOOTSTRAP_TENANT_CODE
         value: orange
       - key: BOOTSTRAP_TENANT_NAME
@@ -38,36 +37,3 @@ services:
         value: Assignment Reviewer
       - key: BOOTSTRAP_ADMIN_PASSWORD
         sync: false
-
-  - type: worker
-    name: abacus-worker
-    runtime: docker
-    plan: starter
-    region: oregon
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    dockerCommand: python -m abacus.worker
-    autoDeployTrigger: "off"
-    maxShutdownDelaySeconds: 60
-    envVars:
-      - key: APP_ENV
-        value: production
-      - key: DATABASE_URL
-        fromDatabase:
-          name: abacus-postgres
-          property: connectionString
-      - key: JWT_SECRET
-        generateValue: true
-      - key: PLATFORM_API_KEY
-        generateValue: true
-
-databases:
-  - name: abacus-postgres
-    plan: basic-256mb
-    region: oregon
-    postgresMajorVersion: "17"
-    databaseName: abacus
-    user: abacus
-    diskSizeGB: 5
-    storageAutoscalingEnabled: false
-    ipAllowList: []

@@ -1,0 +1,97 @@
+name: abacus-take-home
+
+x-application-environment: &application-environment
+  APP_ENV: development
+  DATABASE_URL: postgresql+psycopg://abacus_app:abacus_app_local_only@postgres:5432/abacus
+  MIGRATION_DATABASE_URL: postgresql+psycopg://abacus_owner:abacus_owner_local_only@postgres:5432/abacus
+  APPLICATION_DATABASE_ROLE: abacus_app
+  JWT_SECRET: ${JWT_SECRET:-local-development-jwt-secret-change-before-deploy}
+  PLATFORM_API_KEY: ${PLATFORM_API_KEY:-local-platform-key-change-before-deploy}
+  BOOTSTRAP_TENANT_CODE: ${BOOTSTRAP_TENANT_CODE:-orange}
+  BOOTSTRAP_TENANT_NAME: ${BOOTSTRAP_TENANT_NAME:-Orange}
+  BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-reviewer@orange.example}
+  BOOTSTRAP_ADMIN_DISPLAY_NAME: ${BOOTSTRAP_ADMIN_DISPLAY_NAME:-Assignment Reviewer}
+  BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-OrangeReviewer123!}
+
+x-application-service: &application-service
+  build:
+    context: .
+  environment: *application-environment
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_DB: abacus
+      POSTGRES_USER: abacus_owner
+      POSTGRES_PASSWORD: abacus_owner_local_only
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U abacus_owner -d abacus"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+
+  migrate:
+    build:
+      context: .
+    environment: *application-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *application-service
+    command: ["uvicorn", "abacus.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  catalog-worker:
+    <<: *application-service
+    command: ["abacus-catalog-worker"]
+
+  event-worker:
+    <<: *application-service
+    command: ["abacus-event-worker"]
+
+  test:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      <<: *application-environment
+      TEST_DATABASE_URL: postgresql+psycopg://abacus_owner:abacus_owner_local_only@postgres:5432/abacus_test
+      TEST_APP_DATABASE_URL: postgresql+psycopg://abacus_app:abacus_app_local_only@postgres:5432/abacus_test
+      DATABASE_URL: postgresql+psycopg://abacus_owner:abacus_owner_local_only@postgres:5432/abacus_test
+      MIGRATION_DATABASE_URL: postgresql+psycopg://abacus_owner:abacus_owner_local_only@postgres:5432/abacus_test
+      APP_ENV: test
+    command: ["pytest"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  postgres_data:

@@ -4,8 +4,11 @@ from fastapi import APIRouter, Request
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
 from abacus.api.errors import ApiError
+from abacus.models.architecture import CanonicalIdentityRole
+from abacus.models.identity import IdentityRole
 from abacus.schemas.identity import (
     AccessTokenRead,
+    CanonicalPrincipalRead,
     CurrentPrincipalRead,
     LoginRequest,
     RoleAssignmentRead,
@@ -19,6 +22,7 @@ from abacus.security import (
 from abacus.services.identity import authenticate_user
 
 router = APIRouter(prefix="/v1/auth", tags=["4. Identity and Access"])
+canonical_router = APIRouter(prefix="/v1", tags=["4. Identity and Access"])
 
 
 @router.post(
@@ -97,16 +101,45 @@ def login_endpoint(
     "/me",
     response_model=CurrentPrincipalRead,
     operation_id="getCurrentUser",
+    include_in_schema=False,
 )
 def current_user_endpoint(principal: CurrentPrincipal) -> CurrentPrincipalRead:
+    legacy_role = {
+        CanonicalIdentityRole.TENANT_ADMIN: IdentityRole.CORPORATE_ADMIN,
+        CanonicalIdentityRole.STORE_MANAGER: IdentityRole.STORE_MANAGER,
+        CanonicalIdentityRole.STORE_ASSOCIATE: IdentityRole.STORE_ASSOCIATE,
+    }
     return CurrentPrincipalRead(
         user_id=principal.user_id,
         tenant_id=principal.tenant_id,
         email=principal.email,
         display_name=principal.display_name,
         role_assignments=[
-            RoleAssignmentRead(role=scope.role, store_id=scope.store_id)
+            RoleAssignmentRead(
+                role=(
+                    scope.role if isinstance(scope.role, IdentityRole) else legacy_role[scope.role]
+                ),
+                store_id=scope.store_id,
+            )
             for scope in principal.role_scopes
+            if scope.role != CanonicalIdentityRole.CORPORATE_USER
         ],
+        permissions=sorted(permission.value for permission in principal.permissions),
+    )
+
+
+@canonical_router.get(
+    "/me",
+    response_model=CanonicalPrincipalRead,
+    operation_id="getCurrentUserCanonical",
+)
+def canonical_current_user_endpoint(principal: CurrentPrincipal) -> CanonicalPrincipalRead:
+    return CanonicalPrincipalRead(
+        user_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        email=principal.email,
+        display_name=principal.display_name,
+        roles=list(principal.canonical_roles),
+        store_ids=list(principal.assigned_store_ids),
         permissions=sorted(permission.value for permission in principal.permissions),
     )

@@ -3,6 +3,7 @@ import uuid
 import pytest
 
 from abacus.api.errors import ApiError
+from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.identity import IdentityRole
 from abacus.security import Permission, Principal, RoleScope, ensure_can_assign_roles
 
@@ -23,6 +24,15 @@ def test_corporate_admin_has_tenant_wide_user_access() -> None:
     assert principal.has_tenant_permission(Permission.USERS_CREATE)
     assert principal.can_access_store(Permission.USERS_READ, uuid.uuid4())
     assert principal.has_permission(Permission.IDENTITY_AUDIT_READ)
+
+
+def test_corporate_user_can_read_every_store_but_cannot_manage_inventory() -> None:
+    principal = _principal(RoleScope(CanonicalIdentityRole.CORPORATE_USER, None))
+
+    assert principal.can_access_store(Permission.INVENTORY_READ, uuid.uuid4())
+    assert principal.can_access_store(Permission.REPLENISHMENT_READ, uuid.uuid4())
+    assert not principal.has_permission(Permission.REPLENISHMENT_MANAGE)
+    assert not principal.has_permission(Permission.USERS_CREATE)
 
 
 def test_store_manager_access_is_limited_to_assigned_store() -> None:

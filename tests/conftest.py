@@ -83,7 +83,7 @@ def api_client(
         with postgres_session_factory() as session:
             yield session
 
-    app = create_app()
+    app = create_app(include_legacy_test_routes=True)
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as client:
         yield client

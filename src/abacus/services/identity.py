@@ -2,12 +2,18 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from abacus.api.errors import ApiError
+from abacus.db import TenantSession, pin_session_to_tenant
 from abacus.enums import StoreStatus, TenantStatus
+from abacus.models.architecture import (
+    CanonicalIdentityRole,
+    UserRole,
+    UserStoreAssignment,
+)
 from abacus.models.identity import (
     IdentityAuditAction,
     IdentityAuditRecord,
@@ -17,7 +23,11 @@ from abacus.models.identity import (
     UserStatus,
 )
 from abacus.models.tenancy import Store, Tenant
-from abacus.schemas.identity import UserCreate
+from abacus.schemas.identity import (
+    UserCreate,
+    UserRolesReplace,
+    UserStoreAssignmentsReplace,
+)
 from abacus.schemas.tenancy import TenantCreate
 from abacus.security import (
     Permission,
@@ -35,6 +45,13 @@ class UserRecord:
     grants: tuple[UserAccessGrant, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalUserAccess:
+    user_id: uuid.UUID
+    roles: tuple[CanonicalIdentityRole, ...]
+    store_ids: tuple[uuid.UUID, ...]
+
+
 def bootstrap_corporate_admin(
     db: Session,
     tenant_request: TenantCreate,
@@ -47,9 +64,25 @@ def bootstrap_corporate_admin(
     ):
         raise ValueError("bootstrap user must have exactly one CORPORATE_ADMIN grant")
 
+    tenant_id: uuid.UUID | None = None
+    if isinstance(db, TenantSession):
+        # This narrow SECURITY DEFINER resolver is the only unscoped lookup. End its
+        # transaction before permanently pinning the session so every following SQL
+        # statement is protected by the tenant's RLS context.
+        resolved_tenant_id = db.scalar(
+            text("SELECT abacus_resolve_login_tenant(:tenant_code)"),
+            {"tenant_code": tenant_request.code},
+        )
+        db.rollback()
+        tenant_id = (
+            uuid.UUID(str(resolved_tenant_id)) if resolved_tenant_id is not None else uuid.uuid4()
+        )
+        pin_session_to_tenant(db, tenant_id)
+
     tenant = db.scalar(select(Tenant).where(Tenant.code == tenant_request.code))
     if tenant is None:
         tenant = Tenant(
+            id=tenant_id or uuid.uuid4(),
             code=tenant_request.code,
             name=tenant_request.name,
             status=TenantStatus.ACTIVE,
@@ -77,6 +110,23 @@ def bootstrap_corporate_admin(
     ).first()
     if configured_admin is not None:
         user, grant = configured_admin
+        canonical_admin = db.get(
+            UserRole,
+            {
+                "tenant_id": tenant.id,
+                "user_id": user.id,
+                "role": CanonicalIdentityRole.TENANT_ADMIN,
+            },
+        )
+        if canonical_admin is None:
+            db.add(
+                UserRole(
+                    tenant_id=tenant.id,
+                    user_id=user.id,
+                    role=CanonicalIdentityRole.TENANT_ADMIN,
+                )
+            )
+            db.commit()
         return UserRecord(user=user, grants=(grant,))
 
     any_admin_exists = db.scalar(
@@ -126,7 +176,16 @@ def bootstrap_corporate_admin(
         role=IdentityRole.CORPORATE_ADMIN,
         store_id=None,
     )
-    db.add(grant)
+    db.add_all(
+        [
+            grant,
+            UserRole(
+                tenant_id=tenant.id,
+                user_id=user.id,
+                role=CanonicalIdentityRole.TENANT_ADMIN,
+            ),
+        ]
+    )
     _add_audit_record(
         db,
         tenant_id=tenant.id,
@@ -193,7 +252,21 @@ def authenticate_user(
     email: str,
     password: str,
 ) -> User:
-    tenant = db.scalar(select(Tenant).where(Tenant.code == tenant_code))
+    if isinstance(db, TenantSession):
+        tenant_id = db.scalar(
+            text("SELECT abacus_resolve_login_tenant(:tenant_code)"),
+            {"tenant_code": tenant_code},
+        )
+        db.rollback()
+        if tenant_id is not None:
+            pin_session_to_tenant(db, uuid.UUID(str(tenant_id)))
+        tenant = (
+            db.scalar(select(Tenant).where(Tenant.id == tenant_id))
+            if tenant_id is not None
+            else None
+        )
+    else:
+        tenant = db.scalar(select(Tenant).where(Tenant.code == tenant_code))
     user: User | None = None
     if tenant is not None:
         user = db.scalar(
@@ -490,6 +563,328 @@ def suspend_user(db: Session, principal: Principal, user_id: uuid.UUID) -> UserR
     return UserRecord(
         user=user,
         grants=_visible_grants(principal, Permission.USERS_READ, grants),
+    )
+
+
+def _canonical_role_for_legacy(role: IdentityRole) -> CanonicalIdentityRole:
+    if role is IdentityRole.CORPORATE_ADMIN:
+        return CanonicalIdentityRole.TENANT_ADMIN
+    if role is IdentityRole.STORE_MANAGER:
+        return CanonicalIdentityRole.STORE_MANAGER
+    return CanonicalIdentityRole.STORE_ASSOCIATE
+
+
+def _load_canonical_access(
+    db: Session,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> tuple[
+    frozenset[CanonicalIdentityRole],
+    frozenset[uuid.UUID],
+    bool,
+    bool,
+    tuple[UserAccessGrant, ...],
+]:
+    role_rows = frozenset(
+        db.scalars(
+            select(UserRole.role).where(
+                UserRole.tenant_id == tenant_id,
+                UserRole.user_id == user_id,
+            )
+        ).all()
+    )
+    assignment_rows = frozenset(
+        db.scalars(
+            select(UserStoreAssignment.store_id).where(
+                UserStoreAssignment.tenant_id == tenant_id,
+                UserStoreAssignment.user_id == user_id,
+            )
+        ).all()
+    )
+    grants = _load_grants(db, tenant_id, user_id)
+
+    # Compatibility fallback covers users created through the pre-canonical API after
+    # the migration backfill ran. The next PUT persists the missing canonical half.
+    roles = role_rows or frozenset(_canonical_role_for_legacy(grant.role) for grant in grants)
+    store_ids = assignment_rows or frozenset(
+        grant.store_id for grant in grants if grant.store_id is not None
+    )
+    return roles, store_ids, not role_rows, not assignment_rows, grants
+
+
+def _compatibility_grant_specs(
+    roles: frozenset[CanonicalIdentityRole],
+    store_ids: frozenset[uuid.UUID],
+) -> frozenset[tuple[IdentityRole, uuid.UUID | None]]:
+    specs: set[tuple[IdentityRole, uuid.UUID | None]] = set()
+    if CanonicalIdentityRole.TENANT_ADMIN in roles:
+        specs.add((IdentityRole.CORPORATE_ADMIN, None))
+
+    # The compatibility model has no CORPORATE_USER. Map it to the least-privilege
+    # store role for explicitly assigned stores; never map it to CORPORATE_ADMIN.
+    for store_id in store_ids:
+        if CanonicalIdentityRole.STORE_MANAGER in roles:
+            specs.add((IdentityRole.STORE_MANAGER, store_id))
+        elif roles.intersection(
+            {
+                CanonicalIdentityRole.STORE_ASSOCIATE,
+                CanonicalIdentityRole.CORPORATE_USER,
+            }
+        ):
+            specs.add((IdentityRole.STORE_ASSOCIATE, store_id))
+    return frozenset(specs)
+
+
+def _persist_role_rows(
+    db: Session,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    roles: frozenset[CanonicalIdentityRole],
+) -> None:
+    db.execute(
+        delete(UserRole).where(
+            UserRole.tenant_id == tenant_id,
+            UserRole.user_id == user_id,
+        )
+    )
+    db.add_all(
+        UserRole(tenant_id=tenant_id, user_id=user_id, role=role)
+        for role in sorted(roles, key=lambda item: item.value)
+    )
+
+
+def _persist_assignment_rows(
+    db: Session,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    store_ids: frozenset[uuid.UUID],
+) -> None:
+    db.execute(
+        delete(UserStoreAssignment).where(
+            UserStoreAssignment.tenant_id == tenant_id,
+            UserStoreAssignment.user_id == user_id,
+        )
+    )
+    db.add_all(
+        UserStoreAssignment(tenant_id=tenant_id, user_id=user_id, store_id=store_id)
+        for store_id in sorted(store_ids, key=str)
+    )
+
+
+def _persist_compatibility_grants(
+    db: Session,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    specs: frozenset[tuple[IdentityRole, uuid.UUID | None]],
+) -> None:
+    db.execute(
+        delete(UserAccessGrant).where(
+            UserAccessGrant.tenant_id == tenant_id,
+            UserAccessGrant.user_id == user_id,
+        )
+    )
+    db.add_all(
+        UserAccessGrant(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            role=role,
+            store_id=store_id,
+        )
+        for role, store_id in sorted(specs, key=lambda item: (item[0].value, str(item[1])))
+    )
+
+
+def _lock_access_target(
+    db: Session,
+    principal: Principal,
+    user_id: uuid.UUID,
+) -> User:
+    user = db.scalar(
+        select(User)
+        .where(
+            User.id == user_id,
+            User.tenant_id == principal.tenant_id,
+        )
+        .with_for_update()
+    )
+    if user is None:
+        # Same response for a missing user and another tenant's user.
+        raise ApiError(404, "User not found", "The requested user does not exist.")
+    return user
+
+
+def replace_user_roles(
+    db: Session,
+    principal: Principal,
+    user_id: uuid.UUID,
+    request: UserRolesReplace,
+) -> CanonicalUserAccess:
+    if not principal.has_tenant_permission(Permission.USERS_CREATE):
+        raise ApiError(
+            403,
+            "Forbidden",
+            "Only a tenant administrator may replace user roles.",
+            code="role_assignment_forbidden",
+        )
+
+    # Serializes the last-admin invariant across role changes in this tenant.
+    db.scalar(select(Tenant.id).where(Tenant.id == principal.tenant_id).with_for_update())
+    user = _lock_access_target(db, principal, user_id)
+    existing_roles, store_ids, roles_missing, assignments_missing, grants = _load_canonical_access(
+        db, principal.tenant_id, user.id
+    )
+    requested_roles = frozenset(request.roles)
+
+    if (
+        CanonicalIdentityRole.TENANT_ADMIN in existing_roles
+        and CanonicalIdentityRole.TENANT_ADMIN not in requested_roles
+    ):
+        another_canonical_admin = db.scalar(
+            select(UserRole.user_id)
+            .join(User, User.id == UserRole.user_id)
+            .where(
+                UserRole.tenant_id == principal.tenant_id,
+                UserRole.user_id != user.id,
+                UserRole.role == CanonicalIdentityRole.TENANT_ADMIN,
+                User.status == UserStatus.ACTIVE,
+            )
+            .limit(1)
+        )
+        another_legacy_admin = db.scalar(
+            select(UserAccessGrant.user_id)
+            .join(User, User.id == UserAccessGrant.user_id)
+            .where(
+                UserAccessGrant.tenant_id == principal.tenant_id,
+                UserAccessGrant.user_id != user.id,
+                UserAccessGrant.role == IdentityRole.CORPORATE_ADMIN,
+                UserAccessGrant.store_id.is_(None),
+                User.status == UserStatus.ACTIVE,
+            )
+            .limit(1)
+        )
+        if another_canonical_admin is None and another_legacy_admin is None:
+            raise ApiError(
+                409,
+                "Last tenant administrator",
+                "Assign another tenant administrator before removing this role.",
+                code="last_tenant_admin",
+            )
+
+    existing_specs = frozenset((grant.role, grant.store_id) for grant in grants)
+    desired_specs = _compatibility_grant_specs(requested_roles, store_ids)
+    access_changed = requested_roles != existing_roles or desired_specs != existing_specs
+    if not access_changed and not roles_missing and not assignments_missing:
+        return CanonicalUserAccess(
+            user_id=user.id,
+            roles=tuple(sorted(requested_roles, key=lambda item: item.value)),
+            store_ids=tuple(sorted(store_ids, key=str)),
+        )
+
+    try:
+        _persist_role_rows(db, principal.tenant_id, user.id, requested_roles)
+        if assignments_missing:
+            _persist_assignment_rows(db, principal.tenant_id, user.id, store_ids)
+        if desired_specs != existing_specs:
+            _persist_compatibility_grants(db, principal.tenant_id, user.id, desired_specs)
+        if access_changed:
+            user.token_version += 1
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Role update conflict",
+            "The user's roles changed concurrently.",
+            code="user_role_update_conflict",
+        ) from exc
+    return CanonicalUserAccess(
+        user_id=user.id,
+        roles=tuple(sorted(requested_roles, key=lambda item: item.value)),
+        store_ids=tuple(sorted(store_ids, key=str)),
+    )
+
+
+def replace_user_store_assignments(
+    db: Session,
+    principal: Principal,
+    user_id: uuid.UUID,
+    request: UserStoreAssignmentsReplace,
+) -> CanonicalUserAccess:
+    user = _lock_access_target(db, principal, user_id)
+    roles, existing_store_ids, roles_missing, assignments_missing, grants = _load_canonical_access(
+        db, principal.tenant_id, user.id
+    )
+    if not roles:
+        raise ApiError(
+            422,
+            "Missing role",
+            "Assign at least one role before assigning stores.",
+            code="user_role_required",
+        )
+    requested_store_ids = frozenset(request.store_ids)
+
+    if requested_store_ids:
+        valid_store_ids = frozenset(
+            db.scalars(
+                select(Store.id).where(
+                    Store.tenant_id == principal.tenant_id,
+                    Store.id.in_(requested_store_ids),
+                    Store.status != StoreStatus.INACTIVE,
+                )
+            ).all()
+        )
+        if valid_store_ids != requested_store_ids:
+            raise ApiError(
+                422,
+                "Invalid store scope",
+                "Every assignment must reference a non-inactive store in the current tenant.",
+                code="invalid_store_scope",
+            )
+
+    if not principal.has_tenant_permission(Permission.USERS_CREATE):
+        allowed_store_ids = principal.store_ids_for_permission(Permission.USERS_CREATE)
+        touched_store_ids = requested_store_ids.union(existing_store_ids)
+        if roles != {CanonicalIdentityRole.STORE_ASSOCIATE} or not touched_store_ids.issubset(
+            allowed_store_ids
+        ):
+            raise ApiError(
+                403,
+                "Forbidden",
+                "Store managers may assign associates only within stores they manage.",
+                code="role_assignment_forbidden",
+            )
+
+    existing_specs = frozenset((grant.role, grant.store_id) for grant in grants)
+    desired_specs = _compatibility_grant_specs(roles, requested_store_ids)
+    access_changed = requested_store_ids != existing_store_ids or desired_specs != existing_specs
+    if not access_changed and not roles_missing and not assignments_missing:
+        return CanonicalUserAccess(
+            user_id=user.id,
+            roles=tuple(sorted(roles, key=lambda item: item.value)),
+            store_ids=tuple(sorted(requested_store_ids, key=str)),
+        )
+
+    try:
+        if roles_missing:
+            _persist_role_rows(db, principal.tenant_id, user.id, roles)
+        _persist_assignment_rows(db, principal.tenant_id, user.id, requested_store_ids)
+        if desired_specs != existing_specs:
+            _persist_compatibility_grants(db, principal.tenant_id, user.id, desired_specs)
+        if access_changed:
+            user.token_version += 1
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Store assignment conflict",
+            "The user's store assignments changed concurrently.",
+            code="user_store_assignment_conflict",
+        ) from exc
+    return CanonicalUserAccess(
+        user_id=user.id,
+        roles=tuple(sorted(roles, key=lambda item: item.value)),
+        store_ids=tuple(sorted(requested_store_ids, key=str)),
     )
 
 

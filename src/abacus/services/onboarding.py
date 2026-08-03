@@ -2,13 +2,15 @@ import hashlib
 import json
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from abacus.api.errors import ApiError
+from abacus.db import TenantSession, pin_session_to_tenant
 from abacus.enums import BatchStatus, StoreStatus, TenantStatus
 from abacus.models.tenancy import (
     Device,
@@ -22,11 +24,34 @@ from abacus.models.tenancy import (
 from abacus.schemas.tenancy import (
     BulkStoreOnboardingRequest,
     DeviceAssignmentCreate,
+    StoreDeviceCreate,
     TenantCreate,
+    ZoneCreate,
 )
+from abacus.security import Permission, Principal
+
+
+@dataclass(frozen=True, slots=True)
+class StoreDeviceRegistration:
+    device: Device
+    assignment: DeviceAssignment
+    api_key: str
 
 
 def create_tenant(db: Session, request: TenantCreate) -> Tenant:
+    tenant_id: uuid.UUID
+    if isinstance(db, TenantSession):
+        resolved_tenant_id = db.scalar(
+            text("SELECT abacus_resolve_login_tenant(:tenant_code)"),
+            {"tenant_code": request.code},
+        )
+        db.rollback()
+        tenant_id = (
+            uuid.UUID(str(resolved_tenant_id)) if resolved_tenant_id is not None else uuid.uuid4()
+        )
+        pin_session_to_tenant(db, tenant_id)
+    else:
+        tenant_id = uuid.uuid4()
     existing = db.scalar(select(Tenant).where(Tenant.code == request.code))
     if existing is not None:
         if existing.name == request.name:
@@ -38,7 +63,12 @@ def create_tenant(db: Session, request: TenantCreate) -> Tenant:
             code="tenant_code_conflict",
         )
 
-    tenant = Tenant(code=request.code, name=request.name, status=TenantStatus.ACTIVE)
+    tenant = Tenant(
+        id=tenant_id,
+        code=request.code,
+        name=request.name,
+        status=TenantStatus.ACTIVE,
+    )
     db.add(tenant)
     try:
         db.commit()
@@ -54,6 +84,120 @@ def create_tenant(db: Session, request: TenantCreate) -> Tenant:
     return tenant
 
 
+def _store_in_principal_tenant(
+    db: Session,
+    principal: Principal,
+    store_id: uuid.UUID,
+) -> Store:
+    store = db.scalar(
+        select(Store).where(
+            Store.id == store_id,
+            Store.tenant_id == principal.tenant_id,
+        )
+    )
+    if store is None:
+        # Tenant-scoped lookup avoids confirming another tenant's identifiers.
+        raise ApiError(404, "Store not found", "The requested store does not exist.")
+    if not principal.can_access_store(Permission.TENANT_CONFIGURE, store.id):
+        raise ApiError(
+            403,
+            "Forbidden",
+            "The requested store is outside the current user's access scope.",
+            code="store_scope_denied",
+        )
+    return store
+
+
+def create_store_zone(
+    db: Session,
+    principal: Principal,
+    store_id: uuid.UUID,
+    request: ZoneCreate,
+) -> Zone:
+    store = _store_in_principal_tenant(db, principal, store_id)
+    zone = Zone(
+        tenant_id=store.tenant_id,
+        store_id=store.id,
+        code=request.code,
+        name=request.name,
+        kind=request.kind,
+    )
+    db.add(zone)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Zone code conflict",
+            f"Zone code '{request.code}' already exists in this store.",
+            code="zone_code_conflict",
+        ) from exc
+    db.refresh(zone)
+    return zone
+
+
+def register_store_device(
+    db: Session,
+    principal: Principal,
+    store_id: uuid.UUID,
+    request: StoreDeviceCreate,
+) -> StoreDeviceRegistration:
+    store = _store_in_principal_tenant(db, principal, store_id)
+    zone = db.scalar(
+        select(Zone).where(
+            Zone.id == request.zone_id,
+            Zone.tenant_id == store.tenant_id,
+            Zone.store_id == store.id,
+        )
+    )
+    if zone is None:
+        raise ApiError(
+            422,
+            "Invalid assignment location",
+            "zone_id must identify a zone in the requested store.",
+            code="invalid_device_assignment_location",
+        )
+
+    raw_secret = secrets.token_urlsafe(32)
+    device = Device(
+        tenant_id=store.tenant_id,
+        serial_number=request.serial_number,
+        display_name=request.display_name,
+        credential_hash=hashlib.sha256(raw_secret.encode()).hexdigest(),
+    )
+    db.add(device)
+    try:
+        db.flush()
+        effective_from = db.scalar(select(func.clock_timestamp()))
+        if effective_from is None:  # pragma: no cover - PostgreSQL always returns a value.
+            raise RuntimeError("database clock is unavailable")
+        assignment = DeviceAssignment(
+            tenant_id=store.tenant_id,
+            device_id=device.id,
+            store_id=store.id,
+            zone_id=zone.id,
+            effective_from=effective_from,
+        )
+        db.add(assignment)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Device registration conflict",
+            "The serial number already exists or the assignment was created concurrently.",
+            code="device_registration_conflict",
+        ) from exc
+    db.refresh(device)
+    db.refresh(assignment)
+    return StoreDeviceRegistration(
+        device=device,
+        assignment=assignment,
+        api_key=f"{device.id}.{raw_secret}",
+    )
+
+
 def _request_hash(request: BulkStoreOnboardingRequest) -> str:
     canonical = json.dumps(
         request.model_dump(mode="json"),
@@ -64,6 +208,8 @@ def _request_hash(request: BulkStoreOnboardingRequest) -> str:
 
 
 def _get_tenant(db: Session, tenant_id: uuid.UUID) -> Tenant:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     tenant = db.get(Tenant, tenant_id)
     if tenant is None:
         raise ApiError(404, "Tenant not found", "The requested tenant does not exist.")
@@ -250,6 +396,8 @@ def onboard_stores(
 
 
 def list_stores(db: Session, tenant_id: uuid.UUID) -> list[Store]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     _get_tenant(db, tenant_id)
     return list(
         db.scalars(
@@ -259,6 +407,8 @@ def list_stores(db: Session, tenant_id: uuid.UUID) -> list[Store]:
 
 
 def list_devices(db: Session, tenant_id: uuid.UUID) -> list[Device]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     _get_tenant(db, tenant_id)
     return list(
         db.scalars(
@@ -272,6 +422,8 @@ def rotate_device_credential(
     tenant_id: uuid.UUID,
     device_id: uuid.UUID,
 ) -> str:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     _get_tenant(db, tenant_id)
     device = db.scalar(select(Device).where(Device.id == device_id, Device.tenant_id == tenant_id))
     if device is None:
@@ -288,6 +440,8 @@ def assign_device(
     device_id: uuid.UUID,
     request: DeviceAssignmentCreate,
 ) -> DeviceAssignment:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     device = db.scalar(
         select(Device)
         .where(Device.id == device_id, Device.tenant_id == tenant_id)
@@ -398,6 +552,8 @@ def list_device_assignments(
     tenant_id: uuid.UUID,
     device_id: uuid.UUID,
 ) -> list[DeviceAssignment]:
+    if isinstance(db, TenantSession):
+        pin_session_to_tenant(db, tenant_id)
     device_exists = db.scalar(
         select(Device.id).where(Device.id == device_id, Device.tenant_id == tenant_id)
     )

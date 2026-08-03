@@ -6,13 +6,26 @@ from sqlalchemy import engine_from_config, pool
 from abacus.config import get_settings
 
 # Import every model module so SQLAlchemy registers all tables in Base.metadata.
-from abacus.models import Base, catalog, identity, jobs, replenishment, rfid, tenancy  # noqa: F401
+from abacus.models import (  # noqa: F401
+    Base,
+    architecture,
+    catalog,
+    identity,
+    jobs,
+    replenishment,
+    rfid,
+    tenancy,
+)
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option(
+        "sqlalchemy.url",
+        get_settings().alembic_database_url.replace("%", "%%"),
+    )
 target_metadata = Base.metadata
 
 
