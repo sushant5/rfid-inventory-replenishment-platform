@@ -249,6 +249,12 @@ def _change_balance(
     delta: int,
     observed_at: datetime,
 ) -> None:
+    # A row lock cannot protect a balance that does not exist yet. Serialize the
+    # store/SKU scope before looking it up so parallel first sightings for distinct
+    # EPCs create one aggregate row and increment it safely. Confirmed moves that
+    # touch two stores acquire these same locks for every store in sorted order
+    # before calling this helper, preserving one global lock order.
+    lock_replenishment_store_sku(db, tenant_id, store_id, sku_id)
     balance = db.scalar(
         select(InventoryBalance)
         .where(

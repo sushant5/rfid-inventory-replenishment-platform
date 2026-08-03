@@ -137,3 +137,19 @@ def test_validation_errors_do_not_echo_passwords() -> None:
     assert response.status_code == 422
     assert password not in response.text
     assert all("input" not in error for error in response.json()["errors"])
+    assert response.json()["request_id"] == response.headers["X-Request-ID"]
+
+
+def test_root_discovers_the_reviewer_endpoints() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "service": "Abacus RFID Platform",
+        "version": "0.1.0",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "liveness": "/health/live",
+        "readiness": "/health/ready",
+    }

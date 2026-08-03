@@ -16,6 +16,7 @@ class ProblemDetail(BaseModel):
     instance: str | None = None
     code: str | None = None
     errors: list[dict[str, Any]] | None = None
+    request_id: str | None = None
 
 
 class ApiError(Exception):
@@ -48,6 +49,7 @@ def install_error_handlers(app: FastAPI) -> None:
             instance=str(request.url.path),
             code=exc.code,
             errors=exc.errors,
+            request_id=getattr(request.state, "request_id", None),
         )
         return JSONResponse(
             status_code=exc.status_code,
@@ -75,6 +77,7 @@ def install_error_handlers(app: FastAPI) -> None:
             instance=str(request.url.path),
             code="request_validation_failed",
             errors=errors,
+            request_id=getattr(request.state, "request_id", None),
         )
         return JSONResponse(
             status_code=422,

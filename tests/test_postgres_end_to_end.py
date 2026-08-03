@@ -116,6 +116,7 @@ def _drain_jobs(
                 worker_id=worker_id,
                 limit=1,
                 lease_seconds=30,
+                max_attempts=1,
             )
         if not claimed:
             return processed
@@ -1414,7 +1415,13 @@ def test_postgres_end_to_end(
     assert cutover_health.status_code == 503
     assert cutover_health.json()["code"] == "cutover_reconciliation_required"
     with postgres_session_factory() as db, pytest.raises(ReservationCutoverPending):
-        claim_jobs(db, worker_id="cutover-guard-test", limit=1, lease_seconds=30)
+        claim_jobs(
+            db,
+            worker_id="cutover-guard-test",
+            limit=1,
+            lease_seconds=30,
+            max_attempts=5,
+        )
     blocked_task_mutation = client.patch(
         f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
         headers=_bearer(manager_token),
@@ -2190,7 +2197,13 @@ def test_assignment_sized_onboarding_and_expired_job_recovery(
         job_id = job.id
 
     with postgres_session_factory() as db:
-        first_claim = claim_jobs(db, worker_id="worker-before-restart", limit=1, lease_seconds=30)
+        first_claim = claim_jobs(
+            db,
+            worker_id="worker-before-restart",
+            limit=1,
+            lease_seconds=30,
+            max_attempts=5,
+        )
     assert [job.id for job in first_claim] == [job_id]
     assert first_claim[0].attempts == 1
 
@@ -2201,7 +2214,13 @@ def test_assignment_sized_onboarding_and_expired_job_recovery(
         db.commit()
 
     with postgres_session_factory() as db:
-        reclaimed = claim_jobs(db, worker_id="worker-after-restart", limit=1, lease_seconds=30)
+        reclaimed = claim_jobs(
+            db,
+            worker_id="worker-after-restart",
+            limit=1,
+            lease_seconds=30,
+            max_attempts=5,
+        )
     assert [job.id for job in reclaimed] == [job_id]
     assert reclaimed[0].attempts == 2
     assert reclaimed[0].locked_by == "worker-after-restart"

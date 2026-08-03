@@ -70,6 +70,20 @@ def create_app() -> FastAPI:
             clear_contextvars()
 
     application.include_router(api_router)
+
+    @application.get("/", include_in_schema=False)
+    def service_discovery() -> dict[str, str]:
+        """Give a reviewer useful entry points when opening the hosted base URL."""
+
+        return {
+            "service": settings.app_name,
+            "version": __version__,
+            "docs": "/docs",
+            "openapi": "/openapi.json",
+            "liveness": "/health/live",
+            "readiness": "/health/ready",
+        }
+
     return application
 
 

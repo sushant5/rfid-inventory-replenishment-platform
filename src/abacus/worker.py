@@ -100,6 +100,7 @@ def run() -> None:
                 # queued work from losing its lease before processing begins.
                 limit=1,
                 lease_seconds=settings.worker_lease_seconds,
+                max_attempts=settings.worker_max_attempts,
             )
             cutover_warning_emitted = False
         except ReservationCutoverPending:

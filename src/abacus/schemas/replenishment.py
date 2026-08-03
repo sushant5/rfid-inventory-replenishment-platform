@@ -1,8 +1,9 @@
 import uuid
 from datetime import datetime
-from typing import Self
+from typing import Annotated, Self
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from abacus.models.replenishment import (
     PolicyImportStatus,
@@ -84,15 +85,33 @@ class PolicyCreate(PolicyDefinition):
 
 class PolicyPatch(ApiModel):
     store_id: uuid.UUID | None = None
-    selector_type: PolicySelectorType | None = None
-    selector_value: str | None = Field(default=None, min_length=1, max_length=128)
-    minimum_floor_quantity: int | None = Field(default=None, ge=0)
-    target_floor_quantity: int | None = Field(default=None, ge=0)
+    selector_type: PolicySelectorType | SkipJsonSchema[None] = None
+    selector_value: Annotated[str, Field(min_length=1, max_length=128)] | SkipJsonSchema[None] = (
+        None
+    )
+    minimum_floor_quantity: Annotated[int, Field(ge=0)] | SkipJsonSchema[None] = None
+    target_floor_quantity: Annotated[int, Field(ge=0)] | SkipJsonSchema[None] = None
     maximum_floor_quantity: int | None = Field(default=None, ge=0)
-    priority: int | None = Field(default=None, ge=-1_000_000, le=1_000_000)
-    effective_from: datetime | None = None
+    priority: Annotated[int, Field(ge=-1_000_000, le=1_000_000)] | SkipJsonSchema[None] = None
+    effective_from: datetime | SkipJsonSchema[None] = None
     effective_to: datetime | None = None
-    active: bool | None = None
+    active: bool | SkipJsonSchema[None] = None
+
+    @field_validator(
+        "selector_type",
+        "selector_value",
+        "minimum_floor_quantity",
+        "target_floor_quantity",
+        "priority",
+        "effective_from",
+        "active",
+        mode="before",
+    )
+    @classmethod
+    def reject_explicit_null(cls, value: object, info: ValidationInfo) -> object:
+        if value is None:
+            raise ValueError(f"{info.field_name} cannot be null")
+        return value
 
     @field_validator("selector_value")
     @classmethod

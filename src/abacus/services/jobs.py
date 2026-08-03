@@ -1,14 +1,24 @@
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from abacus.enums import JobKind, JobStatus
+from abacus.enums import JobKind, JobStatus, TenantStatus
 from abacus.models.jobs import DurableJob
+from abacus.models.tenancy import Tenant
 from abacus.services.cutover import ensure_reservation_cutover_ready
+
+
+def _database_now(db: Session) -> datetime:
+    """Use PostgreSQL as the single clock for durable queue decisions."""
+
+    value = cast(datetime | None, db.scalar(select(func.clock_timestamp())))
+    if value is None:  # pragma: no cover - PostgreSQL always returns a value
+        raise RuntimeError("database clock is unavailable")
+    return value
 
 
 def enqueue_job(
@@ -25,7 +35,7 @@ def enqueue_job(
         payload=payload,
         status=JobStatus.PENDING,
         attempts=0,
-        available_at=available_at or datetime.now(UTC),
+        available_at=available_at if available_at is not None else _database_now(db),
     )
     db.add(job)
     db.flush()
@@ -38,28 +48,67 @@ def claim_jobs(
     worker_id: str,
     limit: int,
     lease_seconds: int,
+    max_attempts: int,
 ) -> list[DurableJob]:
     # Readiness does not stop a separately deployed worker. Refuse to lease any
     # durable work while legacy replenishment reservations await reconciliation.
     ensure_reservation_cutover_ready(db)
-    now = datetime.now(UTC)
+    now = _database_now(db)
+
+    # A worker can disappear without reporting its failure, and deployments can
+    # lower the configured retry budget while retries are pending. Terminalize
+    # due work that already consumed the current budget instead of executing or
+    # reclaiming it forever.
+    exhausted_jobs = db.scalars(
+        select(DurableJob)
+        .where(
+            DurableJob.attempts >= max_attempts,
+            or_(
+                and_(
+                    DurableJob.status == JobStatus.PENDING,
+                    DurableJob.available_at <= now,
+                ),
+                and_(
+                    DurableJob.status == JobStatus.PROCESSING,
+                    DurableJob.lease_expires_at.is_not(None),
+                    DurableJob.lease_expires_at <= now,
+                ),
+            ),
+        )
+        .order_by(DurableJob.created_at.asc())
+        .with_for_update(of=DurableJob, skip_locked=True)
+        .limit(max(limit, 1))
+    ).all()
+    for job in exhausted_jobs:
+        expired_lease = job.status == JobStatus.PROCESSING
+        job.status = JobStatus.QUARANTINED
+        job.locked_by = None
+        job.lease_expires_at = None
+        job.last_error = (
+            "LeaseExpired: maximum processing attempts exhausted"
+            if expired_lease
+            else "MaximumAttemptsExceeded: pending job exhausted its attempt budget"
+        )
     claimable = or_(
         and_(
             DurableJob.status == JobStatus.PENDING,
             DurableJob.available_at <= now,
+            DurableJob.attempts < max_attempts,
         ),
         and_(
             DurableJob.status == JobStatus.PROCESSING,
             DurableJob.lease_expires_at.is_not(None),
-            DurableJob.lease_expires_at < now,
+            DurableJob.lease_expires_at <= now,
+            DurableJob.attempts < max_attempts,
         ),
     )
     jobs = list(
         db.scalars(
             select(DurableJob)
-            .where(claimable)
+            .join(Tenant, Tenant.id == DurableJob.tenant_id)
+            .where(claimable, Tenant.status == TenantStatus.ACTIVE)
             .order_by(DurableJob.created_at.asc())
-            .with_for_update(skip_locked=True)
+            .with_for_update(of=DurableJob, skip_locked=True)
             .limit(limit)
         ).all()
     )
@@ -81,6 +130,7 @@ def renew_lease(
 ) -> bool:
     """Extend a lease only while this worker still owns it."""
 
+    now = _database_now(db)
     result = cast(
         CursorResult[Any],
         db.execute(
@@ -89,8 +139,10 @@ def renew_lease(
                 DurableJob.id == job_id,
                 DurableJob.status == JobStatus.PROCESSING,
                 DurableJob.locked_by == worker_id,
+                DurableJob.lease_expires_at.is_not(None),
+                DurableJob.lease_expires_at > now,
             )
-            .values(lease_expires_at=datetime.now(UTC) + timedelta(seconds=lease_seconds))
+            .values(lease_expires_at=now + timedelta(seconds=lease_seconds))
             .execution_options(synchronize_session=False)
         ),
     )
@@ -155,6 +207,6 @@ def mark_failed(
     else:
         job.status = JobStatus.PENDING
         delay_seconds = min(300, 2 ** min(job.attempts, 8))
-        job.available_at = datetime.now(UTC) + timedelta(seconds=delay_seconds)
+        job.available_at = _database_now(db) + timedelta(seconds=delay_seconds)
     db.commit()
     return True

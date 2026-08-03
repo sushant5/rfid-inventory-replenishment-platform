@@ -33,7 +33,7 @@ software release. `GET /version` returns that release plus its deployed `build_s
 The implementation follows the exercise in its original order:
 
 1. **Brand/store onboarding** — active tenant creation, an idempotent 1–500 store batch,
-   organization hierarchy, zones, hardware discovery, device-key rotation with plaintext
+   organization hierarchy, zones, hardware registration, device-key rotation with plaintext
    returned once,
    and effective-dated reader assignments.
 2. **Product master** — staged CSV import, checksum/idempotency, normalization,
@@ -50,8 +50,8 @@ The implementation follows the exercise in its original order:
 
 Sections 4 and 5 are the explicitly required build focus. Sections 1–3 are also
 implemented as a coherent vertical slice so reviewers can exercise them end to end.
-See [assignment coverage](docs/assignment-coverage.md), [architecture](docs/architecture.md),
-and the [decision/assumption register](docs/decisions.md).
+The [engineering response](docs/Sushant_Engineering_Response.md) contains the detailed
+design rationale, tradeoffs, assumptions, and risks without a separate duplicate appendix.
 
 ## Architecture
 
@@ -68,9 +68,10 @@ flowchart LR
 
 The API and worker share domain modules but run as separate processes. Accepted work
 survives restarts because the job row and source record commit together. Workers use
-leases, heartbeats, `FOR UPDATE SKIP LOCKED`, retries with backoff, quarantine after
-the retry limit, and compare-and-set completion. Processing is **at least once**;
-idempotent state transitions provide safety. There is no exactly-once claim.
+the PostgreSQL clock, leases, heartbeats, `FOR UPDATE SKIP LOCKED`, retries with backoff,
+quarantine after the retry limit, and compare-and-set completion. Suspended-tenant jobs
+stay pending and resume after reactivation. Processing is **at least once**; idempotent
+state transitions provide safety. There is no exactly-once claim.
 
 ## Technology choices
 
@@ -185,8 +186,7 @@ $env:DATABASE_URL = $env:TEST_DATABASE_URL
 
 The active GitHub Actions workflow in `.github/workflows/ci.yml` provisions PostgreSQL
 17, migrates a clean database, runs lint/format/strict mypy, the full test and coverage
-gate, `alembic check`, builds this PDF, and builds the Docker image. The copy in
-`ci/github-actions.yml` remains a portable template.
+gate, `alembic check`, builds this PDF, and builds the Docker image.
 
 Build the recruiter-facing PDF from its Markdown source with:
 
@@ -415,5 +415,5 @@ requirements.
 - No 5,000-store throughput claim is made without a supplied workload and measured
   load test.
 
-All missing business facts and alternatives are kept explicit in
-[docs/decisions.md](docs/decisions.md).
+Missing business facts and alternatives are explicit in the
+[engineering response](docs/Sushant_Engineering_Response.md).
