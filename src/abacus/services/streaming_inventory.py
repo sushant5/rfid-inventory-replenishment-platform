@@ -658,7 +658,19 @@ def process_observation(
     decision = infer_stable_zone(window, settings)
     if decision is None:
         if state is not None:
-            state.confidence = min(state.confidence, 0.49)
+            observed_locations = {(item.store_id, item.zone_id) for item in window}
+            current_location = (state.store_id, state.zone_id)
+            # A worker restart starts with an empty process-local evidence window.
+            # One read from the already-confirmed location is insufficient to make
+            # a new decision, but it is not conflicting evidence and must not lower
+            # confidence. Competing locations or a catalog rebind remain ambiguous.
+            same_current_evidence = (
+                state.sku_id == binding.sku_id
+                and state.zone_id is not None
+                and observed_locations == {current_location}
+            )
+            if not same_current_evidence:
+                state.confidence = min(state.confidence, 0.49)
             if event.received_at - state.last_received_at >= timedelta(
                 seconds=settings.rfid_last_seen_flush_seconds
             ):

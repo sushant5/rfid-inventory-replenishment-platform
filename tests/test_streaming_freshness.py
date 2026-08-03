@@ -262,6 +262,55 @@ def test_same_zone_read_throttles_current_item_last_seen_refresh(
     assert state.last_received_at == expected_last_seen
 
 
+def test_same_zone_read_after_worker_restart_preserves_confirmed_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = datetime.now(UTC) - timedelta(minutes=1)
+    store_id = uuid.uuid4()
+    zone_id = uuid.uuid4()
+    event = _event(
+        observed_at=base + timedelta(seconds=10),
+        received_at=base + timedelta(seconds=10),
+        store_id=store_id,
+        zone_id=zone_id,
+    )
+    assignment = DeviceAssignment(
+        tenant_id=event.tenant_id,
+        device_id=event.device_id,
+        store_id=store_id,
+        zone_id=zone_id,
+        effective_from=base - timedelta(days=1),
+    )
+    state = CurrentItemState(
+        tenant_id=event.tenant_id,
+        epc=event.epc,
+        sku_id=uuid.uuid4(),
+        store_id=store_id,
+        zone_id=zone_id,
+        last_observed_at=base,
+        last_received_at=base,
+        confidence=0.9,
+        state_version=1,
+    )
+    binding = MagicMock(spec=EpcBinding, sku_id=state.sku_id)
+    db = MagicMock(spec=Session)
+    db.scalar.side_effect = [binding, state, base]
+    monkeypatch.setattr(
+        streaming_inventory,
+        "_resolve_effective_assignment",
+        MagicMock(return_value=(assignment, None)),
+    )
+    monkeypatch.setattr(streaming_inventory, "_update_connectivity", MagicMock())
+    monkeypatch.setattr(streaming_inventory, "_advance_batch", MagicMock())
+    settings = _settings()
+    settings.rfid_move_confirmation_reads = 3
+
+    result = process_observation(db, event, RecentObservationState(), settings)
+
+    assert result.disposition == "AMBIGUOUS"
+    assert state.confidence == 0.9
+
+
 def test_unlocated_item_requires_tenant_wide_inventory_permission() -> None:
     tenant_id = uuid.uuid4()
     item = CurrentItemState(
