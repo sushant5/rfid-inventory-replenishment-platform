@@ -9,13 +9,13 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 
 ## Hosted demo
 
-- API: <https://abacus-orange-sushant-api.onrender.com>
-- Swagger: <https://abacus-orange-sushant-api.onrender.com/docs>
-- OpenAPI: <https://abacus-orange-sushant-api.onrender.com/openapi.json>
-- Readiness: <https://abacus-orange-sushant-api.onrender.com/health/ready>
-- Release metadata: <https://abacus-orange-sushant-api.onrender.com/version>
+- API: <https://abacus-take-home-api.onrender.com>
+- Swagger: <https://abacus-take-home-api.onrender.com/docs>
+- OpenAPI: <https://abacus-take-home-api.onrender.com/openapi.json>
+- Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
+- Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.3.0` on Render with PostgreSQL 17. Render may need
+The hosted demo runs release `0.3.0` on Render with PostgreSQL 16. Render may need
 about a minute to wake the free web service after inactivity. Reviewer credentials
 are provided separately and are intentionally not stored in this public repository.
 
