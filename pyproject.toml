@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "abacus-rfid-platform"
 dynamic = ["version"]
-description = "GreyOrange Engineering take-home: multi-tenant RFID inventory and replenishment API"
+description = "Multi-tenant RFID inventory and replenishment API"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [

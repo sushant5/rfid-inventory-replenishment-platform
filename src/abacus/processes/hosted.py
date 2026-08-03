@@ -1,6 +1,6 @@
 """Supervise the complete demo topology inside one hosted web container.
 
-Docker Compose keeps the API and workers as independent processes. Some take-home
+Docker Compose keeps the API and workers as independent processes. Some hosted
 hosting tiers provide only one free web process, so this launcher starts the same
 three entry points as children and treats any unexpected child exit as fatal.
 """

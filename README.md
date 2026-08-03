@@ -1,10 +1,10 @@
-# Abacus Engineering Take-Home
+# RFID Inventory and Replenishment Platform
 
 Production-shaped backend for Orange's RFID inventory and replenishment workflow:
 
 `Tenant/Store → Zones/Devices → Catalog/EPCs → RFID → Item State → Inventory → Policy → Task`
 
-The submitted API is Python 3.12, FastAPI, SQLAlchemy 2, PostgreSQL 17, Alembic,
+The reference API is Python 3.12, FastAPI, SQLAlchemy 2, PostgreSQL 17, Alembic,
 JWT, and Pytest. There is intentionally no frontend or external message broker.
 
 ## Hosted demo
@@ -75,7 +75,7 @@ The three deployable processes share one image and codebase:
 2. Catalog/import worker
 3. Durable RFID/inventory event worker
 
-PostgreSQL is the system of record and durable work inbox for the hosted take-home.
+PostgreSQL is the system of record and durable work inbox for the hosted deployment.
 Parsed catalog rows remain in staging until validation succeeds. Kafka-compatible
 streaming and S3 source-file retention are production extensions, not demo dependencies.
 
@@ -233,4 +233,4 @@ changing the item-state, transition-ID, delta-ID, or projection contracts.
 
 Kubernetes, Flink, regional cells, DynamoDB, enterprise OIDC/SAML/SCIM, X.509 device
 lifecycle, precise XY positioning, and real reader integration are documented production
-extensions only. They are intentionally outside this take-home's executable scope.
+extensions only. They are intentionally outside this implementation's executable scope.

@@ -1,4 +1,4 @@
-"""Exercise the canonical take-home workflow against a running Compose stack."""
+"""Exercise the canonical RFID workflow against a running Compose stack."""
 
 from __future__ import annotations
 
