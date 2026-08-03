@@ -10,12 +10,24 @@ from structlog.contextvars import bind_contextvars, clear_contextvars
 
 from abacus import __version__
 from abacus.api.errors import install_error_handlers, install_openapi_error_contract
-from abacus.api.router import api_router, legacy_test_router
+from abacus.api.router import api_router
 from abacus.config import get_settings
 from abacus.logging import configure_logging
 
 configure_logging()
 logger = structlog.get_logger(__name__)
+
+OPENAPI_TAGS = [
+    {"name": "1. Onboarding", "description": "Tenant, store, zone, and device setup."},
+    {"name": "2. Product catalog", "description": "Asynchronous catalog import and SKU lookup."},
+    {"name": "3. RFID and Inventory", "description": "RFID ingestion and current inventory state."},
+    {
+        "name": "4. Identity and Access",
+        "description": "Authentication, users, roles, and store scope.",
+    },
+    {"name": "5. Replenishment", "description": "Policies, evaluation, and task lifecycle."},
+    {"name": "Operations", "description": "Service health and release metadata."},
+]
 
 
 @asynccontextmanager
@@ -28,12 +40,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         logger.info("application_stopped")
 
 
-def create_app(*, include_legacy_test_routes: bool = False) -> FastAPI:
+def create_app() -> FastAPI:
     settings = get_settings()
     application = FastAPI(
         title=settings.app_name,
         version=__version__,
         description="Multi-tenant RFID inventory and replenishment API.",
+        openapi_tags=OPENAPI_TAGS,
         lifespan=lifespan,
     )
     install_error_handlers(application)
@@ -72,8 +85,6 @@ def create_app(*, include_legacy_test_routes: bool = False) -> FastAPI:
             clear_contextvars()
 
     application.include_router(api_router)
-    if include_legacy_test_routes:
-        application.include_router(legacy_test_router)
     install_openapi_error_contract(application)
 
     @application.get("/", include_in_schema=False)

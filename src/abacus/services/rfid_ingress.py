@@ -1,6 +1,7 @@
 import hashlib
 import json
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
@@ -23,33 +24,53 @@ from abacus.models.tenancy import Device, DeviceAssignment
 from abacus.schemas.architecture import CanonicalObservationBatchCreate
 
 
-def _effective_assignment(
+def _assignment_unavailable() -> ApiError:
+    return ApiError(
+        409,
+        "Device assignment unavailable",
+        "The device has no store and zone assignment effective for an observation.",
+        code="device_assignment_unavailable",
+    )
+
+
+def _load_effective_assignment_history(
     db: Session,
     device: Device,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[DeviceAssignment, ...]:
+    """Load every assignment that can cover a timestamp in the batch window."""
+
+    return tuple(
+        db.scalars(
+            select(DeviceAssignment)
+            .where(
+                DeviceAssignment.tenant_id == device.tenant_id,
+                DeviceAssignment.device_id == device.id,
+                DeviceAssignment.effective_from <= window_end,
+                or_(
+                    DeviceAssignment.effective_to.is_(None),
+                    DeviceAssignment.effective_to > window_start,
+                ),
+            )
+            .order_by(DeviceAssignment.effective_from.desc())
+        ).all()
+    )
+
+
+def _resolve_effective_assignment(
+    assignments: Sequence[DeviceAssignment],
     at: datetime,
 ) -> DeviceAssignment:
-    assignment = db.scalar(
-        select(DeviceAssignment)
-        .where(
-            DeviceAssignment.tenant_id == device.tenant_id,
-            DeviceAssignment.device_id == device.id,
-            DeviceAssignment.effective_from <= at,
-            or_(
-                DeviceAssignment.effective_to.is_(None),
-                DeviceAssignment.effective_to > at,
-            ),
-        )
-        .order_by(DeviceAssignment.effective_from.desc())
-        .limit(1)
-    )
-    if assignment is None:
-        raise ApiError(
-            409,
-            "Device assignment unavailable",
-            "The device has no store and zone assignment effective for an observation.",
-            code="device_assignment_unavailable",
-        )
-    return assignment
+    """Resolve one timestamp using the database's half-open interval semantics."""
+
+    for assignment in assignments:
+        if assignment.effective_from <= at and (
+            assignment.effective_to is None or assignment.effective_to > at
+        ):
+            return assignment
+    raise _assignment_unavailable()
 
 
 def observation_payload_fingerprint(event: RfidObservationEvent) -> str:
@@ -116,11 +137,18 @@ def accept_observation_batch(
         )
 
     try:
-        current_assignment = _effective_assignment(db, device, received_at)
+        assignment_times = [received_at, *(item.observed_at for item in request.observations)]
+        assignments = _load_effective_assignment_history(
+            db,
+            device,
+            window_start=min(assignment_times),
+            window_end=max(assignment_times),
+        )
+        current_assignment = _resolve_effective_assignment(assignments, received_at)
         batch_id = uuid.uuid4()
         events: list[RfidObservationEvent] = []
         for observation in request.observations:
-            assignment = _effective_assignment(db, device, observation.observed_at)
+            assignment = _resolve_effective_assignment(assignments, observation.observed_at)
             buffered = received_at - observation.observed_at > timedelta(seconds=60)
             events.append(
                 RfidObservationEvent(

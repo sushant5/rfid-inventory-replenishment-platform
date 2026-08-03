@@ -292,13 +292,18 @@ def _ingest(
 
 
 def test_postgres_end_to_end(
-    api_client: TestClient,
+    compatibility_api_client: TestClient,
     postgres_session_factory: sessionmaker[Session],
 ) -> None:
+    api_client = compatibility_api_client
     client = api_client
 
     assert _expect(client.get("/health/live"), 200) == {"status": "ok"}
-    assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
+    ready = _expect(client.get("/health/ready"), 200)
+    assert isinstance(ready, dict)
+    assert ready["status"] == "ok"
+    assert ready["schema_revision"] == EXPECTED_SCHEMA_REVISION
+    assert ready["cutover_ready"] is True
     with postgres_session_factory() as db:
         db.execute(text("UPDATE alembic_version SET version_num = 'c421c8a25f4e'"))
         db.commit()
@@ -311,10 +316,12 @@ def test_postgres_end_to_end(
             {"revision": EXPECTED_SCHEMA_REVISION},
         )
         db.commit()
-    assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
+    restored_ready = _expect(client.get("/health/ready"), 200)
+    assert isinstance(restored_ready, dict)
+    assert restored_ready["status"] == "ok"
     version = _expect(client.get("/version"), 200)
     assert isinstance(version, dict)
-    assert version["version"] == "0.4.0"
+    assert version["version"] == "0.5.0"
     assert (
         client.get(
             "/v1/platform/tenants/00000000-0000-0000-0000-000000000000/stores",
@@ -1705,7 +1712,9 @@ def test_postgres_end_to_end(
             {"task_id": uuid.UUID(task_id)},
         )
         db.commit()
-    assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
+    cutover_ready = _expect(client.get("/health/ready"), 200)
+    assert isinstance(cutover_ready, dict)
+    assert cutover_ready["status"] == "ok"
 
     unclaimed_movement = client.patch(
         f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
@@ -2316,7 +2325,7 @@ def test_postgres_end_to_end(
     )
     assert isinstance(assignment_history, list)
     assert len(assignment_history) == 1
-    original_effective_from = datetime.fromisoformat(str(assignment_history[0]["effective_from"]))
+    original_effective_from = datetime.fromisoformat(str(assignment_history[0]["valid_from"]))
     backfilled_effective_from = original_effective_from - timedelta(minutes=1)
     unchanged_assignment = _expect(
         client.post(
@@ -2332,7 +2341,7 @@ def test_postgres_end_to_end(
     )
     assert isinstance(unchanged_assignment, dict)
     assert unchanged_assignment["id"] == assignment_history[0]["id"]
-    assert datetime.fromisoformat(str(unchanged_assignment["effective_from"])) == (
+    assert datetime.fromisoformat(str(unchanged_assignment["valid_from"])) == (
         backfilled_effective_from
     )
     reassignment_time = datetime.now(UTC) + timedelta(minutes=1)
@@ -2403,9 +2412,10 @@ def test_postgres_end_to_end(
 
 
 def test_assignment_sized_onboarding_and_expired_job_recovery(
-    api_client: TestClient,
+    compatibility_api_client: TestClient,
     postgres_session_factory: sessionmaker[Session],
 ) -> None:
+    api_client = compatibility_api_client
     tenant = _expect(
         api_client.post(
             "/v1/platform/tenants",

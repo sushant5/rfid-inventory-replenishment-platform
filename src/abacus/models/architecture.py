@@ -84,11 +84,14 @@ class RfidTag(TimestampMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
-class CanonicalIdentityRole(StrEnum):
+class IdentityRole(StrEnum):
     STORE_ASSOCIATE = "STORE_ASSOCIATE"
     STORE_MANAGER = "STORE_MANAGER"
     CORPORATE_USER = "CORPORATE_USER"
     TENANT_ADMIN = "TENANT_ADMIN"
+
+
+CanonicalIdentityRole = IdentityRole
 
 
 class UserRole(Base):
@@ -634,13 +637,16 @@ class PolicyRule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
-class CanonicalTaskStatus(StrEnum):
+class ReplenishmentTaskStatus(StrEnum):
     OPEN = "OPEN"
     CLAIMED = "CLAIMED"
     IN_PROGRESS = "IN_PROGRESS"
     COMPLETED = "COMPLETED"
     CANCELED = "CANCELED"
     EXPIRED = "EXPIRED"
+
+
+CanonicalTaskStatus = ReplenishmentTaskStatus
 
 
 class CanonicalReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):

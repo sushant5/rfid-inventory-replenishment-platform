@@ -11,7 +11,7 @@ from abacus.schemas.catalog import normalize_epc
 from abacus.schemas.common import ApiModel
 
 
-class CanonicalObservationInput(ApiModel):
+class ObservationInput(ApiModel):
     event_id: str = Field(min_length=1, max_length=128)
     epc: str = Field(min_length=4, max_length=128)
     observed_at: datetime
@@ -36,18 +36,24 @@ class CanonicalObservationInput(ApiModel):
         return value
 
 
-class CanonicalObservationBatchCreate(ApiModel):
+class ObservationBatchCreate(ApiModel):
     device_id: uuid.UUID
-    observations: list[CanonicalObservationInput] = Field(min_length=1, max_length=1000)
+    observations: list[ObservationInput] = Field(min_length=1, max_length=1000)
     backlog_drained: bool = True
     reader_coverage_ok: bool = True
 
     @model_validator(mode="after")
-    def unique_events_within_batch(self) -> "CanonicalObservationBatchCreate":
+    def unique_events_within_batch(self) -> "ObservationBatchCreate":
         event_ids = [item.event_id for item in self.observations]
         if len(event_ids) != len(set(event_ids)):
             raise ValueError("event_id values must be unique within a batch")
         return self
+
+
+# Internal compatibility aliases keep the durable processing modules stable while the
+# public OpenAPI contract uses concise domain names.
+CanonicalObservationInput = ObservationInput
+CanonicalObservationBatchCreate = ObservationBatchCreate
 
 
 class ObservationBatchAccepted(ApiModel):
@@ -88,6 +94,9 @@ class InventoryProjectionRead(ApiModel):
     zone: str
     quantity: int
     as_of: datetime
+    oldest_item_observed_at: datetime = Field(
+        description="Oldest observation contributing to this inventory bucket."
+    )
     confidence: float = Field(
         description="Effective item-location confidence after read-time recency decay."
     )

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, architecture-aligned-v5]
+    branches: [main]
   pull_request:
 
 permissions:
@@ -61,8 +61,8 @@ jobs:
           scripts/generate_store_batch.py
       - name: Migrate clean database
         run: alembic upgrade head
-      - name: Verify latest migration rollback
-        run: alembic downgrade -1 && alembic upgrade head
+      - name: Verify full migration rollback chain
+        run: alembic downgrade base && alembic upgrade head
       - name: Test
         run: python -m pytest --cov=abacus --cov-report=term-missing --cov-report=xml
       - name: Verify migration metadata

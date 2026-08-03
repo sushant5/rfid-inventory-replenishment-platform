@@ -231,6 +231,7 @@ def get_store_inventory_endpoint(
             Zone,
             current_metadata.c.item_count,
             current_metadata.c.as_of,
+            current_metadata.c.oldest_item_observed_at,
             current_metadata.c.confidence,
         )
         .join(Sku, Sku.id == InventoryProjection.sku_id)
@@ -255,6 +256,7 @@ def get_store_inventory_endpoint(
             zone=zone.code,
             quantity=projection.quantity,
             as_of=current_as_of or projection.as_of,
+            oldest_item_observed_at=current_oldest_observed_at or projection.as_of,
             confidence=effective_bucket_confidence(
                 projected_quantity=projection.quantity,
                 current_item_count=current_item_count,
@@ -262,7 +264,15 @@ def get_store_inventory_endpoint(
             ),
             freshness_status=freshness,
         )
-        for projection, sku, zone, current_item_count, current_as_of, current_confidence in rows
+        for (
+            projection,
+            sku,
+            zone,
+            current_item_count,
+            current_as_of,
+            current_oldest_observed_at,
+            current_confidence,
+        ) in rows
     ]
 
 

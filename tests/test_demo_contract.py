@@ -31,7 +31,7 @@ def test_checked_in_examples_match_the_public_request_schemas() -> None:
     )
 
 
-def test_openapi_contains_the_canonical_submission_contract() -> None:
+def test_openapi_contains_the_submission_contract() -> None:
     schema = create_app().openapi()
     assert schema["openapi"] == "3.1.0"
     assert schema["info"] == {
@@ -39,7 +39,7 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.5.0"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",
@@ -154,14 +154,23 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
         assert paths[path][method]["security"] == [{"HTTPBearer": []}]
 
     inventory_fields = schema["components"]["schemas"]["InventoryProjectionRead"]["properties"]
-    assert {"quantity", "as_of", "confidence", "freshness_status"}.issubset(inventory_fields)
+    assert {
+        "quantity",
+        "as_of",
+        "oldest_item_observed_at",
+        "confidence",
+        "freshness_status",
+    }.issubset(inventory_fields)
     device_mapping_fields = schema["components"]["schemas"]["StoreDeviceMappingRead"]["properties"]
     assert set(device_mapping_fields) == {"device", "assignment"}
+    assignment_fields = schema["components"]["schemas"]["DeviceAssignmentRead"]["properties"]
+    assert {"valid_from", "valid_to"}.issubset(assignment_fields)
+    assert "effective_from" not in assignment_fields
     device_items = paths["/v1/stores/{store_id}/devices"]["get"]["responses"]["200"]["content"][
         "application/json"
     ]["schema"]["items"]
     assert device_items["$ref"].endswith("/StoreDeviceMappingRead")
-    assert schema["components"]["schemas"]["CanonicalTaskStatus"]["enum"] == [
+    assert schema["components"]["schemas"]["ReplenishmentTaskStatus"]["enum"] == [
         "OPEN",
         "CLAIMED",
         "IN_PROGRESS",
@@ -169,6 +178,21 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
         "CANCELED",
         "EXPIRED",
     ]
+    assert not any(name.startswith("Canonical") for name in schema["components"]["schemas"])
+    assert [item["name"] for item in schema["tags"]] == [
+        "1. Onboarding",
+        "2. Product catalog",
+        "3. RFID and Inventory",
+        "4. Identity and Access",
+        "5. Replenishment",
+        "Operations",
+    ]
+    assert all(
+        "Canonical" not in operation["summary"] and not operation["summary"].endswith(" Endpoint")
+        for path_item in paths.values()
+        for method, operation in path_item.items()
+        if method in http_methods
+    )
 
     validation = paths["/v1/items/{epc}"]["get"]["responses"]["422"]
     assert "ProblemDetail" in schema["components"]["schemas"]

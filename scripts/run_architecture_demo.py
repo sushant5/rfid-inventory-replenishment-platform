@@ -1,4 +1,4 @@
-"""Exercise the canonical RFID workflow against a running Compose stack."""
+"""Exercise the end-to-end RFID workflow against a running Compose stack."""
 
 from __future__ import annotations
 
@@ -162,7 +162,7 @@ def create_scoped_user(
     password: str,
     role: str,
     store_ids: list[str],
-) -> str:
+) -> tuple[str, str]:
     _, created = client.request(
         "POST",
         "/v1/users",
@@ -176,8 +176,8 @@ def create_scoped_user(
             "store_ids": store_ids,
         },
     )
-    required(object_result(created, "user"), "id")
-    return login(client, email, password)
+    user_id = str(required(object_result(created, "user"), "id"))
+    return user_id, login(client, email, password)
 
 
 def observation(event_id: str, epc: str, at: datetime, rssi: float) -> dict[str, object]:
@@ -247,6 +247,7 @@ def run(args: argparse.Namespace) -> None:
     client = Client(args.base_url, timeout=args.request_timeout)
     platform_headers = {"X-Platform-Key": args.platform_key}
     wait_for_readiness(client, args.startup_timeout)
+    client.request("GET", "/health/live")
 
     _, tenant = client.request(
         "POST",
@@ -278,7 +279,7 @@ def run(args: argparse.Namespace) -> None:
     client.request(
         "POST",
         f"/v1/tenants/{tenant_id}/store-imports",
-        expected=202,
+        expected=201,
         headers={**platform_headers, "Idempotency-Key": "orange-demo-stores-v2"},
         payload=stores_payload,
     )
@@ -288,12 +289,23 @@ def run(args: argparse.Namespace) -> None:
     stores = {str(item["code"]): item for item in list_result(stores_value, "stores")}
     store1_id = str(required(stores["orange-001"], "id"))
     store2_id = str(required(stores["orange-002"], "id"))
+    run_id = uuid.uuid4().hex[:10].upper()
+    client.request(
+        "POST",
+        f"/v1/stores/{store2_id}/zones",
+        expected=201,
+        headers=bearer(admin_token),
+        payload={
+            "code": f"audit-{run_id.lower()}",
+            "name": "Demo Audit Zone",
+            "kind": "OTHER",
+        },
+    )
     _, zones_value = client.request(
         "GET", f"/v1/stores/{store1_id}/zones", headers=bearer(admin_token)
     )
     zones = {str(item["code"]): item for item in list_result(zones_value, "zones")}
 
-    run_id = uuid.uuid4().hex[:10].upper()
     devices: dict[str, dict[str, Any]] = {}
     for code in ("floor", "backroom"):
         _, registration = client.request(
@@ -323,6 +335,14 @@ def run(args: argparse.Namespace) -> None:
     )
     if completed_import["status"] != "COMPLETED":
         raise DemoFailure(f"catalog import failed: {completed_import}")
+    _, import_errors_value = client.request(
+        "GET",
+        f"/v1/catalog-imports/{import_id}/errors",
+        headers=platform_headers,
+    )
+    import_errors = object_result(import_errors_value, "catalog import errors")
+    if int(required(import_errors, "total")) != 0:
+        raise DemoFailure(f"catalog import unexpectedly reported errors: {import_errors}")
 
     _, policy_value = client.request(
         "POST",
@@ -362,6 +382,30 @@ def run(args: argparse.Namespace) -> None:
         "POST",
         f"/v1/replenishment-policy-versions/{version_id}/activate",
         headers=bearer(admin_token),
+    )
+    _, draft_value = client.request(
+        "POST",
+        f"/v1/replenishment-policies/{policy_id}/versions",
+        expected=201,
+        headers=bearer(admin_token),
+    )
+    draft = object_result(draft_value, "draft policy version")
+    draft_version_id = str(
+        required(object_result(required(draft, "version"), "draft version"), "id")
+    )
+    client.request(
+        "PATCH",
+        f"/v1/replenishment-policy-versions/{draft_version_id}",
+        headers=bearer(admin_token),
+        payload={
+            "rules": [
+                {
+                    "min_floor_qty": 2,
+                    "target_floor_qty": 4,
+                    "priority": int(run_id[:5], 16) % 1_000_000,
+                }
+            ]
+        },
     )
 
     floor_device = object_result(required(devices["floor"], "device"), "floor device")
@@ -449,7 +493,7 @@ def run(args: argparse.Namespace) -> None:
 
     associate_password = f"DemoAssociate-{run_id}!"
     associate_email = f"associate-{run_id.lower()}@orange.example"
-    associate_token = create_scoped_user(
+    associate_user_id, associate_token = create_scoped_user(
         client,
         admin_token,
         email=associate_email,
@@ -457,6 +501,22 @@ def run(args: argparse.Namespace) -> None:
         role="STORE_ASSOCIATE",
         store_ids=[store1_id],
     )
+    client.request(
+        "PUT",
+        f"/v1/users/{associate_user_id}/roles",
+        headers=bearer(admin_token),
+        payload={"roles": ["STORE_ASSOCIATE"]},
+    )
+    client.request(
+        "PUT",
+        f"/v1/users/{associate_user_id}/store-assignments",
+        headers=bearer(admin_token),
+        payload={"store_ids": [store1_id]},
+    )
+    _, me_value = client.request("GET", "/v1/me", headers=bearer(associate_token))
+    me = object_result(me_value, "current user")
+    if str(required(me, "user_id")) != associate_user_id:
+        raise DemoFailure("current-user identity did not match the authenticated user")
     client.request("GET", f"/v1/stores/{store1_id}/inventory", headers=bearer(associate_token))
     denied_status, _ = client.request(
         "GET",
@@ -468,6 +528,14 @@ def run(args: argparse.Namespace) -> None:
         raise DemoFailure("store-scoped authorization was not enforced")
 
     task = tasks[0]
+    _, task_list_value = client.request(
+        "GET",
+        f"/v1/stores/{store1_id}/replenishment-tasks",
+        headers=bearer(associate_token),
+    )
+    task_list = list_result(task_list_value, "replenishment task list")
+    if not any(str(item["id"]) == str(task["id"]) for item in task_list):
+        raise DemoFailure("created replenishment task was not discoverable")
     for next_status in ("CLAIMED", "IN_PROGRESS", "COMPLETED"):
         _, task_value = client.request(
             "PATCH",

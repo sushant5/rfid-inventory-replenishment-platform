@@ -1,5 +1,9 @@
+from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -12,11 +16,31 @@ from abacus.config import get_settings
 from abacus.db import get_db
 
 router = APIRouter(tags=["Operations"])
-EXPECTED_SCHEMA_REVISION = "f0c1d2e3a4b5"
+
+
+@lru_cache
+def expected_schema_revision() -> str:
+    repository_root = Path(__file__).resolve().parents[4]
+    config = Config(str(repository_root / "alembic.ini"))
+    config.set_main_option("script_location", str(repository_root / "alembic"))
+    heads = ScriptDirectory.from_config(config).get_heads()
+    if len(heads) != 1:
+        raise RuntimeError(f"expected one Alembic head, found {len(heads)}")
+    return heads[0]
+
+
+EXPECTED_SCHEMA_REVISION = expected_schema_revision()
 
 
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
+
+
+class ReadinessResponse(HealthResponse):
+    database: Literal["ok"] = "ok"
+    schema_revision: str
+    restricted_database_role: bool
+    cutover_ready: bool
 
 
 class VersionResponse(BaseModel):
@@ -30,26 +54,25 @@ def liveness() -> HealthResponse:
     return HealthResponse()
 
 
-@router.get("/health/ready", response_model=HealthResponse, operation_id="readiness")
-async def readiness(db: Annotated[Session, Depends(get_db)]) -> HealthResponse:
+@router.get("/health/ready", response_model=ReadinessResponse, operation_id="readiness")
+async def readiness(db: Annotated[Session, Depends(get_db)]) -> ReadinessResponse:
     settings = get_settings()
     try:
-        if settings.app_env == "production":
-            runtime_role_ready = db.scalar(
-                text(
-                    "SELECT current_user = :expected_role "
-                    "AND NOT rolsuper AND NOT rolbypassrls "
-                    "FROM pg_catalog.pg_roles WHERE rolname = current_user"
-                ),
-                {"expected_role": settings.application_database_role},
+        runtime_role_ready = db.scalar(
+            text(
+                "SELECT current_user = :expected_role "
+                "AND NOT rolsuper AND NOT rolbypassrls "
+                "FROM pg_catalog.pg_roles WHERE rolname = current_user"
+            ),
+            {"expected_role": settings.application_database_role},
+        )
+        if settings.app_env == "production" and runtime_role_ready is not True:
+            raise ApiError(
+                503,
+                "Service unavailable",
+                "The runtime database credential is not the configured restricted role.",
+                code="database_role_not_ready",
             )
-            if runtime_role_ready is not True:
-                raise ApiError(
-                    503,
-                    "Service unavailable",
-                    "The runtime database credential is not the configured restricted role.",
-                    code="database_role_not_ready",
-                )
         required_tables_ready = db.scalar(
             text(
                 "SELECT to_regclass('public.tenants') IS NOT NULL "
@@ -98,7 +121,11 @@ async def readiness(db: Annotated[Session, Depends(get_db)]) -> HealthResponse:
             "Legacy replenishment movement must be reconciled before serving traffic.",
             code="cutover_reconciliation_required",
         )
-    return HealthResponse()
+    return ReadinessResponse(
+        schema_revision=schema_revision,
+        restricted_database_role=runtime_role_ready,
+        cutover_ready=cutover_ready,
+    )
 
 
 @router.get("/version", response_model=VersionResponse, operation_id="version")

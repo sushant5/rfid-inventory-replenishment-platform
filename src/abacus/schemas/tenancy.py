@@ -237,8 +237,8 @@ class DeviceAssignmentRead(ApiModel):
     device_id: uuid.UUID
     store_id: uuid.UUID
     zone_id: uuid.UUID
-    effective_from: datetime
-    effective_to: datetime | None
+    valid_from: datetime = Field(validation_alias="effective_from")
+    valid_to: datetime | None = Field(validation_alias="effective_to")
 
 
 class StoreDeviceMappingRead(ApiModel):

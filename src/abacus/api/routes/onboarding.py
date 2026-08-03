@@ -70,7 +70,7 @@ def create_tenant_endpoint(
 @canonical_router.post(
     "/tenants/{tenant_id}/store-imports",
     response_model=OnboardingBatchRead,
-    status_code=status.HTTP_202_ACCEPTED,
+    status_code=status.HTTP_201_CREATED,
     operation_id="createStoreImport",
 )
 @router.post(

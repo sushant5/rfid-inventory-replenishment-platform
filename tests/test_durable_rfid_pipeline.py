@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 import abacus.processes.event_worker as event_worker
@@ -794,6 +794,123 @@ def test_durable_acceptance_retry_and_projection_drain(
         )
     assert exc_info.value.status_code == 409
     assert exc_info.value.code == "rfid_event_id_conflict"
+
+
+def test_batch_assignment_resolution_uses_half_open_historical_boundaries(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    cutover_at = durable_pipeline.observed_at + timedelta(seconds=10)
+    second_zone_id = uuid.uuid4()
+    with postgres_session_factory() as db:
+        current = db.scalar(
+            select(DeviceAssignment).where(
+                DeviceAssignment.tenant_id == durable_pipeline.tenant_id,
+                DeviceAssignment.device_id == durable_pipeline.device_id,
+                DeviceAssignment.effective_to.is_(None),
+            )
+        )
+        assert current is not None
+        current.effective_to = cutover_at
+        db.add(
+            Zone(
+                id=second_zone_id,
+                tenant_id=durable_pipeline.tenant_id,
+                store_id=durable_pipeline.store_id,
+                code="historical-boundary",
+                name="Historical boundary",
+                kind=ZoneKind.BACKROOM,
+            )
+        )
+        db.flush()
+        db.add(
+            DeviceAssignment(
+                tenant_id=durable_pipeline.tenant_id,
+                device_id=durable_pipeline.device_id,
+                store_id=durable_pipeline.store_id,
+                zone_id=second_zone_id,
+                effective_from=cutover_at,
+            )
+        )
+        db.commit()
+
+    event_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
+    request = CanonicalObservationBatchCreate(
+        device_id=durable_pipeline.device_id,
+        observations=[
+            CanonicalObservationInput(
+                event_id=event_ids[0],
+                epc=durable_pipeline.epc,
+                observed_at=cutover_at - timedelta(microseconds=1),
+                rssi=-42,
+            ),
+            CanonicalObservationInput(
+                event_id=event_ids[1],
+                epc=durable_pipeline.epc,
+                observed_at=cutover_at,
+                rssi=-42,
+            ),
+        ],
+    )
+    _accept(
+        postgres_session_factory,
+        durable_pipeline,
+        request,
+        received_at=cutover_at + timedelta(seconds=1),
+    )
+
+    with postgres_session_factory() as db:
+        ledgers = {
+            row.event_id: row
+            for row in db.scalars(
+                select(RfidObservationEventLedger).where(
+                    RfidObservationEventLedger.tenant_id == durable_pipeline.tenant_id,
+                    RfidObservationEventLedger.event_id.in_(event_ids),
+                )
+            )
+        }
+        assert ledgers[event_ids[0]].zone_id == durable_pipeline.zone_id
+        assert ledgers[event_ids[1]].zone_id == second_zone_id
+
+
+def test_batch_assignment_resolution_executes_one_history_query(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    request = _request(
+        durable_pipeline,
+        tuple(str(uuid.uuid4()) for _ in range(100)),
+    )
+    assignment_queries = 0
+
+    def count_assignment_query(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        nonlocal assignment_queries
+        if "from device_assignments" in statement.lower():
+            assignment_queries += 1
+
+    with postgres_session_factory() as db:
+        device = db.get(Device, durable_pipeline.device_id)
+        assert device is not None
+        bind = db.get_bind()
+        event.listen(bind, "before_cursor_execute", count_assignment_query)
+        try:
+            accept_observation_batch(
+                db,
+                device=device,
+                request=request,
+                received_at=durable_pipeline.observed_at + timedelta(seconds=101),
+            )
+        finally:
+            event.remove(bind, "before_cursor_execute", count_assignment_query)
+
+    assert assignment_queries == 1
 
 
 def test_effective_epc_binding_controls_historical_and_current_sku_projection(

@@ -32,7 +32,7 @@ from abacus.services.canonical_replenishment import (
     patch_replenishment_task,
 )
 
-router = APIRouter(prefix="/v1", tags=["5. Canonical replenishment"])
+router = APIRouter(prefix="/v1", tags=["5. Replenishment"])
 
 CanManagePolicies = Annotated[
     Principal,

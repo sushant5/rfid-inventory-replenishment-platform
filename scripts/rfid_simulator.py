@@ -114,7 +114,7 @@ def build_scenario(
     seed: int | None = None,
     start_at: datetime | None = None,
 ) -> list[ObservationBatch]:
-    """Build canonical observation-batch requests for one simulator scenario."""
+    """Build observation-batch requests for one simulator scenario."""
 
     if scenario not in SCENARIOS:
         raise ValueError(f"unknown scenario: {scenario}")
@@ -148,7 +148,7 @@ def build_scenario(
             rssi=-48.0,
             antenna_id="floor-1",
         )
-        # The canonical API rejects duplicate IDs inside one batch. A real retry
+        # The observation-batch API rejects duplicate IDs inside one batch. A real retry
         # is therefore represented by the same event in two separate batches.
         return [
             ObservationBatch(primary, (event,)),

@@ -147,7 +147,7 @@ class UserCreate(ApiModel):
         return self
 
 
-class CanonicalUserCreate(ApiModel):
+class UserCreateRequest(ApiModel):
     email: EmailStr
     display_name: str = Field(min_length=1, max_length=255)
     password: SecretStr = Field(min_length=12, max_length=128)
@@ -168,7 +168,7 @@ class CanonicalUserCreate(ApiModel):
         return normalized
 
     @model_validator(mode="after")
-    def validate_canonical_access(self) -> "CanonicalUserCreate":
+    def validate_canonical_access(self) -> "UserCreateRequest":
         if len(self.roles) != len(set(self.roles)):
             raise ValueError("roles cannot contain duplicates")
         if len(self.store_ids) != len(set(self.store_ids)):
@@ -197,7 +197,7 @@ class UserRead(ApiModel):
     updated_at: datetime
 
 
-class CanonicalUserRead(ApiModel):
+class UserResponse(ApiModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
     email: EmailStr
@@ -217,8 +217,8 @@ class UserPage(ApiModel):
     offset: int
 
 
-class CanonicalUserPage(ApiModel):
-    items: list[CanonicalUserRead]
+class UserListResponse(ApiModel):
+    items: list[UserResponse]
     total: int
     limit: int
     offset: int
@@ -233,7 +233,7 @@ class CurrentPrincipalRead(ApiModel):
     permissions: list[str]
 
 
-class CanonicalPrincipalRead(ApiModel):
+class CurrentUserResponse(ApiModel):
     user_id: uuid.UUID
     tenant_id: uuid.UUID
     email: EmailStr
@@ -241,6 +241,12 @@ class CanonicalPrincipalRead(ApiModel):
     roles: list[CanonicalIdentityRole]
     store_ids: list[uuid.UUID]
     permissions: list[str]
+
+
+CanonicalUserCreate = UserCreateRequest
+CanonicalUserRead = UserResponse
+CanonicalUserPage = UserListResponse
+CanonicalPrincipalRead = CurrentUserResponse
 
 
 class IdentityAuditRecordRead(ApiModel):

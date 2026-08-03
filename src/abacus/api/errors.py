@@ -1,3 +1,4 @@
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
@@ -99,6 +100,7 @@ def install_openapi_error_contract(app: FastAPI) -> None:
             version=app.version,
             description=app.description,
             routes=app.routes,
+            tags=app.openapi_tags,
         )
         components = schema.setdefault("components", {}).setdefault("schemas", {})
         components["ProblemDetail"] = ProblemDetail.model_json_schema(
@@ -116,6 +118,13 @@ def install_openapi_error_contract(app: FastAPI) -> None:
             for operation in path_item.values():
                 if not isinstance(operation, dict) or "responses" not in operation:
                     continue
+                operation_id = operation.get("operationId")
+                if isinstance(operation_id, str):
+                    words = re.sub(r"(?<!^)(?=[A-Z])", " ", operation_id)
+                    words = (
+                        words.replace("Rfid", "RFID").replace("Skus", "SKUs").replace("Sku", "SKU")
+                    )
+                    operation["summary"] = words[0].upper() + words[1:]
                 responses = operation["responses"]
                 current_validation = responses.get("422", {})
                 current_schema = (

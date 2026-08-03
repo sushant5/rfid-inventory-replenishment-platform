@@ -98,6 +98,7 @@ def current_inventory_bucket_metadata(
             CurrentItemState.zone_id.label("zone_id"),
             func.count(CurrentItemState.epc).label("item_count"),
             func.max(CurrentItemState.last_observed_at).label("as_of"),
+            func.min(CurrentItemState.last_observed_at).label("oldest_item_observed_at"),
             func.min(effective_confidence).label("confidence"),
         )
         .where(

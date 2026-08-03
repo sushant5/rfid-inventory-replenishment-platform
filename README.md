@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.4.0` on Render with PostgreSQL 16. Render may need
+The hosted demo runs release `0.5.0` on Render with PostgreSQL 16. Render may need
 about a minute to wake the free web service after inactivity. Reviewer credentials
 are provided separately and are intentionally not stored in this public repository.
 
@@ -65,7 +65,7 @@ Required commands:
 | `make migrate` | Apply Alembic with the migration-owner credential |
 | `make seed` | Idempotently create Orange and its demo tenant administrator |
 | `make test` | Run unit and PostgreSQL integration tests in an isolated test database |
-| `make demo` | Build/start the stack and run the complete canonical workflow |
+| `make demo` | Build/start the stack and run the complete end-to-end workflow |
 
 Without Make, run the commands shown in the [Makefile](Makefile) directly. Local
 credentials in `docker-compose.yml` are deliberately marked local-only.
@@ -125,11 +125,9 @@ streaming and S3 source-file retention are production extensions, not demo depen
   audit record. The corresponding migration downgrade deliberately refuses to narrow
   the action constraint after such records exist rather than discard audit history.
 
-## Canonical API
+## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.4.0`).
-Earlier prototype routes are retained only as migration-test fixtures and are not
-mounted by the submitted application.
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.5.0`).
 
 The visible contract includes all required endpoints:
 
@@ -176,6 +174,10 @@ after a worker restart, new reads rebuild the evidence window while database
 watermarks and conditional state updates prevent state regression. The demo uses
 gateway reader-coverage status as the reader-health input to confidence; production
 integrations would supply per-reader diagnostics and an adjacency graph.
+
+The hosted event worker is intentionally single-instance. Horizontal production
+workers require `tenant_id:epc` partition affinity and durable or changelog-backed
+evidence windows so all reads for one item reach the same inference state.
 
 ## Replenishment
 
