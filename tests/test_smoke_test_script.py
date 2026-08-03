@@ -11,7 +11,7 @@ def healthy_fetcher(recorder: list[str]) -> Callable[[str, float], JsonObject]:
         if url.endswith("/health/live") or url.endswith("/health/ready"):
             return {"status": "ok"}
         if url.endswith("/version"):
-            return {"version": "0.5.0", "build_sha": "test", "environment": "test"}
+            return {"version": "0.5.1", "build_sha": "test", "environment": "test"}
         return {
             "openapi": "3.1.0",
             "paths": {
@@ -54,7 +54,7 @@ def test_smoke_check_rejects_an_incomplete_openapi_document() -> None:
         if url.endswith("/health/live") or url.endswith("/health/ready"):
             return {"status": "ok"}
         if url.endswith("/version"):
-            return {"version": "0.5.0", "environment": "test"}
+            return {"version": "0.5.1", "environment": "test"}
         return {"openapi": "3.1.0", "paths": {}}
 
     with pytest.raises(RuntimeError, match="missing required paths"):

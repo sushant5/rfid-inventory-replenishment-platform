@@ -13,6 +13,14 @@ engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
     future=True,
+    connect_args={
+        "options": (
+            f"-c statement_timeout={settings.database_statement_timeout_ms} "
+            f"-c lock_timeout={settings.database_lock_timeout_ms} "
+            "-c idle_in_transaction_session_timeout="
+            f"{settings.database_idle_transaction_timeout_ms}"
+        )
+    },
 )
 
 TENANT_CONTEXT_KEY = "tenant_id"
@@ -53,13 +61,15 @@ SessionLocal: sessionmaker[TenantSession] = sessionmaker(
 )
 
 
-def pin_session_to_tenant(session: TenantSession, tenant_id: uuid.UUID) -> TenantSession:
+def pin_session_to_tenant(session: Session, tenant_id: uuid.UUID) -> TenantSession:
     """Bind a new session to one verified tenant before its first transaction.
 
     The binding is immutable. Callers must derive ``tenant_id`` from authenticated
     claims or another trusted registry lookup, never directly from an untrusted body.
     """
 
+    if not isinstance(session, TenantSession):
+        raise TypeError("tenant context requires a TenantSession")
     if not isinstance(tenant_id, uuid.UUID):
         raise TypeError("tenant_id must be a UUID")
 
@@ -76,7 +86,7 @@ def pin_session_to_tenant(session: TenantSession, tenant_id: uuid.UUID) -> Tenan
     return session
 
 
-def get_db() -> Generator[Session]:
+def get_db() -> Generator[TenantSession]:
     """Yield the existing unpinned session dependency.
 
     This remains unpinned while authentication and platform dependencies are migrated

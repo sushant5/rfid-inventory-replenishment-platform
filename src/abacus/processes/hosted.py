@@ -73,6 +73,9 @@ def run() -> int:
             "0.0.0.0",  # noqa: S104 - required by the hosting load balancer.
             "--port",
             _port(),
+            "--proxy-headers",
+            "--forwarded-allow-ips",
+            "*",
         ),
     )
     children: list[subprocess.Popen[bytes]] = []

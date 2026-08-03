@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from abacus.db import TenantSession, get_db, pin_session_to_tenant
+from abacus.db import TenantSession, engine, get_db, pin_session_to_tenant
 from abacus.main import create_app
 
 pytestmark = pytest.mark.integration
@@ -30,6 +30,7 @@ def test_canonical_api_runs_through_restricted_rls_role(postgres_engine: object)
         expire_on_commit=False,
     )
     tenant_code = f"runtime-{uuid.uuid4().hex[:12]}"
+    second_tenant_code = f"runtime-{uuid.uuid4().hex[:12]}"
 
     def override_get_db() -> Generator[Session]:
         with app_sessions() as session:
@@ -57,8 +58,15 @@ def test_canonical_api_runs_through_restricted_rls_role(postgres_engine: object)
                 headers={"X-Platform-Key": os.environ["PLATFORM_API_KEY"]},
                 json={"code": tenant_code, "name": "Runtime Role Tenant"},
             )
+            second_response = client.post(
+                "/v1/tenants",
+                headers={"X-Platform-Key": os.environ["PLATFORM_API_KEY"]},
+                json={"code": second_tenant_code, "name": "Second Runtime Role Tenant"},
+            )
         assert response.status_code == 201, response.text
+        assert second_response.status_code == 201, second_response.text
         tenant_id = uuid.UUID(response.json()["id"])
+        second_tenant_id = uuid.UUID(second_response.json()["id"])
 
         # Missing or wrong tenant context fails closed at PostgreSQL, independently
         # of application query predicates.
@@ -66,9 +74,27 @@ def test_canonical_api_runs_through_restricted_rls_role(postgres_engine: object)
             assert unpinned.scalar(text("SELECT count(*) FROM tenants")) == 0
         with app_sessions() as correct:
             pin_session_to_tenant(correct, tenant_id)
+            # No tenant predicate: PostgreSQL RLS itself hides the second tenant.
             assert correct.scalar(text("SELECT count(*) FROM tenants")) == 1
+        with app_sessions() as second:
+            pin_session_to_tenant(second, second_tenant_id)
+            assert second.scalar(text("SELECT count(*) FROM tenants")) == 1
         with app_sessions() as wrong:
             pin_session_to_tenant(wrong, uuid.uuid4())
             assert wrong.scalar(text("SELECT count(*) FROM tenants")) == 0
     finally:
         app_engine.dispose()
+
+
+def test_runtime_engine_applies_database_timeouts(postgres_engine: object) -> None:
+    del postgres_engine
+    with engine.connect() as connection:
+        configured = connection.execute(
+            text(
+                "SELECT current_setting('statement_timeout'), "
+                "current_setting('lock_timeout'), "
+                "current_setting('idle_in_transaction_session_timeout')"
+            )
+        ).one()
+
+    assert configured == ("30s", "5s", "1min")

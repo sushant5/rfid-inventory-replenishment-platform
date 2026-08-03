@@ -380,6 +380,12 @@ class CurrentItemState(Base):
             "sku_id",
             "zone_id",
         ),
+        Index(
+            "ix_current_item_state_removal_sweep",
+            "tenant_id",
+            "last_observed_at",
+            postgresql_where=text("zone_id IS NOT NULL"),
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(

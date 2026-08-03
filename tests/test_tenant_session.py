@@ -3,8 +3,9 @@ from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import Connection, event
-from sqlalchemy.orm import SessionTransaction
+from sqlalchemy.orm import Session, SessionTransaction
 
+from abacus.api.dependencies import require_tenant_session
 from abacus.db import (
     TENANT_CONTEXT_KEY,
     TenantSession,
@@ -80,6 +81,16 @@ def test_tenant_must_be_bound_before_the_first_transaction() -> None:
 def test_tenant_binding_rejects_unvalidated_string_ids() -> None:
     with pytest.raises(TypeError, match="must be a UUID"):
         pin_session_to_tenant(TenantSession(), "not-a-uuid")  # type: ignore[arg-type]
+
+
+def test_tenant_binding_rejects_plain_sqlalchemy_sessions() -> None:
+    with pytest.raises(TypeError, match="requires a TenantSession"):
+        pin_session_to_tenant(Session(), uuid.uuid4())
+
+
+def test_api_dependency_rejects_plain_sqlalchemy_sessions() -> None:
+    with pytest.raises(RuntimeError, match="must provide a TenantSession"):
+        require_tenant_session(Session())
 
 
 def test_listener_fails_closed_for_corrupted_session_context() -> None:

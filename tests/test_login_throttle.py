@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
+from abacus.api.dependencies import require_tenant_session
 from abacus.api.errors import ApiError
-from abacus.db import get_db
 from abacus.main import create_app
 from abacus.security import (
     LoginAttemptOutcome,
@@ -175,7 +175,7 @@ def test_login_endpoint_limits_unknown_account_and_returns_retry_after(
 
     monkeypatch.setattr("abacus.api.routes.auth.authenticate_user", reject_login)
     app = create_app()
-    app.dependency_overrides[get_db] = object
+    app.dependency_overrides[require_tenant_session] = object
     app.dependency_overrides[get_login_throttle] = lambda: throttle
     with TestClient(app) as client:
         request = {
@@ -211,7 +211,7 @@ def test_login_endpoint_ignores_forwarded_for_and_releases_successful_reservatio
 
     monkeypatch.setattr("abacus.api.routes.auth.authenticate_user", authenticate)
     app = create_app()
-    app.dependency_overrides[get_db] = object
+    app.dependency_overrides[require_tenant_session] = object
     app.dependency_overrides[get_login_throttle] = lambda: throttle
     with TestClient(app) as client:
         base = {"tenant_code": "orange", "email": "user@orange.example"}
@@ -269,7 +269,7 @@ def test_successful_logins_consume_ip_but_not_account_budget(
 
     monkeypatch.setattr("abacus.api.routes.auth.authenticate_user", authenticate)
     app = create_app()
-    app.dependency_overrides[get_db] = object
+    app.dependency_overrides[require_tenant_session] = object
     app.dependency_overrides[get_login_throttle] = lambda: throttle
     with TestClient(app) as client:
         for index in range(3):
@@ -318,7 +318,7 @@ def test_non_authentication_errors_release_the_reservation(monkeypatch: MonkeyPa
 
     monkeypatch.setattr("abacus.api.routes.auth.authenticate_user", authenticate)
     app = create_app()
-    app.dependency_overrides[get_db] = object
+    app.dependency_overrides[require_tenant_session] = object
     app.dependency_overrides[get_login_throttle] = lambda: throttle
     request = {
         "tenant_code": "orange",

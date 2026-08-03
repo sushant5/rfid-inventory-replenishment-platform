@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://abacus:abacus@localhost:5432/abacus"
     migration_database_url: str | None = None
     application_database_role: str = "abacus_app"
+    database_statement_timeout_ms: int = Field(default=30_000, ge=1_000, le=300_000)
+    database_lock_timeout_ms: int = Field(default=5_000, ge=100, le=60_000)
+    database_idle_transaction_timeout_ms: int = Field(
+        default=60_000,
+        ge=1_000,
+        le=600_000,
+    )
     jwt_secret: str = Field(
         default="local-development-secret-change-before-deploy",
         min_length=32,

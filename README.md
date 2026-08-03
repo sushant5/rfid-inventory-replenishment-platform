@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.5.0` on Render with PostgreSQL 16. Render may need
+The hosted demo runs release `0.5.1` on Render with PostgreSQL 16. Render may need
 about a minute to wake the free web service after inactivity. Reviewer credentials
 are provided separately and are intentionally not stored in this public repository.
 
@@ -101,6 +101,8 @@ streaming and S3 source-file retention are production extensions, not demo depen
 
 - Runtime SQL uses `abacus_app`, a `NOSUPERUSER`/`NOBYPASSRLS` role. Alembic alone
   uses the owner credential.
+- Runtime connections enforce statement, lock-wait, and idle-transaction timeouts;
+  schema migrations use a separate owner connection without those request limits.
 - Every tenant transaction sets `app.tenant_id`; forced RLS fails closed when the
   context is absent. Tenant IDs in request bodies are never trusted.
 - Accepted RFID events, retry-batch links, and their durable inbox records commit
@@ -127,7 +129,7 @@ streaming and S3 source-file retention are production extensions, not demo depen
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.5.0`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.5.1`).
 
 The visible contract includes all required endpoints:
 
@@ -143,6 +145,12 @@ Demo authentication uses a platform key, one-time device credentials, and short-
 JWTs. JWTs contain only user and tenant identity; current roles and store assignments
 are loaded from PostgreSQL on every authenticated request. Production SSO/SCIM is an
 explicit extension, not simulated here.
+
+All documented failures use RFC 7807 `application/problem+json`, including validation
+and unexpected server errors. Each failure includes the request ID returned in the
+`X-Request-ID` response header. The hosted launcher trusts forwarded client addresses
+because Render exposes the application port only through its load balancer; local
+Compose does not trust arbitrary proxy headers.
 
 Device discovery returns each reader with its currently effective store/zone
 assignment. Plaintext device tokens are returned only at registration or rotation.

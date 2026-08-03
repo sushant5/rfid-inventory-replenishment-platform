@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
 from abacus.api.errors import ApiError
-from abacus.db import TenantSession, pin_session_to_tenant
+from abacus.db import pin_session_to_tenant
 from abacus.enums import TenantStatus
 from abacus.models.architecture import (
     CanonicalIdentityRole,
@@ -512,8 +512,7 @@ def get_current_principal(
         issuer=settings.jwt_issuer,
         audience=settings.jwt_audience,
     )
-    if isinstance(db, TenantSession):
-        pin_session_to_tenant(db, claims.tenant_id)
+    pin_session_to_tenant(db, claims.tenant_id)
     user = db.scalar(
         select(User).where(
             User.id == claims.user_id,
@@ -622,4 +621,5 @@ def require_permission(permission: Permission) -> Callable[[CurrentPrincipal], P
             )
         return principal
 
+    dependency.__abacus_permission__ = permission.value  # type: ignore[attr-defined]
     return dependency

@@ -16,7 +16,12 @@ from sqlalchemy.orm import Session, sessionmaker
 # The application creates its module-level engine while it is imported. Select the
 # explicitly supplied test database before test modules import any application code.
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+TEST_APP_DATABASE_URL = os.environ.get("TEST_APP_DATABASE_URL")
 if TEST_DATABASE_URL:
+    os.environ["MIGRATION_DATABASE_URL"] = TEST_DATABASE_URL
+if TEST_APP_DATABASE_URL:
+    os.environ["DATABASE_URL"] = TEST_APP_DATABASE_URL
+elif TEST_DATABASE_URL:
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("JWT_SECRET", "postgres-integration-test-jwt-secret-000000000000")
@@ -34,6 +39,18 @@ def _validated_test_database_url() -> str:
             f"{database_name!r} does not contain 'test'."
         )
     return TEST_DATABASE_URL
+
+
+def _validated_test_app_database_url() -> str:
+    if not TEST_APP_DATABASE_URL:
+        pytest.skip("TEST_APP_DATABASE_URL is required for restricted-role API tests")
+    database_name = make_url(TEST_APP_DATABASE_URL).database or ""
+    if "test" not in database_name.lower():
+        raise pytest.UsageError(
+            "Refusing to use application test connection: TEST_APP_DATABASE_URL database name "
+            f"{database_name!r} does not contain 'test'."
+        )
+    return TEST_APP_DATABASE_URL
 
 
 def _reset_public_schema(engine: Engine) -> None:
@@ -74,14 +91,42 @@ def postgres_session_factory(
 
 
 @pytest.fixture(scope="session")
+def application_session_factory(
+    postgres_engine: Engine,
+) -> Generator[sessionmaker[Session]]:
+    from abacus.db import TenantSession
+
+    database_url = _validated_test_app_database_url()
+    application_engine = create_engine(database_url, pool_pre_ping=True)
+    with application_engine.connect() as connection:
+        role = connection.execute(
+            text(
+                "SELECT current_user, rolsuper, rolbypassrls "
+                "FROM pg_catalog.pg_roles WHERE rolname = current_user"
+            )
+        ).one()
+        assert role[0] == os.environ.get("APPLICATION_DATABASE_ROLE", "abacus_app")
+        assert role[1] is False
+        assert role[2] is False
+    try:
+        yield sessionmaker(
+            bind=application_engine,
+            class_=TenantSession,
+            expire_on_commit=False,
+        )
+    finally:
+        application_engine.dispose()
+
+
+@pytest.fixture(scope="session")
 def api_client(
-    postgres_session_factory: sessionmaker[Session],
+    application_session_factory: sessionmaker[Session],
 ) -> Generator[TestClient]:
     from abacus.db import get_db
     from abacus.main import create_app
 
     def override_get_db() -> Generator[Session]:
-        with postgres_session_factory() as session:
+        with application_session_factory() as session:
             yield session
 
     app = create_app()
@@ -92,7 +137,7 @@ def api_client(
 
 @pytest.fixture
 def compatibility_api_client(
-    postgres_session_factory: sessionmaker[Session],
+    application_session_factory: sessionmaker[Session],
 ) -> Generator[TestClient]:
     from abacus.api.routes.catalog import router as catalog_fixture_router
     from abacus.api.routes.onboarding import router as onboarding_fixture_router
@@ -103,7 +148,7 @@ def compatibility_api_client(
     from abacus.main import create_app
 
     def override_get_db() -> Generator[Session]:
-        with postgres_session_factory() as session:
+        with application_session_factory() as session:
             yield session
 
     fixture_router = APIRouter()
