@@ -69,5 +69,10 @@ jobs:
         run: alembic check
       - name: Build image
         run: docker build --tag abacus-rfid-platform:${{ github.sha }} .
+      - name: Smoke-test installed runtime
+        run: >-
+          docker run --rm --entrypoint python
+          abacus-rfid-platform:${{ github.sha }}
+          -c "from abacus.main import app; assert app.openapi()['info']['version']"
       - name: Validate Compose model
         run: docker compose -f docker-compose.yml config --quiet

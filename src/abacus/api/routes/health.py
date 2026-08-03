@@ -2,7 +2,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from alembic.config import Config
 from alembic.script import ScriptDirectory
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -20,10 +19,11 @@ router = APIRouter(tags=["Operations"])
 
 @lru_cache
 def expected_schema_revision() -> str:
-    repository_root = Path(__file__).resolve().parents[4]
-    config = Config(str(repository_root / "alembic.ini"))
-    config.set_main_option("script_location", str(repository_root / "alembic"))
-    heads = ScriptDirectory.from_config(config).get_heads()
+    candidates = (Path.cwd() / "alembic", Path(__file__).resolve().parents[4] / "alembic")
+    script_location = next((path for path in candidates if path.is_dir()), None)
+    if script_location is None:
+        raise RuntimeError("Alembic migration directory is unavailable")
+    heads = ScriptDirectory(str(script_location)).get_heads()
     if len(heads) != 1:
         raise RuntimeError(f"expected one Alembic head, found {len(heads)}")
     return heads[0]
