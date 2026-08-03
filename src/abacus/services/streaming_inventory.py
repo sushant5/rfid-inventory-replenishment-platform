@@ -696,6 +696,11 @@ def process_observation(
         and state.store_id == decision.store_id
         and state.zone_id == decision.zone_id
     ):
+        # Recover confidence as soon as a complete stable window is rebuilt after
+        # a worker handoff. Timestamp refreshes remain throttled, but waiting for
+        # that timer here would suppress safe replenishment despite fresh evidence.
+        if decision.confidence > state.confidence:
+            state.confidence = decision.confidence
         if event.received_at - state.last_received_at >= timedelta(
             seconds=settings.rfid_last_seen_flush_seconds
         ):
