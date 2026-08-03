@@ -12,7 +12,11 @@ from abacus.db import SessionLocal, tenant_session_scope
 from abacus.enums import JobKind
 from abacus.logging import configure_logging
 from abacus.models.jobs import DurableJob
-from abacus.services.catalog import process_catalog_import_job
+from abacus.services.catalog import (
+    mark_catalog_import_failed_after_retry_exhaustion,
+    process_catalog_import_job,
+    reconcile_quarantined_catalog_imports,
+)
 from abacus.services.jobs import claim_jobs, mark_completed, mark_failed, renew_lease
 
 configure_logging()
@@ -77,6 +81,13 @@ def _process_job(tenant_id: uuid.UUID, job: DurableJob, worker_id: str) -> None:
         stop.set()
         heartbeat.join(timeout=2)
         with tenant_session_scope(tenant_id) as db:
+            if job.attempts >= settings.worker_max_attempts:
+                mark_catalog_import_failed_after_retry_exhaustion(
+                    db,
+                    tenant_id=tenant_id,
+                    payload=job.payload,
+                    error=exc,
+                )
             mark_failed(
                 db,
                 job.id,
@@ -107,6 +118,16 @@ def run() -> None:
                     tenant_id=tenant_id,
                     kinds=(JobKind.CATALOG_IMPORT,),
                 )
+                reconciled = reconcile_quarantined_catalog_imports(
+                    db,
+                    tenant_id=tenant_id,
+                )
+                if reconciled:
+                    logger.warning(
+                        "catalog_quarantined_imports_reconciled",
+                        tenant_id=str(tenant_id),
+                        count=reconciled,
+                    )
             for job in jobs:
                 claimed_any = True
                 _process_job(tenant_id, job, worker_id)

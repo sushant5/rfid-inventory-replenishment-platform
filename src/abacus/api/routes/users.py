@@ -4,14 +4,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, status
 
 from abacus.api.dependencies import DatabaseSession
-from abacus.models.identity import IdentityAuditRecord, UserAccessGrant
+from abacus.models.identity import IdentityAuditRecord
 from abacus.schemas.identity import (
+    CanonicalUserCreate,
+    CanonicalUserPage,
+    CanonicalUserRead,
     IdentityAuditPage,
     IdentityAuditRecordRead,
-    RoleAssignmentRead,
-    UserCreate,
-    UserPage,
-    UserRead,
     UserRolesRead,
     UserRolesReplace,
     UserStoreAssignmentsRead,
@@ -19,8 +18,9 @@ from abacus.schemas.identity import (
 )
 from abacus.security import Permission, Principal, require_permission
 from abacus.services.identity import (
-    UserRecord,
-    create_user,
+    CanonicalUserRecord,
+    canonicalize_user_record,
+    create_canonical_user,
     get_user,
     list_audit_records,
     list_users,
@@ -40,19 +40,16 @@ CanReadIdentityAudit = Annotated[
 ]
 
 
-def _role_assignment_read(grant: UserAccessGrant) -> RoleAssignmentRead:
-    return RoleAssignmentRead(role=grant.role, store_id=grant.store_id)
-
-
-def _user_read(record: UserRecord) -> UserRead:
+def _user_read(record: CanonicalUserRecord) -> CanonicalUserRead:
     user = record.user
-    return UserRead(
+    return CanonicalUserRead(
         id=user.id,
         tenant_id=user.tenant_id,
         email=user.email,
         display_name=user.display_name,
         status=user.status,
-        role_assignments=[_role_assignment_read(grant) for grant in record.grants],
+        roles=list(record.roles),
+        store_ids=list(record.store_ids),
         last_login_at=user.last_login_at,
         created_at=user.created_at,
         updated_at=user.updated_at,
@@ -65,21 +62,21 @@ def _audit_read(record: IdentityAuditRecord) -> IdentityAuditRecordRead:
 
 @router.post(
     "",
-    response_model=UserRead,
+    response_model=CanonicalUserRead,
     status_code=status.HTTP_201_CREATED,
     operation_id="createUser",
 )
 def create_user_endpoint(
-    request: UserCreate,
+    request: CanonicalUserCreate,
     db: DatabaseSession,
     principal: CanCreateUsers,
-) -> UserRead:
-    return _user_read(create_user(db, principal, request))
+) -> CanonicalUserRead:
+    return _user_read(create_canonical_user(db, principal, request))
 
 
 @router.get(
     "",
-    response_model=UserPage,
+    response_model=CanonicalUserPage,
     operation_id="listUsers",
 )
 def list_users_endpoint(
@@ -88,7 +85,7 @@ def list_users_endpoint(
     store_id: Annotated[uuid.UUID | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> UserPage:
+) -> CanonicalUserPage:
     records, total = list_users(
         db,
         principal,
@@ -96,8 +93,8 @@ def list_users_endpoint(
         limit=limit,
         offset=offset,
     )
-    return UserPage(
-        items=[_user_read(record) for record in records],
+    return CanonicalUserPage(
+        items=[_user_read(canonicalize_user_record(db, record, principal)) for record in records],
         total=total,
         limit=limit,
         offset=offset,
@@ -126,15 +123,15 @@ def list_identity_audit_records_endpoint(
 
 @router.get(
     "/{user_id}",
-    response_model=UserRead,
+    response_model=CanonicalUserRead,
     operation_id="getUser",
 )
 def get_user_endpoint(
     user_id: uuid.UUID,
     db: DatabaseSession,
     principal: CanReadUsers,
-) -> UserRead:
-    return _user_read(get_user(db, principal, user_id))
+) -> CanonicalUserRead:
+    return _user_read(canonicalize_user_record(db, get_user(db, principal, user_id), principal))
 
 
 @router.put(
@@ -169,12 +166,12 @@ def replace_user_store_assignments_endpoint(
 
 @router.post(
     "/{user_id}:suspend",
-    response_model=UserRead,
+    response_model=CanonicalUserRead,
     operation_id="suspendUser",
 )
 def suspend_user_endpoint(
     user_id: uuid.UUID,
     db: DatabaseSession,
     principal: CanSuspendUsers,
-) -> UserRead:
-    return _user_read(suspend_user(db, principal, user_id))
+) -> CanonicalUserRead:
+    return _user_read(canonicalize_user_record(db, suspend_user(db, principal, user_id), principal))

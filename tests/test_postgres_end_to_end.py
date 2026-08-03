@@ -11,6 +11,7 @@ from scripts.generate_store_batch import build_store_batch
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from abacus.api.routes.health import EXPECTED_SCHEMA_REVISION
 from abacus.enums import JobKind, JobStatus, ObservationStatus, TenantStatus, ZoneKind
 from abacus.models.catalog import CatalogImport, EpcBinding, Sku
 from abacus.models.identity import IdentityRole
@@ -304,12 +305,15 @@ def test_postgres_end_to_end(
     assert stale_schema_health.status_code == 503
     assert stale_schema_health.json()["code"] == "schema_not_ready"
     with postgres_session_factory() as db:
-        db.execute(text("UPDATE alembic_version SET version_num = 'a6f0c4d1e537'"))
+        db.execute(
+            text("UPDATE alembic_version SET version_num = :revision"),
+            {"revision": EXPECTED_SCHEMA_REVISION},
+        )
         db.commit()
     assert _expect(client.get("/health/ready"), 200) == {"status": "ok"}
     version = _expect(client.get("/version"), 200)
     assert isinstance(version, dict)
-    assert version["version"] == "0.2.0"
+    assert version["version"] == "0.3.0"
     assert (
         client.get(
             "/v1/platform/tenants/00000000-0000-0000-0000-000000000000/stores",
@@ -540,9 +544,10 @@ def test_postgres_end_to_end(
         "admin@blue.example",
         ADMIN_PASSWORD,
     )
-    current_admin = _expect(client.get("/v1/auth/me", headers=_bearer(admin_a_token)), 200)
+    current_admin = _expect(client.get("/v1/me", headers=_bearer(admin_a_token)), 200)
     assert isinstance(current_admin, dict)
     assert current_admin["user_id"] == admin_a_id
+    assert current_admin["roles"] == ["TENANT_ADMIN"]
     assert "policy:manage" in current_admin["permissions"]
 
     manager = _expect(
@@ -553,14 +558,48 @@ def test_postgres_end_to_end(
                 "email": "manager.la01@orange.example",
                 "display_name": "LA01 Manager",
                 "password": MANAGER_PASSWORD,
-                "role_assignments": [
-                    {"role": "STORE_MANAGER", "store_id": store_1_id},
-                ],
+                "roles": ["STORE_MANAGER"],
+                "store_ids": [store_1_id],
             },
         ),
         201,
     )
     assert isinstance(manager, dict)
+    assert manager["roles"] == ["STORE_MANAGER"]
+    assert manager["store_ids"] == [store_1_id]
+    manager_id = str(manager["id"])
+    invalid_role_replacement = client.put(
+        f"/v1/users/{manager_id}/roles",
+        headers=_bearer(admin_a_token),
+        json={"roles": ["CORPORATE_USER"]},
+    )
+    assert invalid_role_replacement.status_code == 422
+    assert invalid_role_replacement.json()["code"] == "store_assignment_not_allowed"
+    invalid_assignment_replacement = client.put(
+        f"/v1/users/{manager_id}/store-assignments",
+        headers=_bearer(admin_a_token),
+        json={"store_ids": []},
+    )
+    assert invalid_assignment_replacement.status_code == 422
+    assert invalid_assignment_replacement.json()["code"] == "store_assignment_required"
+    valid_role_replacement = _expect(
+        client.put(
+            f"/v1/users/{manager_id}/roles",
+            headers=_bearer(admin_a_token),
+            json={"roles": ["STORE_ASSOCIATE"]},
+        ),
+        200,
+    )
+    assert isinstance(valid_role_replacement, dict)
+    assert valid_role_replacement["roles"] == ["STORE_ASSOCIATE"]
+    _expect(
+        client.put(
+            f"/v1/users/{manager_id}/roles",
+            headers=_bearer(admin_a_token),
+            json={"roles": ["STORE_MANAGER"]},
+        ),
+        200,
+    )
     manager_token = _login(
         client,
         "orange",
@@ -575,9 +614,8 @@ def test_postgres_end_to_end(
             "email": "other.manager@orange.example",
             "display_name": "Other Manager",
             "password": MANAGER_PASSWORD,
-            "role_assignments": [
-                {"role": "STORE_MANAGER", "store_id": store_1_id},
-            ],
+            "roles": ["STORE_MANAGER"],
+            "store_ids": [store_1_id],
         },
     )
     assert forbidden_delegation.status_code == 403
@@ -590,9 +628,8 @@ def test_postgres_end_to_end(
             "email": "associate.la02@orange.example",
             "display_name": "LA02 Associate",
             "password": ASSOCIATE_PASSWORD,
-            "role_assignments": [
-                {"role": "STORE_ASSOCIATE", "store_id": store_2_id},
-            ],
+            "roles": ["STORE_ASSOCIATE"],
+            "store_ids": [store_2_id],
         },
     )
     assert out_of_store_delegation.status_code == 403
@@ -606,9 +643,8 @@ def test_postgres_end_to_end(
                 "email": "associate.one@orange.example",
                 "display_name": "Associate One",
                 "password": ASSOCIATE_PASSWORD,
-                "role_assignments": [
-                    {"role": "STORE_ASSOCIATE", "store_id": store_1_id},
-                ],
+                "roles": ["STORE_ASSOCIATE"],
+                "store_ids": [store_1_id],
             },
         ),
         201,
@@ -621,9 +657,8 @@ def test_postgres_end_to_end(
                 "email": "associate.two@orange.example",
                 "display_name": "Associate Two",
                 "password": SECOND_ASSOCIATE_PASSWORD,
-                "role_assignments": [
-                    {"role": "STORE_ASSOCIATE", "store_id": store_1_id},
-                ],
+                "roles": ["STORE_ASSOCIATE"],
+                "store_ids": [store_1_id],
             },
         ),
         201,
@@ -651,6 +686,56 @@ def test_postgres_end_to_end(
         "associate.two@orange.example",
         "manager.la01@orange.example",
     }
+    cross_store_associate = _expect(
+        client.post(
+            "/v1/users",
+            headers=_bearer(admin_a_token),
+            json={
+                "email": "associate.cross-store@orange.example",
+                "display_name": "Cross Store Associate",
+                "password": "Cross-Store-Associate-1234",
+                "roles": ["STORE_ASSOCIATE"],
+                "store_ids": [store_1_id, store_2_id],
+            },
+        ),
+        201,
+    )
+    assert isinstance(cross_store_associate, dict)
+    manager_view = _expect(
+        client.get(
+            f"/v1/users/{cross_store_associate['id']}",
+            headers=_bearer(manager_token),
+        ),
+        200,
+    )
+    assert isinstance(manager_view, dict)
+    assert manager_view["store_ids"] == [store_1_id]
+
+    corporate_user = _expect(
+        client.post(
+            "/v1/users",
+            headers=_bearer(admin_a_token),
+            json={
+                "email": "corporate.user@orange.example",
+                "display_name": "Corporate User",
+                "password": "Corporate-User-Read-1234",
+                "roles": ["CORPORATE_USER"],
+                "store_ids": [],
+            },
+        ),
+        201,
+    )
+    assert isinstance(corporate_user, dict)
+    corporate_token = _login(
+        client,
+        "orange",
+        "corporate.user@orange.example",
+        "Corporate-User-Read-1234",
+    )
+    corporate_me = _expect(client.get("/v1/me", headers=_bearer(corporate_token)), 200)
+    assert isinstance(corporate_me, dict)
+    assert corporate_me["roles"] == ["CORPORATE_USER"]
+    assert corporate_me["store_ids"] == []
     audit = _expect(
         client.get("/v1/users/audit-records", headers=_bearer(admin_a_token)),
         200,
@@ -1172,6 +1257,35 @@ def test_postgres_end_to_end(
         )
     quantities = {str(item["zone_kind"]): int(item["quantity"]) for item in inventory["items"]}
     assert quantities == {"BACKROOM": 3, "SALES_FLOOR": 2}
+    assert (
+        client.get(
+            f"/v1/stores/{store_1_id}/inventory",
+            headers=_bearer(manager_token),
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            f"/v1/stores/{store_2_id}/inventory",
+            headers=_bearer(manager_token),
+        ).status_code
+        == 403
+    )
+    for corporate_store_id in (store_1_id, store_2_id):
+        assert (
+            client.get(
+                f"/v1/stores/{corporate_store_id}/inventory",
+                headers=_bearer(corporate_token),
+            ).status_code
+            == 200
+        )
+    assert (
+        client.get(
+            f"/v1/stores/{store_1_id}/inventory",
+            headers=_bearer(admin_b_token),
+        ).status_code
+        == 404
+    )
     first_inventory_page = _expect(
         client.get(
             f"/v1/tenants/{tenant_a_id}/inventory",
@@ -1504,10 +1618,8 @@ def test_postgres_end_to_end(
                 "email": "mixed.scope@orange.example",
                 "display_name": "Mixed Scope User",
                 "password": MIXED_ROLE_PASSWORD,
-                "role_assignments": [
-                    {"role": "STORE_MANAGER", "store_id": store_2_id},
-                    {"role": "STORE_ASSOCIATE", "store_id": store_1_id},
-                ],
+                "roles": ["STORE_MANAGER"],
+                "store_ids": [store_2_id],
             },
         ),
         201,
@@ -1525,7 +1637,7 @@ def test_postgres_end_to_end(
         json={"status": "CANCELLED", "expected_version": 1},
     )
     assert cross_scope_cancel.status_code == 403
-    assert cross_scope_cancel.json()["code"] == "task_management_permission_required"
+    assert cross_scope_cancel.json()["code"] == "store_scope_denied"
 
     associate_cancel = client.patch(
         f"/v1/tenants/{tenant_a_id}/replenishment/tasks/{task_id}",
@@ -2075,7 +2187,7 @@ def test_postgres_end_to_end(
     )
     assert isinstance(suspended_associate, dict)
     assert suspended_associate["status"] == "SUSPENDED"
-    assert client.get("/v1/auth/me", headers=_bearer(associate_two_token)).status_code == 401
+    assert client.get("/v1/me", headers=_bearer(associate_two_token)).status_code == 401
 
     # Effective-dated device history is queryable and rejects cross-tenant locations.
     assignment_history = _expect(

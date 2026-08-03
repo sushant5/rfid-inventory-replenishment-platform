@@ -154,7 +154,6 @@ def create_scoped_user(
     *,
     email: str,
     password: str,
-    initial_store_id: str,
     role: str,
     store_ids: list[str],
 ) -> str:
@@ -167,22 +166,11 @@ def create_scoped_user(
             "email": email,
             "display_name": f"Demo {role.replace('_', ' ').title()}",
             "password": password,
-            "role_assignments": [{"role": "STORE_ASSOCIATE", "store_id": initial_store_id}],
+            "roles": [role],
+            "store_ids": store_ids,
         },
     )
-    user_id = str(required(object_result(created, "user"), "id"))
-    client.request(
-        "PUT",
-        f"/v1/users/{user_id}/roles",
-        headers=bearer(admin_token),
-        payload={"roles": [role]},
-    )
-    client.request(
-        "PUT",
-        f"/v1/users/{user_id}/store-assignments",
-        headers=bearer(admin_token),
-        payload={"store_ids": store_ids},
-    )
+    required(object_result(created, "user"), "id")
     return login(client, email, password)
 
 
@@ -357,13 +345,13 @@ def run(args: argparse.Namespace) -> None:
     floor_batch = submit_batch(
         client,
         device_id=str(required(floor_device, "id")),
-        device_token=str(required(devices["floor"], "api_key")),
+        device_token=str(required(devices["floor"], "device_token")),
         observations=floor_observations,
     )
     back_batch = submit_batch(
         client,
         device_id=str(required(back_device, "id")),
-        device_token=str(required(devices["backroom"], "api_key")),
+        device_token=str(required(devices["backroom"], "device_token")),
         observations=back_observations,
     )
     wait_for_batch(client, admin_token, floor_batch, args.poll_timeout)
@@ -391,14 +379,14 @@ def run(args: argparse.Namespace) -> None:
     duplicate_batch = submit_batch(
         client,
         device_id=str(required(floor_device, "id")),
-        device_token=str(required(devices["floor"], "api_key")),
+        device_token=str(required(devices["floor"], "device_token")),
         observations=[floor_observations[0]],
     )
     wait_for_batch(client, admin_token, duplicate_batch, args.poll_timeout)
     late_batch = submit_batch(
         client,
         device_id=str(required(floor_device, "id")),
-        device_token=str(required(devices["floor"], "api_key")),
+        device_token=str(required(devices["floor"], "device_token")),
         observations=[
             observation(str(uuid.uuid4()), EPCS[0], base_time + timedelta(seconds=1), -30)
         ],
@@ -429,7 +417,6 @@ def run(args: argparse.Namespace) -> None:
         admin_token,
         email=associate_email,
         password=associate_password,
-        initial_store_id=store1_id,
         role="STORE_ASSOCIATE",
         store_ids=[store1_id],
     )

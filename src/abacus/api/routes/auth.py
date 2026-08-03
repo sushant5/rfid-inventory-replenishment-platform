@@ -4,14 +4,10 @@ from fastapi import APIRouter, Request
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
 from abacus.api.errors import ApiError
-from abacus.models.architecture import CanonicalIdentityRole
-from abacus.models.identity import IdentityRole
 from abacus.schemas.identity import (
     AccessTokenRead,
     CanonicalPrincipalRead,
-    CurrentPrincipalRead,
     LoginRequest,
-    RoleAssignmentRead,
 )
 from abacus.security import (
     CurrentPrincipal,
@@ -97,41 +93,10 @@ def login_endpoint(
     return response
 
 
-@router.get(
-    "/me",
-    response_model=CurrentPrincipalRead,
-    operation_id="getCurrentUser",
-    include_in_schema=False,
-)
-def current_user_endpoint(principal: CurrentPrincipal) -> CurrentPrincipalRead:
-    legacy_role = {
-        CanonicalIdentityRole.TENANT_ADMIN: IdentityRole.CORPORATE_ADMIN,
-        CanonicalIdentityRole.STORE_MANAGER: IdentityRole.STORE_MANAGER,
-        CanonicalIdentityRole.STORE_ASSOCIATE: IdentityRole.STORE_ASSOCIATE,
-    }
-    return CurrentPrincipalRead(
-        user_id=principal.user_id,
-        tenant_id=principal.tenant_id,
-        email=principal.email,
-        display_name=principal.display_name,
-        role_assignments=[
-            RoleAssignmentRead(
-                role=(
-                    scope.role if isinstance(scope.role, IdentityRole) else legacy_role[scope.role]
-                ),
-                store_id=scope.store_id,
-            )
-            for scope in principal.role_scopes
-            if scope.role != CanonicalIdentityRole.CORPORATE_USER
-        ],
-        permissions=sorted(permission.value for permission in principal.permissions),
-    )
-
-
 @canonical_router.get(
     "/me",
     response_model=CanonicalPrincipalRead,
-    operation_id="getCurrentUserCanonical",
+    operation_id="getCurrentUser",
 )
 def canonical_current_user_endpoint(principal: CurrentPrincipal) -> CanonicalPrincipalRead:
     return CanonicalPrincipalRead(

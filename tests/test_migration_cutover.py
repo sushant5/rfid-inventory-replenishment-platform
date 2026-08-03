@@ -46,6 +46,7 @@ def test_populated_active_task_cutover_requires_review_before_baselining() -> No
     migration_engine = None
     project_root = Path(__file__).resolve().parents[1]
     original_database_url = os.environ.get("DATABASE_URL")
+    original_migration_database_url = os.environ.get("MIGRATION_DATABASE_URL")
 
     try:
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
@@ -53,6 +54,10 @@ def test_populated_active_task_cutover_requires_review_before_baselining() -> No
 
         migration_url_text = migration_url.render_as_string(hide_password=False)
         os.environ["DATABASE_URL"] = migration_url_text
+        # Docker Compose supplies MIGRATION_DATABASE_URL for the main test database.
+        # Point both settings at this isolated migration database so `make test`
+        # exercises the same database that this test creates.
+        os.environ["MIGRATION_DATABASE_URL"] = migration_url_text
         get_settings.cache_clear()
         command.upgrade(_alembic_config(project_root), "c421c8a25f4e")
         migration_engine = create_engine(migration_url)
@@ -532,6 +537,10 @@ def test_populated_active_task_cutover_requires_review_before_baselining() -> No
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = original_database_url
+        if original_migration_database_url is None:
+            os.environ.pop("MIGRATION_DATABASE_URL", None)
+        else:
+            os.environ["MIGRATION_DATABASE_URL"] = original_migration_database_url
         get_settings.cache_clear()
         with admin_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
             connection.execute(

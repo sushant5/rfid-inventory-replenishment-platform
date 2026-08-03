@@ -5,7 +5,7 @@
 # out of the long-running application container.
 services:
   - type: web
-    name: abacus-take-home-api
+    name: abacus-orange-sushant-api
     runtime: docker
     plan: free
     region: oregon

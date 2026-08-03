@@ -11,7 +11,7 @@ from abacus.config import Settings
 from abacus.enums import DeviceStatus
 from abacus.events.rfid import RfidObservationEvent
 from abacus.models.architecture import CurrentItemState, FreshnessStatus, StoreConnectivity
-from abacus.models.catalog import Sku
+from abacus.models.catalog import EpcBinding, Sku
 from abacus.models.identity import IdentityRole
 from abacus.models.tenancy import Device, DeviceAssignment
 from abacus.security import Principal, RoleScope
@@ -20,9 +20,35 @@ from abacus.services.streaming_inventory import (
     ProcessingResult,
     RecentObservationState,
     _resolve_effective_assignment,
+    effective_bucket_confidence,
     effective_freshness,
     process_observation,
 )
+
+
+@pytest.mark.parametrize(
+    ("projected_quantity", "current_item_count", "current_confidence", "expected"),
+    [
+        (0, None, None, 1.0),
+        (1, None, None, 0.0),
+        (2, 1, 0.9, 0.0),
+        (2, 2, 0.9, 0.9),
+    ],
+)
+def test_bucket_confidence_fails_safe_while_projection_quantity_lags(
+    projected_quantity: int,
+    current_item_count: int | None,
+    current_confidence: float | None,
+    expected: float,
+) -> None:
+    assert (
+        effective_bucket_confidence(
+            projected_quantity=projected_quantity,
+            current_item_count=current_item_count,
+            current_confidence=current_confidence,
+        )
+        == expected
+    )
 
 
 def _settings() -> Settings:
@@ -184,15 +210,18 @@ def test_future_observation_is_quarantined_before_connectivity_or_assignment(
     assert quarantined == ["OBSERVED_AT_TOO_FAR_IN_FUTURE"]
 
 
-def test_same_zone_read_advances_durable_event_watermark_but_throttles_received_at(
+@pytest.mark.parametrize(("event_offset_seconds", "should_flush"), [(10, False), (31, True)])
+def test_same_zone_read_throttles_current_item_last_seen_refresh(
     monkeypatch: pytest.MonkeyPatch,
+    event_offset_seconds: int,
+    should_flush: bool,
 ) -> None:
     base = datetime.now(UTC) - timedelta(minutes=1)
     store_id = uuid.uuid4()
     zone_id = uuid.uuid4()
     event = _event(
-        observed_at=base + timedelta(seconds=10),
-        received_at=base + timedelta(seconds=10),
+        observed_at=base + timedelta(seconds=event_offset_seconds),
+        received_at=base + timedelta(seconds=event_offset_seconds),
         store_id=store_id,
         zone_id=zone_id,
     )
@@ -214,10 +243,9 @@ def test_same_zone_read_advances_durable_event_watermark_but_throttles_received_
         confidence=0.9,
         state_version=1,
     )
-    tag = MagicMock(active=True, sku_id=state.sku_id)
+    binding = MagicMock(spec=EpcBinding, sku_id=state.sku_id)
     db = MagicMock(spec=Session)
-    db.get.return_value = tag
-    db.scalar.return_value = state
+    db.scalar.side_effect = [binding, state, base]
     monkeypatch.setattr(
         streaming_inventory,
         "_resolve_effective_assignment",
@@ -229,8 +257,9 @@ def test_same_zone_read_advances_durable_event_watermark_but_throttles_received_
     result = process_observation(db, event, RecentObservationState(), _settings())
 
     assert result.disposition == "PROCESSED"
-    assert state.last_observed_at == event.observed_at
-    assert state.last_received_at == base
+    expected_last_seen = event.observed_at if should_flush else base
+    assert state.last_observed_at == expected_last_seen
+    assert state.last_received_at == expected_last_seen
 
 
 def test_unlocated_item_requires_tenant_wide_inventory_permission() -> None:

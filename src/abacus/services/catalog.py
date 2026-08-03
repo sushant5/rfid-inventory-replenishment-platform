@@ -11,13 +11,13 @@ from pathlib import PurePath
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from abacus.api.errors import ApiError
 from abacus.db import TenantSession, pin_session_to_tenant
-from abacus.enums import JobKind
+from abacus.enums import JobKind, JobStatus
 from abacus.models.architecture import Product, ProductVariant, RfidTag
 from abacus.models.catalog import (
     CatalogImport,
@@ -31,6 +31,7 @@ from abacus.models.catalog import (
     ProductStyle,
     Sku,
 )
+from abacus.models.jobs import DurableJob
 from abacus.models.tenancy import Tenant
 from abacus.schemas.catalog import CatalogRowData, normalize_epc
 from abacus.services.jobs import enqueue_job
@@ -1290,3 +1291,91 @@ def process_catalog_import_job(db: Session, payload: dict[str, object]) -> None:
     if raw_import_id is None:
         raise ValueError("catalog import job is missing import_id")
     promote_catalog_import(db, uuid.UUID(str(raw_import_id)))
+
+
+def mark_catalog_import_failed_after_retry_exhaustion(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    payload: dict[str, object],
+    error: Exception,
+) -> bool:
+    """Stage a terminal import failure for the durable job transaction to commit.
+
+    The caller must invoke ``mark_failed`` in the same session. Its compare-and-set
+    commit makes this update atomic with quarantining the job, while a lost lease
+    rolls both changes back.
+    """
+
+    raw_import_id = payload.get("import_id")
+    if raw_import_id is None:
+        return False
+    try:
+        import_id = uuid.UUID(str(raw_import_id))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    catalog_import = db.scalar(
+        select(CatalogImport)
+        .where(
+            CatalogImport.id == import_id,
+            CatalogImport.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    )
+    if catalog_import is None or catalog_import.status in {
+        CatalogImportStatus.COMPLETED,
+        CatalogImportStatus.REJECTED,
+        CatalogImportStatus.FAILED,
+    }:
+        return False
+
+    catalog_import.status = CatalogImportStatus.FAILED
+    catalog_import.failure_reason = (
+        f"Catalog worker retry budget exhausted: {type(error).__name__}: {error}"
+    )[:2000]
+    return True
+
+
+def reconcile_quarantined_catalog_imports(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    limit: int = 100,
+) -> int:
+    """Terminalize imports whose durable jobs were quarantined after a worker crash."""
+
+    if limit < 1:
+        raise ValueError("limit must be positive")
+
+    stranded = db.execute(
+        select(DurableJob, CatalogImport)
+        .join(
+            CatalogImport,
+            (CatalogImport.tenant_id == DurableJob.tenant_id)
+            & (DurableJob.payload["import_id"].as_string() == cast(CatalogImport.id, String)),
+        )
+        .where(
+            DurableJob.tenant_id == tenant_id,
+            DurableJob.kind == JobKind.CATALOG_IMPORT,
+            DurableJob.status == JobStatus.QUARANTINED,
+            CatalogImport.status.not_in(
+                (
+                    CatalogImportStatus.COMPLETED,
+                    CatalogImportStatus.REJECTED,
+                    CatalogImportStatus.FAILED,
+                )
+            ),
+        )
+        .order_by(DurableJob.created_at.asc())
+        .with_for_update(of=CatalogImport, skip_locked=True)
+        .limit(limit)
+    ).all()
+
+    for job, catalog_import in stranded:
+        detail = job.last_error or "Retry budget exhausted without a recorded worker error"
+        catalog_import.status = CatalogImportStatus.FAILED
+        catalog_import.failure_reason = f"Catalog worker job quarantined: {detail}"[:2000]
+
+    db.commit()
+    return len(stranded)

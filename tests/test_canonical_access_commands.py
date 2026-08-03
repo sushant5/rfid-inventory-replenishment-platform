@@ -9,7 +9,11 @@ from abacus.models.identity import IdentityRole
 from abacus.schemas.identity import UserRolesReplace, UserStoreAssignmentsReplace
 from abacus.schemas.tenancy import StoreDeviceCreate
 from abacus.security import Principal, RoleScope
-from abacus.services.identity import _compatibility_grant_specs, replace_user_roles
+from abacus.services.identity import (
+    _compatibility_grant_specs,
+    _ensure_valid_canonical_access_pair,
+    replace_user_roles,
+)
 
 
 def _store_manager() -> Principal:
@@ -79,3 +83,30 @@ def test_only_tenant_admin_can_replace_roles() -> None:
 
     assert error.value.status_code == 403
     assert error.value.code == "role_assignment_forbidden"
+
+
+@pytest.mark.parametrize(
+    ("roles", "store_ids", "expected_code"),
+    [
+        (
+            frozenset({CanonicalIdentityRole.STORE_MANAGER}),
+            frozenset(),
+            "store_assignment_required",
+        ),
+        (
+            frozenset({CanonicalIdentityRole.CORPORATE_USER}),
+            frozenset({uuid.uuid4()}),
+            "store_assignment_not_allowed",
+        ),
+    ],
+)
+def test_access_replacements_cannot_leave_an_invalid_role_store_pair(
+    roles: frozenset[CanonicalIdentityRole],
+    store_ids: frozenset[uuid.UUID],
+    expected_code: str,
+) -> None:
+    with pytest.raises(ApiError) as error:
+        _ensure_valid_canonical_access_pair(roles, store_ids)
+
+    assert error.value.status_code == 422
+    assert error.value.code == expected_code

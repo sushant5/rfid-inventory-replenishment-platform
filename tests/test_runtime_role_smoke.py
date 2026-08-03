@@ -50,6 +50,8 @@ def test_canonical_api_runs_through_restricted_rls_role(postgres_engine: object)
         app = create_app()
         app.dependency_overrides[get_db] = override_get_db
         with TestClient(app) as client:
+            ready = client.get("/health/ready")
+            assert ready.status_code == 200, ready.text
             response = client.post(
                 "/v1/tenants",
                 headers={"X-Platform-Key": os.environ["PLATFORM_API_KEY"]},

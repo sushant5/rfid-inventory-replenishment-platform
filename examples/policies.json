@@ -1,17 +1,12 @@
 {
-  "policies": [
+  "name": "Orange shirts floor policy",
+  "description": "Maintain three units of each shirt SKU on the sales floor.",
+  "rules": [
     {
-      "external_key": "orange-trail-default",
-      "store_id": null,
-      "selector_type": "SKU",
-      "selector_value": "SKU-TRAIL-BLUE-M",
-      "minimum_floor_quantity": 3,
-      "target_floor_quantity": 6,
-      "maximum_floor_quantity": 8,
-      "priority": 100,
-      "effective_from": "2026-01-01T00:00:00Z",
-      "effective_to": null,
-      "active": true
+      "category": "SHIRTS",
+      "min_floor_qty": 2,
+      "target_floor_qty": 3,
+      "priority": 100
     }
   ]
 }

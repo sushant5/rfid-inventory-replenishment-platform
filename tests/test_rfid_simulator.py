@@ -60,6 +60,20 @@ def test_duplicate_retry_reuses_exact_event_in_a_separate_batch() -> None:
     assert batches[0].as_payload() == batches[1].as_payload()
 
 
+def test_event_id_conflict_reuses_identity_but_changes_immutable_payload() -> None:
+    batches = build_scenario("event-id-conflict", seed=1, start_at=START)
+
+    assert len(batches) == 2
+    first = batches[0].observations[0]
+    conflicting = batches[1].observations[0]
+    assert first.event_id == conflicting.event_id
+    assert first.epc == conflicting.epc
+    assert first.observed_at == conflicting.observed_at
+    assert first.rssi != conflicting.rssi
+    assert batches[0].expected_http_status == 202
+    assert batches[1].expected_http_status == 409
+
+
 def test_repeated_and_stationary_scenarios_represent_one_physical_epc() -> None:
     repeated = build_scenario("repeated-reads", seed=2, start_at=START, count=27)
     burst = build_scenario("large-stationary-burst", seed=2, start_at=START, count=1000)

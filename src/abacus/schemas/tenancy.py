@@ -212,6 +212,12 @@ class DeviceCredentialRead(ApiModel):
     warning: str = "This credential is shown once. Store it securely."
 
 
+class DeviceTokenRead(ApiModel):
+    device_id: uuid.UUID
+    device_token: str
+    warning: str = "This credential is shown once. Store it securely."
+
+
 class DeviceAssignmentCreate(ApiModel):
     store_id: uuid.UUID
     zone_id: uuid.UUID
@@ -235,8 +241,13 @@ class DeviceAssignmentRead(ApiModel):
     effective_to: datetime | None
 
 
+class StoreDeviceMappingRead(ApiModel):
+    device: DeviceRead
+    assignment: DeviceAssignmentRead
+
+
 class StoreDeviceRegistrationRead(ApiModel):
     device: DeviceRead
     assignment: DeviceAssignmentRead
-    api_key: str
+    device_token: str
     warning: str = "This credential is shown once. Store it securely."

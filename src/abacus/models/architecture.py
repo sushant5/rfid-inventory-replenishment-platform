@@ -216,6 +216,13 @@ class RfidObservationEventLedger(Base):
             "first_received_at",
             postgresql_where=text("processing_status = 'PENDING'"),
         ),
+        Index(
+            "ix_rfid_events_processed_epc_watermark",
+            "tenant_id",
+            "epc",
+            text("observed_at DESC"),
+            postgresql_where=text("processing_status = 'PROCESSED'"),
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(

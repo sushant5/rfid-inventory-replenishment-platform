@@ -71,7 +71,7 @@ def _catalog_import_tenant_id(db: DatabaseSession, import_id: uuid.UUID) -> uuid
     "/v1/tenants/{tenant_id}/catalog-imports",
     response_model=CatalogImportRead,
     status_code=status.HTTP_202_ACCEPTED,
-    operation_id="createCatalogImportCanonical",
+    operation_id="createCatalogImport",
     summary="Stage and validate a product-master CSV",
 )
 @router.post(
@@ -148,7 +148,7 @@ def get_catalog_import_endpoint(
 @canonical_router.get(
     "/v1/catalog-imports/{import_id}",
     response_model=CatalogImportRead,
-    operation_id="getCatalogImportCanonical",
+    operation_id="getCatalogImport",
 )
 def get_catalog_import_canonical_endpoint(
     import_id: uuid.UUID,
@@ -190,7 +190,7 @@ def list_catalog_import_errors_endpoint(
 @canonical_router.get(
     "/v1/catalog-imports/{import_id}/errors",
     response_model=CatalogImportErrorListRead,
-    operation_id="listCatalogImportErrorsCanonical",
+    operation_id="listCatalogImportErrors",
 )
 def list_catalog_import_errors_canonical_endpoint(
     import_id: uuid.UUID,
@@ -213,6 +213,49 @@ def list_catalog_import_errors_canonical_endpoint(
         limit=limit,
         offset=offset,
     )
+
+
+@canonical_router.get(
+    "/v1/skus",
+    response_model=SkuListRead,
+    operation_id="listSkus",
+)
+def list_skus_canonical_endpoint(
+    db: DatabaseSession,
+    principal: CanReadCatalog,
+    active: bool | None = True,
+    code: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> SkuListRead:
+    rows, total = list_skus(
+        db,
+        principal.tenant_id,
+        active=active,
+        code=code,
+        limit=limit,
+        offset=offset,
+    )
+    return SkuListRead(
+        items=[_sku_read(sku, style) for sku, style in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@canonical_router.get(
+    "/v1/skus/{sku_id}",
+    response_model=SkuRead,
+    operation_id="getSku",
+)
+def get_sku_canonical_endpoint(
+    sku_id: uuid.UUID,
+    db: DatabaseSession,
+    principal: CanReadCatalog,
+) -> SkuRead:
+    sku, style = get_sku(db, principal.tenant_id, sku_id)
+    return _sku_read(sku, style)
 
 
 @router.get(

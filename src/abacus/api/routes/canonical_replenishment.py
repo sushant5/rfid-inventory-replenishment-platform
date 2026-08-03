@@ -61,7 +61,7 @@ def _bundle_read(bundle: PolicyBundle) -> PolicyBundleRead:
     "/replenishment-policies",
     response_model=PolicyBundleRead,
     status_code=status.HTTP_201_CREATED,
-    operation_id="createCanonicalReplenishmentPolicy",
+    operation_id="createReplenishmentPolicy",
 )
 def create_policy_endpoint(
     request: PolicyCreate,
@@ -115,7 +115,7 @@ def activate_policy_version_endpoint(
 @router.post(
     "/replenishment/evaluations",
     response_model=ReplenishmentEvaluationRead,
-    operation_id="evaluateCanonicalReplenishment",
+    operation_id="evaluateReplenishment",
 )
 def evaluate_replenishment_endpoint(
     request: ReplenishmentEvaluationCreate,
@@ -142,7 +142,7 @@ def evaluate_replenishment_endpoint(
 @router.get(
     "/stores/{store_id}/replenishment-tasks",
     response_model=list[ReplenishmentTaskRead],
-    operation_id="listCanonicalReplenishmentTasks",
+    operation_id="listReplenishmentTasks",
 )
 def list_store_tasks_endpoint(
     store_id: uuid.UUID,
@@ -166,7 +166,7 @@ def list_store_tasks_endpoint(
 @router.patch(
     "/replenishment-tasks/{task_id}",
     response_model=ReplenishmentTaskRead,
-    operation_id="patchCanonicalReplenishmentTask",
+    operation_id="patchReplenishmentTask",
 )
 def patch_replenishment_task_endpoint(
     task_id: uuid.UUID,

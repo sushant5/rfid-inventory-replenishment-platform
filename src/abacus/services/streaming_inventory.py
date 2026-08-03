@@ -10,6 +10,7 @@ from typing import Literal
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.selectable import Subquery
 
 from abacus.config import Settings
 from abacus.enums import DeviceStatus
@@ -27,9 +28,9 @@ from abacus.models.architecture import (
     RfidObservationBatchEvent,
     RfidObservationEventLedger,
     RfidQuarantine,
-    RfidTag,
     StoreConnectivity,
 )
+from abacus.models.catalog import EpcBinding
 from abacus.models.tenancy import Device, DeviceAssignment
 
 
@@ -47,6 +48,59 @@ class StableZoneDecision:
     confidence: float
     observed_at: datetime
     received_at: datetime
+
+
+def current_inventory_bucket_metadata(*, tenant_id: uuid.UUID, store_id: uuid.UUID) -> Subquery:
+    """Aggregate authoritative metadata for each currently occupied inventory bucket.
+
+    ``inventory_projection`` is an eventually consistent quantity projection. Item
+    confidence and observation time can change without a quantity transition, so its
+    copied metadata is not authoritative for reads or replenishment decisions.
+    """
+
+    return (
+        select(
+            CurrentItemState.tenant_id.label("tenant_id"),
+            CurrentItemState.store_id.label("store_id"),
+            CurrentItemState.sku_id.label("sku_id"),
+            CurrentItemState.zone_id.label("zone_id"),
+            func.count(CurrentItemState.epc).label("item_count"),
+            func.max(CurrentItemState.last_observed_at).label("as_of"),
+            func.min(CurrentItemState.confidence).label("confidence"),
+        )
+        .where(
+            CurrentItemState.tenant_id == tenant_id,
+            CurrentItemState.store_id == store_id,
+            CurrentItemState.zone_id.is_not(None),
+        )
+        .group_by(
+            CurrentItemState.tenant_id,
+            CurrentItemState.store_id,
+            CurrentItemState.sku_id,
+            CurrentItemState.zone_id,
+        )
+        .subquery("current_inventory_bucket_metadata")
+    )
+
+
+def effective_bucket_confidence(
+    *,
+    projected_quantity: int,
+    current_item_count: int | None,
+    current_confidence: float | None,
+) -> float:
+    """Return current-state confidence, failing safe on a projection mismatch.
+
+    A zero-quantity bucket with no current items is a normal empty bucket. A positive
+    projection without any matching current item means the asynchronous projection is
+    behind current state, so automatic work must not trust it.
+    """
+
+    if current_item_count is None:
+        return 1.0 if projected_quantity == 0 else 0.0
+    if projected_quantity != current_item_count or current_confidence is None:
+        return 0.0
+    return float(current_confidence)
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +307,7 @@ def _quarantine(
     event: RfidObservationEvent,
     *,
     reason: str,
+    payload: dict[str, object] | None = None,
 ) -> ProcessingResult:
     existing_quarantine = db.scalar(
         select(RfidQuarantine).where(
@@ -267,7 +322,7 @@ def _quarantine(
                 batch_id=event.batch_id,
                 event_id=event.event_id,
                 reason=reason,
-                payload=event.model_dump(mode="json"),
+                payload=payload if payload is not None else event.model_dump(mode="json"),
             )
         )
     _advance_batch(
@@ -278,6 +333,18 @@ def _quarantine(
         reason=reason,
     )
     return ProcessingResult("QUARANTINED", reason=reason)
+
+
+def quarantine_observation(
+    db: Session,
+    event: RfidObservationEvent,
+    *,
+    reason: str,
+    payload: dict[str, object] | None = None,
+) -> ProcessingResult:
+    """Terminally reject one accepted observation and finalize every retry batch."""
+
+    return _quarantine(db, event, reason=reason, payload=payload)
 
 
 def _resolve_effective_assignment(
@@ -330,7 +397,10 @@ def _delta_payload(
     observed_at: datetime,
 ) -> dict[str, object]:
     return InventoryDeltaEvent(
-        delta_id=f"{transition_id}:{zone_id}",
+        # SKU is part of the inventory bucket identity. Including it keeps both
+        # sides of an effective-dated EPC rebind distinct even when the item stays
+        # in the same physical zone.
+        delta_id=f"{transition_id}:{sku_id}:{zone_id}",
         transition_id=transition_id,
         tenant_id=tenant_id,
         store_id=store_id,
@@ -358,10 +428,12 @@ def _update_connectivity(
             freshness_status=FreshnessStatus.STALE,
         )
         db.add(connectivity)
-    connectivity.gateway_last_heartbeat = max(
-        event.received_at,
-        connectivity.gateway_last_heartbeat or event.received_at,
-    )
+    if (
+        connectivity.gateway_last_heartbeat is None
+        or event.received_at - connectivity.gateway_last_heartbeat
+        >= timedelta(seconds=settings.rfid_last_seen_flush_seconds)
+    ):
+        connectivity.gateway_last_heartbeat = event.received_at
     connectivity.reader_coverage_ok = event.reader_coverage_ok
     if event.is_buffered:
         if (
@@ -387,6 +459,23 @@ def _update_connectivity(
             now=event.received_at,
         )
     return connectivity
+
+
+def _processed_observation_watermark(db: Session, event: RfidObservationEvent) -> datetime | None:
+    """Return the latest durable event-time watermark for one physical item.
+
+    The immutable event ledger is updated for every accepted event anyway. Using it
+    as replay protection lets ``current_item_state`` throttle repeated last-seen
+    refreshes without allowing a worker restart to regress item state.
+    """
+
+    return db.scalar(
+        select(func.max(RfidObservationEventLedger.observed_at)).where(
+            RfidObservationEventLedger.tenant_id == event.tenant_id,
+            RfidObservationEventLedger.epc == event.epc,
+            RfidObservationEventLedger.processing_status == RfidEventProcessingStatus.PROCESSED,
+        )
+    )
 
 
 def _advance_batch(
@@ -533,8 +622,18 @@ def process_observation(
         update={"store_id": assignment.store_id, "zone_id": assignment.zone_id}
     )
     _update_connectivity(db, resolved_event, settings)
-    tag = db.get(RfidTag, (event.tenant_id, event.epc))
-    if tag is None or not tag.active:
+    binding = db.scalar(
+        select(EpcBinding)
+        .where(
+            EpcBinding.tenant_id == event.tenant_id,
+            EpcBinding.epc == event.epc,
+            EpcBinding.effective_from <= event.observed_at,
+            or_(EpcBinding.effective_to.is_(None), EpcBinding.effective_to > event.observed_at),
+        )
+        .order_by(EpcBinding.effective_from.desc())
+        .limit(1)
+    )
+    if binding is None:
         return _quarantine(db, event, reason="UNKNOWN_EPC")
 
     state = db.scalar(
@@ -545,7 +644,13 @@ def process_observation(
         )
         .with_for_update()
     )
-    if state is not None and event.observed_at < state.last_observed_at:
+    processed_watermark = _processed_observation_watermark(db, event)
+    state_watermark = state.last_observed_at if state is not None else None
+    durable_watermark = max(
+        (value for value in (processed_watermark, state_watermark) if value is not None),
+        default=None,
+    )
+    if durable_watermark is not None and event.observed_at < durable_watermark:
         _advance_batch(db, event, rejected=False, disposition="LATE")
         return ProcessingResult("LATE", reason="OBSERVED_AT_BEFORE_CURRENT_STATE")
 
@@ -553,41 +658,40 @@ def process_observation(
     decision = infer_stable_zone(window, settings)
     if decision is None:
         if state is not None:
-            # This watermark is deliberately durable for every accepted observation.
-            # Otherwise a processor restart could accept an older event and move the
-            # item backwards while the more recent read existed only in memory.
-            state.last_observed_at = max(state.last_observed_at, event.observed_at)
             state.confidence = min(state.confidence, 0.49)
             if event.received_at - state.last_received_at >= timedelta(
                 seconds=settings.rfid_last_seen_flush_seconds
             ):
+                state.last_observed_at = max(state.last_observed_at, event.observed_at)
                 state.last_received_at = event.received_at
         _advance_batch(db, event, rejected=False, disposition="AMBIGUOUS")
         return ProcessingResult("AMBIGUOUS")
 
-    if state is not None and decision.observed_at <= state.last_observed_at:
-        state.last_observed_at = max(state.last_observed_at, event.observed_at)
-        state.confidence = min(state.confidence, 0.49)
-        if event.received_at - state.last_received_at >= timedelta(
-            seconds=settings.rfid_last_seen_flush_seconds
-        ):
-            state.last_received_at = event.received_at
+    if durable_watermark is not None and decision.observed_at < durable_watermark:
+        if state is not None:
+            state.confidence = min(state.confidence, 0.49)
+            if event.received_at - state.last_received_at >= timedelta(
+                seconds=settings.rfid_last_seen_flush_seconds
+            ):
+                state.last_observed_at = max(state.last_observed_at, event.observed_at)
+                state.last_received_at = event.received_at
         _advance_batch(db, event, rejected=False, disposition="AMBIGUOUS")
         return ProcessingResult("AMBIGUOUS", reason="STABLE_EVIDENCE_BEFORE_CURRENT_STATE")
 
     if (
         state is not None
+        and state.sku_id == binding.sku_id
         and state.store_id == decision.store_id
         and state.zone_id == decision.zone_id
     ):
-        state.last_observed_at = max(
-            state.last_observed_at,
-            decision.observed_at,
-            event.observed_at,
-        )
         if event.received_at - state.last_received_at >= timedelta(
             seconds=settings.rfid_last_seen_flush_seconds
         ):
+            state.last_observed_at = max(
+                state.last_observed_at,
+                decision.observed_at,
+                event.observed_at,
+            )
             state.last_received_at = max(state.last_received_at, decision.received_at)
             state.confidence = decision.confidence
         _advance_batch(db, event, rejected=False, disposition="PROCESSED")
@@ -617,7 +721,7 @@ def process_observation(
             transition_id=transition_id,
             tenant_id=event.tenant_id,
             epc=event.epc,
-            sku_id=tag.sku_id,
+            sku_id=binding.sku_id,
             store_id=decision.store_id,
             zone_id=decision.zone_id,
             quantity_delta=1,
@@ -629,7 +733,7 @@ def process_observation(
         state = CurrentItemState(
             tenant_id=event.tenant_id,
             epc=event.epc,
-            sku_id=tag.sku_id,
+            sku_id=binding.sku_id,
             store_id=decision.store_id,
             zone_id=decision.zone_id,
             last_observed_at=watermark_observed_at,
@@ -639,7 +743,7 @@ def process_observation(
         )
         db.add(state)
     else:
-        state.sku_id = tag.sku_id
+        state.sku_id = binding.sku_id
         state.store_id = decision.store_id
         state.zone_id = decision.zone_id
         state.last_observed_at = watermark_observed_at

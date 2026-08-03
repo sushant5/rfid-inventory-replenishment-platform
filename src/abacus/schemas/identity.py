@@ -114,6 +114,44 @@ class UserCreate(ApiModel):
         return self
 
 
+class CanonicalUserCreate(ApiModel):
+    email: EmailStr
+    display_name: str = Field(min_length=1, max_length=255)
+    password: SecretStr = Field(min_length=12, max_length=128)
+    roles: list[CanonicalIdentityRole] = Field(min_length=1, max_length=4)
+    store_ids: list[uuid.UUID] = Field(default_factory=list, max_length=500)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_canonical_email(cls, value: EmailStr) -> str:
+        return str(value).strip().lower()
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_canonical_display_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("display_name cannot be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_canonical_access(self) -> "CanonicalUserCreate":
+        if len(self.roles) != len(set(self.roles)):
+            raise ValueError("roles cannot contain duplicates")
+        if len(self.store_ids) != len(set(self.store_ids)):
+            raise ValueError("store_ids cannot contain duplicates")
+        store_roles = {
+            CanonicalIdentityRole.STORE_ASSOCIATE,
+            CanonicalIdentityRole.STORE_MANAGER,
+        }
+        has_store_role = bool(set(self.roles).intersection(store_roles))
+        if has_store_role and not self.store_ids:
+            raise ValueError("store-scoped roles require at least one store_id")
+        if not has_store_role and self.store_ids:
+            raise ValueError("store_ids require a store-scoped role")
+        return self
+
+
 class UserRead(ApiModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -126,8 +164,28 @@ class UserRead(ApiModel):
     updated_at: datetime
 
 
+class CanonicalUserRead(ApiModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    email: EmailStr
+    display_name: str
+    status: UserStatus
+    roles: list[CanonicalIdentityRole]
+    store_ids: list[uuid.UUID]
+    last_login_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
 class UserPage(ApiModel):
     items: list[UserRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class CanonicalUserPage(ApiModel):
+    items: list[CanonicalUserRead]
     total: int
     limit: int
     offset: int

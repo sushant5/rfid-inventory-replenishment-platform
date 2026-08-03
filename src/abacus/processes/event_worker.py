@@ -7,7 +7,9 @@ import uuid
 from datetime import UTC, datetime
 
 import structlog
+from pydantic import ValidationError
 from sqlalchemy import select, text
+from sqlalchemy.orm import Session
 
 from abacus.config import get_settings
 from abacus.db import SessionLocal, tenant_session_scope
@@ -17,6 +19,7 @@ from abacus.logging import configure_logging
 from abacus.models.architecture import (
     InventoryTransitionOutbox,
     RfidEventProcessingStatus,
+    RfidObservationBatchEvent,
     RfidObservationEventLedger,
     RfidObservationOutbox,
 )
@@ -25,11 +28,13 @@ from abacus.services.streaming_inventory import (
     apply_inventory_deltas,
     confirm_timed_out_removals,
     process_observation,
+    quarantine_observation,
 )
 
 configure_logging()
 logger = structlog.get_logger(__name__)
 _stop_requested = False
+PROCESSING_ATTEMPTS_EXHAUSTED = "PROCESSING_ATTEMPTS_EXHAUSTED"
 
 
 def _request_stop(*_: object) -> None:
@@ -40,6 +45,56 @@ def _request_stop(*_: object) -> None:
 def _active_tenants() -> list[uuid.UUID]:
     with SessionLocal() as db:
         return list(db.scalars(text("SELECT tenant_id FROM app_active_tenants()")))
+
+
+def _terminal_event(
+    db: Session,
+    row: RfidObservationOutbox,
+) -> RfidObservationEvent:
+    """Recover the canonical event from its ledger if an outbox payload is malformed."""
+
+    try:
+        return RfidObservationEvent.model_validate(row.payload)
+    except ValidationError as exc:
+        # The ledger is written atomically with the outbox and contains the validated
+        # immutable event fields. This fallback lets a schema-incompatible payload be
+        # quarantined instead of blocking the tenant forever.
+        ledger = db.scalar(
+            select(RfidObservationEventLedger)
+            .where(
+                RfidObservationEventLedger.tenant_id == row.tenant_id,
+                RfidObservationEventLedger.event_id == row.event_id,
+            )
+            .with_for_update()
+        )
+        batch_id = db.scalar(
+            select(RfidObservationBatchEvent.batch_id)
+            .where(
+                RfidObservationBatchEvent.tenant_id == row.tenant_id,
+                RfidObservationBatchEvent.event_id == row.event_id,
+            )
+            .order_by(RfidObservationBatchEvent.batch_id)
+            .limit(1)
+        )
+        if ledger is None or batch_id is None:
+            raise RuntimeError("RFID poison event has no durable ledger or batch link") from exc
+        return RfidObservationEvent(
+            tenant_id=ledger.tenant_id,
+            batch_id=batch_id,
+            event_id=ledger.event_id,
+            device_id=ledger.device_id,
+            store_id=ledger.store_id,
+            zone_id=ledger.zone_id,
+            epc=ledger.epc,
+            observed_at=ledger.observed_at,
+            received_at=ledger.first_received_at,
+            rssi=ledger.rssi,
+            antenna_id=ledger.antenna_id,
+            reader_health=ledger.reader_health,
+            is_buffered=ledger.is_buffered,
+            backlog_drained=ledger.backlog_drained,
+            reader_coverage_ok=ledger.reader_coverage_ok,
+        )
 
 
 def process_tenant_once(
@@ -108,6 +163,7 @@ def process_tenant_once(
         except Exception as exc:
             if checkpoint is not None:
                 recent.restore(checkpoint)
+            terminalized = False
             with tenant_session_scope(tenant_id) as db:
                 failed_raw = db.scalar(
                     select(RfidObservationOutbox)
@@ -121,7 +177,26 @@ def process_tenant_once(
                 if failed_raw is not None:
                     failed_raw.publish_attempts += 1
                     failed_raw.last_error = f"{type(exc).__name__}: {exc}"[:2000]
+                    if failed_raw.publish_attempts >= settings.worker_max_attempts:
+                        failed_event = _terminal_event(db, failed_raw)
+                        quarantine_observation(
+                            db,
+                            failed_event,
+                            reason=PROCESSING_ATTEMPTS_EXHAUSTED,
+                            payload=failed_raw.payload,
+                        )
+                        failed_raw.published_at = datetime.now(UTC)
+                        terminalized = True
                     db.commit()
+            if terminalized:
+                raw_count += 1
+                logger.warning(
+                    "rfid_observation_attempts_exhausted",
+                    tenant_id=str(tenant_id),
+                    outbox_id=str(raw_id),
+                    error=failed_raw.last_error if failed_raw is not None else None,
+                )
+                continue
             raw_error = exc
             break
 

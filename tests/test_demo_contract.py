@@ -1,8 +1,15 @@
+import json
+from pathlib import Path
+
 from scripts.generate_store_batch import build_store_batch
 
 from abacus import API_TITLE, __version__
 from abacus.main import create_app
+from abacus.schemas.architecture import CanonicalObservationBatchCreate
+from abacus.schemas.canonical_replenishment import PolicyCreate
 from abacus.schemas.tenancy import BulkStoreOnboardingRequest
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_assignment_sized_store_fixture_is_valid_and_deterministic() -> None:
@@ -14,6 +21,16 @@ def test_assignment_sized_store_fixture_is_valid_and_deterministic() -> None:
     assert build_store_batch(100) == payload
 
 
+def test_checked_in_examples_match_the_public_request_schemas() -> None:
+    PolicyCreate.model_validate(json.loads((ROOT / "examples" / "policies.json").read_text()))
+    CanonicalObservationBatchCreate.model_validate(
+        json.loads((ROOT / "examples" / "rfid-batch.json").read_text())
+    )
+    BulkStoreOnboardingRequest.model_validate(
+        json.loads((ROOT / "examples" / "stores.json").read_text())
+    )
+
+
 def test_openapi_contains_the_canonical_submission_contract() -> None:
     schema = create_app().openapi()
     assert schema["openapi"] == "3.1.0"
@@ -22,22 +39,24 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.3.0"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",
         ("get", "/health/ready"): "readiness",
         ("get", "/version"): "version",
-        ("post", "/v1/tenants"): "createTenantCanonical",
+        ("post", "/v1/tenants"): "createTenant",
         ("post", "/v1/tenants/{tenant_id}/store-imports"): "createStoreImport",
         ("post", "/v1/stores/{store_id}/zones"): "createStoreZone",
         ("post", "/v1/stores/{store_id}/devices"): "registerStoreDevice",
-        ("post", "/v1/tenants/{tenant_id}/catalog-imports"): "createCatalogImportCanonical",
-        ("get", "/v1/catalog-imports/{import_id}"): "getCatalogImportCanonical",
+        ("post", "/v1/tenants/{tenant_id}/catalog-imports"): "createCatalogImport",
+        ("get", "/v1/catalog-imports/{import_id}"): "getCatalogImport",
         (
             "get",
             "/v1/catalog-imports/{import_id}/errors",
-        ): "listCatalogImportErrorsCanonical",
+        ): "listCatalogImportErrors",
+        ("get", "/v1/skus"): "listSkus",
+        ("get", "/v1/skus/{sku_id}"): "getSku",
         ("post", "/v1/rfid/observation-batches"): "submitRfidObservationBatch",
         (
             "get",
@@ -51,8 +70,8 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
             "put",
             "/v1/users/{user_id}/store-assignments",
         ): "replaceUserStoreAssignments",
-        ("get", "/v1/me"): "getCurrentUserCanonical",
-        ("post", "/v1/replenishment-policies"): "createCanonicalReplenishmentPolicy",
+        ("get", "/v1/me"): "getCurrentUser",
+        ("post", "/v1/replenishment-policies"): "createReplenishmentPolicy",
         (
             "post",
             "/v1/replenishment-policies/{policy_id}/versions",
@@ -65,17 +84,22 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
             "post",
             "/v1/replenishment-policy-versions/{version_id}/activate",
         ): "activateReplenishmentPolicyVersion",
-        ("post", "/v1/replenishment/evaluations"): "evaluateCanonicalReplenishment",
+        ("post", "/v1/replenishment/evaluations"): "evaluateReplenishment",
         (
             "get",
             "/v1/stores/{store_id}/replenishment-tasks",
-        ): "listCanonicalReplenishmentTasks",
-        ("patch", "/v1/replenishment-tasks/{task_id}"): "patchCanonicalReplenishmentTask",
+        ): "listReplenishmentTasks",
+        ("patch", "/v1/replenishment-tasks/{task_id}"): "patchReplenishmentTask",
     }
     optional_operations = {
         ("post", "/v1/auth/login"): "login",
-        ("get", "/v1/tenants/{tenant_id}/stores"): "listCanonicalTenantStores",
+        ("get", "/v1/tenants/{tenant_id}/stores"): "listTenantStores",
         ("get", "/v1/stores/{store_id}/zones"): "listStoreZones",
+        ("get", "/v1/stores/{store_id}/devices"): "listStoreDevices",
+        (
+            "post",
+            "/v1/devices/{device_id}/credentials:rotate",
+        ): "rotateDeviceCredential",
         ("get", "/v1/users"): "listUsers",
         ("get", "/v1/users/audit-records"): "listIdentityAuditRecords",
         ("get", "/v1/users/{user_id}"): "getUser",
@@ -110,6 +134,9 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
         assert paths[path][method]["security"] == [{"PlatformApiKey": []}]
     for path, method in (
         ("/v1/me", "get"),
+        ("/v1/skus", "get"),
+        ("/v1/skus/{sku_id}", "get"),
+        ("/v1/stores/{store_id}/devices", "get"),
         ("/v1/stores/{store_id}/inventory", "get"),
         ("/v1/items/{epc}", "get"),
         ("/v1/replenishment-policies", "post"),
@@ -121,6 +148,12 @@ def test_openapi_contains_the_canonical_submission_contract() -> None:
 
     inventory_fields = schema["components"]["schemas"]["InventoryProjectionRead"]["properties"]
     assert {"quantity", "as_of", "confidence", "freshness_status"}.issubset(inventory_fields)
+    device_mapping_fields = schema["components"]["schemas"]["StoreDeviceMappingRead"]["properties"]
+    assert set(device_mapping_fields) == {"device", "assignment"}
+    device_items = paths["/v1/stores/{store_id}/devices"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["items"]
+    assert device_items["$ref"].endswith("/StoreDeviceMappingRead")
     assert schema["components"]["schemas"]["CanonicalTaskStatus"]["enum"] == [
         "OPEN",
         "CLAIMED",

@@ -24,6 +24,7 @@ from abacus.models.identity import (
 )
 from abacus.models.tenancy import Store, Tenant
 from abacus.schemas.identity import (
+    CanonicalUserCreate,
     UserCreate,
     UserRolesReplace,
     UserStoreAssignmentsReplace,
@@ -48,6 +49,13 @@ class UserRecord:
 @dataclass(frozen=True, slots=True)
 class CanonicalUserAccess:
     user_id: uuid.UUID
+    roles: tuple[CanonicalIdentityRole, ...]
+    store_ids: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalUserRecord:
+    user: User
     roles: tuple[CanonicalIdentityRole, ...]
     store_ids: tuple[uuid.UUID, ...]
 
@@ -415,6 +423,106 @@ def create_user(db: Session, principal: Principal, request: UserCreate) -> UserR
     return UserRecord(user=user, grants=grants)
 
 
+def create_canonical_user(
+    db: Session,
+    principal: Principal,
+    request: CanonicalUserCreate,
+) -> CanonicalUserRecord:
+    roles = frozenset(request.roles)
+    store_ids = frozenset(request.store_ids)
+    if not principal.has_tenant_permission(Permission.USERS_CREATE):
+        allowed_store_ids = principal.store_ids_for_permission(Permission.USERS_CREATE)
+        if roles != {CanonicalIdentityRole.STORE_ASSOCIATE} or not store_ids.issubset(
+            allowed_store_ids
+        ):
+            raise ApiError(
+                403,
+                "Forbidden",
+                "Store managers may create associates only within stores they manage.",
+                code="role_assignment_forbidden",
+            )
+
+    if store_ids:
+        active_store_ids = frozenset(
+            db.scalars(
+                select(Store.id).where(
+                    Store.tenant_id == principal.tenant_id,
+                    Store.id.in_(store_ids),
+                    Store.status == StoreStatus.ACTIVE,
+                )
+            ).all()
+        )
+        if active_store_ids != store_ids:
+            raise ApiError(
+                422,
+                "Invalid store scope",
+                "Every store assignment must reference an active store in the current tenant.",
+                code="invalid_store_scope",
+            )
+
+    existing_user = db.scalar(
+        select(User.id).where(
+            User.tenant_id == principal.tenant_id,
+            User.email == str(request.email),
+        )
+    )
+    if existing_user is not None:
+        raise ApiError(
+            409,
+            "User already exists",
+            "A user with this email already exists in the tenant.",
+            code="user_email_conflict",
+        )
+
+    user = User(
+        tenant_id=principal.tenant_id,
+        email=str(request.email),
+        display_name=request.display_name,
+        password_hash=hash_password(request.password.get_secret_value()),
+        status=UserStatus.ACTIVE,
+        token_version=1,
+    )
+    db.add(user)
+    try:
+        db.flush()
+        _persist_role_rows(db, principal.tenant_id, user.id, roles)
+        _persist_assignment_rows(db, principal.tenant_id, user.id, store_ids)
+        compatibility_grants = _compatibility_grant_specs(roles, store_ids)
+        _persist_compatibility_grants(
+            db,
+            principal.tenant_id,
+            user.id,
+            compatibility_grants,
+        )
+        _add_audit_record(
+            db,
+            tenant_id=principal.tenant_id,
+            actor_user_id=principal.user_id,
+            action=IdentityAuditAction.USER_CREATED,
+            target_user_id=user.id,
+            details={
+                "email": user.email,
+                "roles": [role.value for role in sorted(roles, key=lambda item: item.value)],
+                "store_ids": [str(store_id) for store_id in sorted(store_ids, key=str)],
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "User creation conflict",
+            "The user or one of its access assignments was created concurrently.",
+            code="user_creation_conflict",
+        ) from exc
+    db.refresh(user)
+    return CanonicalUserRecord(
+        user=user,
+        roles=tuple(sorted(roles, key=lambda item: item.value)),
+        store_ids=tuple(sorted(store_ids, key=str)),
+    )
+
+
 def _visible_grants(
     principal: Principal,
     permission: Permission,
@@ -612,6 +720,27 @@ def _load_canonical_access(
     return roles, store_ids, not role_rows, not assignment_rows, grants
 
 
+def canonicalize_user_record(
+    db: Session,
+    record: UserRecord,
+    principal: Principal | None = None,
+) -> CanonicalUserRecord:
+    roles, store_ids, _roles_missing, _assignments_missing, _grants = _load_canonical_access(
+        db,
+        record.user.tenant_id,
+        record.user.id,
+    )
+    if principal is not None and not principal.has_tenant_permission(Permission.USERS_READ):
+        store_ids = store_ids.intersection(
+            principal.store_ids_for_permission(Permission.USERS_READ)
+        )
+    return CanonicalUserRecord(
+        user=record.user,
+        roles=tuple(sorted(roles, key=lambda item: item.value)),
+        store_ids=tuple(sorted(store_ids, key=str)),
+    )
+
+
 def _compatibility_grant_specs(
     roles: frozenset[CanonicalIdentityRole],
     store_ids: frozenset[uuid.UUID],
@@ -713,6 +842,36 @@ def _lock_access_target(
     return user
 
 
+def _ensure_valid_canonical_access_pair(
+    roles: frozenset[CanonicalIdentityRole],
+    store_ids: frozenset[uuid.UUID],
+) -> None:
+    """Reject role/store combinations that would leave misleading access state."""
+
+    has_store_scoped_role = bool(
+        roles.intersection(
+            {
+                CanonicalIdentityRole.STORE_ASSOCIATE,
+                CanonicalIdentityRole.STORE_MANAGER,
+            }
+        )
+    )
+    if has_store_scoped_role and not store_ids:
+        raise ApiError(
+            422,
+            "Store assignment required",
+            "Store-scoped roles require at least one store assignment.",
+            code="store_assignment_required",
+        )
+    if not has_store_scoped_role and store_ids:
+        raise ApiError(
+            422,
+            "Store assignment not allowed",
+            "Store assignments require a store-scoped role.",
+            code="store_assignment_not_allowed",
+        )
+
+
 def replace_user_roles(
     db: Session,
     principal: Principal,
@@ -734,6 +893,7 @@ def replace_user_roles(
         db, principal.tenant_id, user.id
     )
     requested_roles = frozenset(request.roles)
+    _ensure_valid_canonical_access_pair(requested_roles, store_ids)
 
     if (
         CanonicalIdentityRole.TENANT_ADMIN in existing_roles
@@ -822,6 +982,7 @@ def replace_user_store_assignments(
             code="user_role_required",
         )
     requested_store_ids = frozenset(request.store_ids)
+    _ensure_valid_canonical_access_pair(roles, requested_store_ids)
 
     if requested_store_ids:
         valid_store_ids = frozenset(

@@ -35,7 +35,11 @@ from abacus.schemas.canonical_replenishment import (
     ReplenishmentTaskPatch,
 )
 from abacus.security import Permission, Principal
-from abacus.services.streaming_inventory import effective_freshness
+from abacus.services.streaming_inventory import (
+    current_inventory_bucket_metadata,
+    effective_bucket_confidence,
+    effective_freshness,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -696,6 +700,10 @@ def evaluate_replenishment(
     if not descriptors:
         return EvaluationResult(store.id, (), False, 0)
 
+    current_metadata = current_inventory_bucket_metadata(
+        tenant_id=principal.tenant_id,
+        store_id=store.id,
+    )
     projection_query = (
         select(
             InventoryProjection,
@@ -704,6 +712,8 @@ def evaluate_replenishment(
             Sku.size,
             Product.style_code,
             Product.category,
+            current_metadata.c.item_count,
+            current_metadata.c.confidence,
         )
         .join(
             Zone,
@@ -725,6 +735,13 @@ def evaluate_replenishment(
             (Product.id == ProductVariant.product_id)
             & (Product.tenant_id == ProductVariant.tenant_id),
         )
+        .outerjoin(
+            current_metadata,
+            (current_metadata.c.tenant_id == InventoryProjection.tenant_id)
+            & (current_metadata.c.store_id == InventoryProjection.store_id)
+            & (current_metadata.c.sku_id == InventoryProjection.sku_id)
+            & (current_metadata.c.zone_id == InventoryProjection.zone_id),
+        )
         .where(
             InventoryProjection.tenant_id == principal.tenant_id,
             InventoryProjection.store_id == store.id,
@@ -735,7 +752,16 @@ def evaluate_replenishment(
     if request.sku_ids:
         projection_query = projection_query.where(InventoryProjection.sku_id.in_(request.sku_ids))
     snapshots: dict[uuid.UUID, InventorySnapshot] = {}
-    for projection, kind, sku_id, size, style_code, category in db.execute(projection_query).all():
+    for (
+        projection,
+        kind,
+        sku_id,
+        size,
+        style_code,
+        category,
+        current_item_count,
+        current_confidence,
+    ) in db.execute(projection_query).all():
         if kind not in {ZoneKind.SALES_FLOOR, ZoneKind.BACKROOM}:
             continue
         snapshot = snapshots.setdefault(
@@ -753,7 +779,14 @@ def evaluate_replenishment(
             snapshot.floor_qty += projection.quantity
         else:
             snapshot.backroom_qty += projection.quantity
-        snapshot.confidence = min(snapshot.confidence, projection.confidence)
+        snapshot.confidence = min(
+            snapshot.confidence,
+            effective_bucket_confidence(
+                projected_quantity=projection.quantity,
+                current_item_count=current_item_count,
+                current_confidence=current_confidence,
+            ),
+        )
 
     active_statuses = {
         CanonicalTaskStatus.OPEN,

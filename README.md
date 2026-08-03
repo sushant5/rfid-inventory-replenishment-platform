@@ -9,13 +9,13 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 
 ## Hosted demo
 
-- API: <https://abacus-take-home-api.onrender.com>
-- Swagger: <https://abacus-take-home-api.onrender.com/docs>
-- OpenAPI: <https://abacus-take-home-api.onrender.com/openapi.json>
-- Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
-- Release metadata: <https://abacus-take-home-api.onrender.com/version>
+- API: <https://abacus-orange-sushant-api.onrender.com>
+- Swagger: <https://abacus-orange-sushant-api.onrender.com/docs>
+- OpenAPI: <https://abacus-orange-sushant-api.onrender.com/openapi.json>
+- Readiness: <https://abacus-orange-sushant-api.onrender.com/health/ready>
+- Release metadata: <https://abacus-orange-sushant-api.onrender.com/version>
 
-The hosted demo runs release `0.2.0` on Render with PostgreSQL 16. Render may need
+The hosted demo runs release `0.3.0` on Render with PostgreSQL 17. Render may need
 about a minute to wake the free web service after inactivity. Reviewer credentials
 are provided separately and are intentionally not stored in this public repository.
 
@@ -87,12 +87,17 @@ streaming and S3 source-file retention are production extensions, not demo depen
   context is absent. Tenant IDs in request bodies are never trusted.
 - Accepted RFID events, retry-batch links, and their durable inbox records commit
   together. A worker outage therefore leaves recoverable work, not a false `202`.
+- Raw-event and catalog jobs have bounded retries. Exhausted work reaches a terminal
+  status with its error preserved; one poison record cannot block later RFID events.
 - `(tenant_id, event_id)` is a durable idempotency boundary. A conflicting reuse is
   rejected; a byte-equivalent retry does not add stable-zone evidence twice.
 - Worker processing is at least once. Conditional item-state versions, deterministic
   transition IDs, and unique delta IDs make retries safe; no exactly-once claim is made.
 - Item state and its inventory-transition outbox commit in one transaction. The event
   worker deduplicates each delta before updating derived bucket counts.
+- Repeated reads throttle `current_item_state` last-seen writes. The immutable event
+  ledger provides the durable event-time watermark after a worker restart, so this
+  optimization cannot allow a late event to regress state.
 - Projection counts are rebuildable from `current_item_state` with
   `abacus-cli rebuild-inventory-projection --tenant-id …`.
 - Freshness is derived from heartbeat age, live-event age, backlog drain, and reader
@@ -101,14 +106,14 @@ streaming and S3 source-file retention are production extensions, not demo depen
 
 ## Canonical API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.2.0`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.3.0`).
 Earlier prototype routes are retained only as migration-test fixtures and are not
 mounted by the submitted application.
 
 The visible contract includes all required endpoints:
 
 - Onboarding: tenants, store imports, zones, devices
-- Catalog: create import, status, row errors
+- Catalog: create import, status, row errors, SKU discovery
 - RFID: submit batch, batch status
 - Inventory: store projection, physical item state
 - Identity: create user, replace roles, replace store assignments, current user
@@ -119,6 +124,9 @@ Demo authentication uses a platform key, one-time device credentials, and short-
 JWTs. JWTs contain only user and tenant identity; current roles and store assignments
 are loaded from PostgreSQL on every authenticated request. Production SSO/SCIM is an
 explicit extension, not simulated here.
+
+Device discovery returns each reader with its currently effective store/zone
+assignment. Plaintext device tokens are returned only at registration or rotation.
 
 ## Catalog and RFID behavior
 
@@ -134,14 +142,16 @@ Hosted stable-zone defaults are configurable:
 
 - 3 consistent reads from a new zone
 - 10-second evidence window
-- median-RSSI adjacent-zone tie-break
+- median-RSSI tie-break across competing observed zones
 - previous zone retained with lower confidence when evidence is ambiguous
 - 30-minute absence before confirmed removal, only while the store is live
 
 Production thresholds require pilot calibration. Recent evidence is intentionally
 process-local for this hosted slice. The event ledger and current state are durable;
 after a worker restart, new reads rebuild the evidence window while database
-compare-and-set updates prevent state regression.
+watermarks and conditional state updates prevent state regression. The demo uses
+gateway reader-coverage status as the reader-health input to confidence; production
+integrations would supply per-reader diagnostics and an adjacency graph.
 
 ## Replenishment
 
@@ -181,11 +191,13 @@ mypy src scripts/run_architecture_demo.py scripts/rfid_simulator.py scripts/smok
 
 The suite covers RLS tenant isolation, store/corporate authorization, catalog
 idempotency, durable RFID dedupe, late/future events, stable and ambiguous zones,
-outbox transitions, delta dedupe, projection reconstruction, policy precedence, size
-curves, active-task uniqueness, and stale-store suppression.
+bounded poison-event handling, outbox transitions, delta dedupe, projection
+reconstruction, policy precedence, size curves, active-task uniqueness, and
+stale-store suppression.
 
-`scripts/rfid_simulator.py` generates normal, duplicate, repeated, late/out-of-order,
-adjacent-conflict, unknown-EPC, outage/replay, and stationary-burst scenarios.
+`scripts/rfid_simulator.py` generates normal, duplicate, conflicting event-ID,
+repeated, late/out-of-order, competing-zone, unknown-EPC, outage/replay, and
+stationary-burst scenarios.
 `scripts/smoke_test.py` is a dependency-free hosted health/contract check.
 
 ## Hosting

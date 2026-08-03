@@ -1,20 +1,23 @@
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from abacus.api.dependencies import DatabaseSession, PlatformAccess
 from abacus.api.errors import ApiError
-from abacus.models.tenancy import Zone
+from abacus.models.tenancy import Device, DeviceAssignment, Store, Zone
 from abacus.schemas.tenancy import (
     BulkStoreOnboardingRequest,
     DeviceAssignmentCreate,
     DeviceAssignmentRead,
     DeviceCredentialRead,
     DeviceRead,
+    DeviceTokenRead,
     OnboardingBatchRead,
     StoreDeviceCreate,
+    StoreDeviceMappingRead,
     StoreDeviceRegistrationRead,
     StoreRead,
     TenantCreate,
@@ -48,7 +51,7 @@ CanConfigureTenant = Annotated[
     "/tenants",
     response_model=TenantRead,
     status_code=status.HTTP_201_CREATED,
-    operation_id="createTenantCanonical",
+    operation_id="createTenant",
 )
 @router.post(
     "/tenants",
@@ -120,8 +123,70 @@ def register_store_device_endpoint(
     return StoreDeviceRegistrationRead(
         device=DeviceRead.model_validate(registration.device),
         assignment=DeviceAssignmentRead.model_validate(registration.assignment),
-        api_key=registration.api_key,
+        device_token=registration.api_key,
     )
+
+
+@canonical_router.get(
+    "/stores/{store_id}/devices",
+    response_model=list[StoreDeviceMappingRead],
+    operation_id="listStoreDevices",
+)
+def list_store_devices_endpoint(
+    store_id: uuid.UUID,
+    db: DatabaseSession,
+    principal: CanConfigureTenant,
+) -> list[StoreDeviceMappingRead]:
+    store_exists = db.scalar(
+        select(Store.id).where(
+            Store.id == store_id,
+            Store.tenant_id == principal.tenant_id,
+        )
+    )
+    if store_exists is None:
+        raise ApiError(404, "Store not found", "The requested store does not exist.")
+    if not principal.can_access_store(Permission.TENANT_CONFIGURE, store_id):
+        raise ApiError(403, "Forbidden", "The store is outside the current user's scope.")
+    effective_at = datetime.now(UTC)
+    mappings = db.execute(
+        select(Device, DeviceAssignment)
+        .join(
+            DeviceAssignment,
+            (DeviceAssignment.device_id == Device.id)
+            & (DeviceAssignment.tenant_id == Device.tenant_id),
+        )
+        .where(
+            Device.tenant_id == principal.tenant_id,
+            DeviceAssignment.store_id == store_id,
+            DeviceAssignment.effective_from <= effective_at,
+            or_(
+                DeviceAssignment.effective_to.is_(None),
+                DeviceAssignment.effective_to > effective_at,
+            ),
+        )
+        .order_by(Device.serial_number)
+    ).all()
+    return [
+        StoreDeviceMappingRead(
+            device=DeviceRead.model_validate(device),
+            assignment=DeviceAssignmentRead.model_validate(assignment),
+        )
+        for device, assignment in mappings
+    ]
+
+
+@canonical_router.post(
+    "/devices/{device_id}/credentials:rotate",
+    response_model=DeviceTokenRead,
+    operation_id="rotateDeviceCredential",
+)
+def rotate_device_credential_canonical_endpoint(
+    device_id: uuid.UUID,
+    db: DatabaseSession,
+    principal: CanConfigureTenant,
+) -> DeviceTokenRead:
+    api_key = rotate_device_credential(db, principal.tenant_id, device_id)
+    return DeviceTokenRead(device_id=device_id, device_token=api_key)
 
 
 @router.get(
@@ -132,7 +197,7 @@ def register_store_device_endpoint(
 @canonical_router.get(
     "/tenants/{tenant_id}/stores",
     response_model=list[StoreRead],
-    operation_id="listCanonicalTenantStores",
+    operation_id="listTenantStores",
 )
 def list_tenant_stores_endpoint(
     tenant_id: uuid.UUID,

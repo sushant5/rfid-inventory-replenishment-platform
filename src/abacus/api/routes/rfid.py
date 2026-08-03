@@ -20,7 +20,7 @@ from abacus.models.architecture import (
     StoreConnectivity,
 )
 from abacus.models.catalog import Sku
-from abacus.models.tenancy import Zone
+from abacus.models.tenancy import Store, Zone
 from abacus.schemas.architecture import (
     CanonicalObservationBatchCreate,
     InventoryProjectionRead,
@@ -46,7 +46,11 @@ from abacus.services.rfid import (
     replay_quarantined_observation,
 )
 from abacus.services.rfid_ingress import accept_observation_batch
-from abacus.services.streaming_inventory import effective_freshness
+from abacus.services.streaming_inventory import (
+    current_inventory_bucket_metadata,
+    effective_bucket_confidence,
+    effective_freshness,
+)
 
 device_router = APIRouter(prefix="/v1/device", tags=["3. RFID Ingestion"])
 platform_router = APIRouter(tags=["3. RFID Inventory"])
@@ -142,6 +146,14 @@ def get_store_inventory_endpoint(
     sku_id: uuid.UUID | None = None,
     zone_id: uuid.UUID | None = None,
 ) -> list[InventoryProjectionRead]:
+    store_exists = db.scalar(
+        select(Store.id).where(
+            Store.id == store_id,
+            Store.tenant_id == principal.tenant_id,
+        )
+    )
+    if store_exists is None:
+        raise ApiError(404, "Store not found", "The requested store does not exist.")
     if not principal.can_access_store(Permission.INVENTORY_READ, store_id):
         raise ApiError(403, "Forbidden", "The store is outside the current user's scope.")
     predicates = [
@@ -152,10 +164,28 @@ def get_store_inventory_endpoint(
         predicates.append(InventoryProjection.sku_id == sku_id)
     if zone_id is not None:
         predicates.append(InventoryProjection.zone_id == zone_id)
+    current_metadata = current_inventory_bucket_metadata(
+        tenant_id=principal.tenant_id,
+        store_id=store_id,
+    )
     rows = db.execute(
-        select(InventoryProjection, Sku, Zone)
+        select(
+            InventoryProjection,
+            Sku,
+            Zone,
+            current_metadata.c.item_count,
+            current_metadata.c.as_of,
+            current_metadata.c.confidence,
+        )
         .join(Sku, Sku.id == InventoryProjection.sku_id)
         .join(Zone, Zone.id == InventoryProjection.zone_id)
+        .outerjoin(
+            current_metadata,
+            (current_metadata.c.tenant_id == InventoryProjection.tenant_id)
+            & (current_metadata.c.store_id == InventoryProjection.store_id)
+            & (current_metadata.c.sku_id == InventoryProjection.sku_id)
+            & (current_metadata.c.zone_id == InventoryProjection.zone_id),
+        )
         .where(*predicates)
         .order_by(Sku.code, Zone.code)
     ).all()
@@ -168,11 +198,15 @@ def get_store_inventory_endpoint(
             zone_id=projection.zone_id,
             zone=zone.code,
             quantity=projection.quantity,
-            as_of=projection.as_of,
-            confidence=projection.confidence,
+            as_of=current_as_of or projection.as_of,
+            confidence=effective_bucket_confidence(
+                projected_quantity=projection.quantity,
+                current_item_count=current_item_count,
+                current_confidence=current_confidence,
+            ),
             freshness_status=freshness,
         )
-        for projection, sku, zone in rows
+        for projection, sku, zone, current_item_count, current_as_of, current_confidence in rows
     ]
 
 

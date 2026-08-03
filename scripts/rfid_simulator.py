@@ -27,6 +27,7 @@ DEFAULT_UNKNOWN_EPC: Final = "3034257BF7194E40FFFFFFFF"
 SCENARIOS: Final = (
     "normal",
     "duplicate-retry",
+    "event-id-conflict",
     "repeated-reads",
     "late-out-of-order",
     "adjacent-zone-conflict",
@@ -63,6 +64,7 @@ class ObservationBatch:
     backlog_drained: bool = True
     reader_coverage_ok: bool = True
     credential_slot: str = "primary"
+    expected_http_status: int = 202
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -151,6 +153,27 @@ def build_scenario(
         return [
             ObservationBatch(primary, (event,)),
             ObservationBatch(primary, (event,)),
+        ]
+
+    if scenario == "event-id-conflict":
+        event = factory.event(
+            epc=epc,
+            observed_at=base,
+            rssi=-48.0,
+            antenna_id="floor-1",
+        )
+        conflicting = Observation(
+            event_id=event.event_id,
+            epc=event.epc,
+            observed_at=event.observed_at,
+            rssi=-61.0,
+            antenna_id=event.antenna_id,
+        )
+        # The second request deliberately violates the immutable event contract.
+        # A conforming API accepts the first batch and rejects the second with 409.
+        return [
+            ObservationBatch(primary, (event,)),
+            ObservationBatch(primary, (conflicting,), expected_http_status=409),
         ]
 
     if scenario == "repeated-reads":
@@ -287,6 +310,11 @@ def post_batches(
         try:
             with urlopen(request, timeout=timeout) as response:  # noqa: S310
                 response_body = json.loads(response.read().decode("utf-8"))
+                if response.status != batch.expected_http_status:
+                    raise RuntimeError(
+                        f"batch {index} returned {response.status}; "
+                        f"expected {batch.expected_http_status}"
+                    )
                 results.append(
                     {
                         "batch_number": index,
@@ -295,8 +323,20 @@ def post_batches(
                     }
                 )
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"batch {index} was rejected ({exc.code}): {body}") from exc
+            raw_body = exc.read().decode("utf-8", errors="replace")
+            if exc.code != batch.expected_http_status:
+                raise RuntimeError(f"batch {index} was rejected ({exc.code}): {raw_body}") from exc
+            try:
+                response_body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                response_body = {"detail": raw_body}
+            results.append(
+                {
+                    "batch_number": index,
+                    "http_status": exc.code,
+                    "response": response_body,
+                }
+            )
         except URLError as exc:
             raise RuntimeError(f"could not reach Abacus for batch {index}: {exc.reason}") from exc
     return results

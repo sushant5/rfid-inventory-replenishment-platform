@@ -12,7 +12,7 @@ from abacus.config import get_settings
 from abacus.db import get_db
 
 router = APIRouter(tags=["Operations"])
-EXPECTED_SCHEMA_REVISION = "a6f0c4d1e537"
+EXPECTED_SCHEMA_REVISION = "e9b7c1a4d205"
 
 
 class HealthResponse(BaseModel):
@@ -79,13 +79,10 @@ async def readiness(db: Annotated[Session, Depends(get_db)]) -> HealthResponse:
             code="schema_not_ready",
         )
     try:
-        cutover_ready = db.scalar(
-            text(
-                "SELECT NOT EXISTS ("
-                "SELECT 1 FROM legacy_replenishment_tasks "
-                "WHERE reservation_cutover_reviewed = false)"
-            )
-        )
+        # The runtime role has no tenant context during a global readiness check.
+        # This narrow SECURITY DEFINER function can see every cutover row without
+        # granting the application a general RLS bypass.
+        cutover_ready = db.scalar(text("SELECT app_cutover_ready()"))
     except SQLAlchemyError as exc:
         db.rollback()
         raise ApiError(

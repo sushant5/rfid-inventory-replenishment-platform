@@ -135,6 +135,7 @@ def accept_observation_batch(
                     received_at=received_at,
                     rssi=observation.rssi,
                     antenna_id=observation.antenna_id,
+                    reader_health=1.0 if request.reader_coverage_ok else 0.0,
                     is_buffered=buffered,
                     backlog_drained=request.backlog_drained,
                     reader_coverage_ok=request.reader_coverage_ok,
