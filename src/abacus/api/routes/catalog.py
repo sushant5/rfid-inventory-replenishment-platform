@@ -13,6 +13,7 @@ from abacus.schemas.catalog import (
     CatalogImportErrorRead,
     CatalogImportListRead,
     CatalogImportRead,
+    SkuActivityFilter,
     SkuListRead,
     SkuRead,
 )
@@ -223,7 +224,15 @@ def list_catalog_import_errors_canonical_endpoint(
 def list_skus_canonical_endpoint(
     db: DatabaseSession,
     principal: CanReadCatalog,
-    active: bool | None = True,
+    active: Annotated[
+        SkuActivityFilter,
+        Query(
+            description=(
+                "Activity scope: ACTIVE, INACTIVE, or ALL. The former true/false values "
+                "remain accepted as aliases for ACTIVE/INACTIVE."
+            )
+        ),
+    ] = SkuActivityFilter.ACTIVE,
     code: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -231,7 +240,7 @@ def list_skus_canonical_endpoint(
     rows, total = list_skus(
         db,
         principal.tenant_id,
-        active=active,
+        active=active.database_value(),
         code=code,
         limit=limit,
         offset=offset,
@@ -267,7 +276,15 @@ def list_skus_endpoint(
     tenant_id: uuid.UUID,
     db: DatabaseSession,
     principal: CanReadCatalog,
-    active: bool | None = True,
+    active: Annotated[
+        SkuActivityFilter,
+        Query(
+            description=(
+                "Activity scope: ACTIVE, INACTIVE, or ALL. The former true/false values "
+                "remain accepted as aliases for ACTIVE/INACTIVE."
+            )
+        ),
+    ] = SkuActivityFilter.ACTIVE,
     code: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
@@ -282,7 +299,7 @@ def list_skus_endpoint(
     rows, total = list_skus(
         db,
         tenant_id,
-        active=active,
+        active=active.database_value(),
         code=code,
         limit=limit,
         offset=offset,

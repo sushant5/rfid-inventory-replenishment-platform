@@ -10,6 +10,7 @@ from abacus.enums import DeviceStatus
 from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.catalog import ProductStyle, Sku
 from abacus.models.tenancy import Device, DeviceAssignment
+from abacus.schemas.catalog import SkuActivityFilter
 from abacus.security import Principal, RoleScope
 
 
@@ -75,7 +76,7 @@ def test_canonical_sku_discovery_uses_authenticated_tenant(
     result = catalog_routes.list_skus_canonical_endpoint(
         Mock(spec=Session),
         principal,
-        active=True,
+        active=SkuActivityFilter.ACTIVE,
         code="SKU-1-M",
         limit=25,
         offset=0,

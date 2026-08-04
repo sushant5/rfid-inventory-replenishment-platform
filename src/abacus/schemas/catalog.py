@@ -1,6 +1,7 @@
 import re
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import Field, field_validator
@@ -11,6 +12,34 @@ from abacus.schemas.common import ApiModel
 PRODUCT_CODE_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]*$")
 EPC_URI_PATTERN = re.compile(r"^urn:epc:(?:id|tag):[a-z0-9-]+:[a-z0-9.*%_-]+(?:\.[a-z0-9.*%_-]+)*$")
 GTIN_LENGTHS = {8, 12, 13, 14}
+
+
+class SkuActivityFilter(StrEnum):
+    """Public SKU activity filter with compatibility for the former boolean query."""
+
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+    ALL = "ALL"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "SkuActivityFilter | None":
+        if isinstance(value, bool):
+            return cls.ACTIVE if value else cls.INACTIVE
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized == "TRUE":
+                return cls.ACTIVE
+            if normalized == "FALSE":
+                return cls.INACTIVE
+            return cls.__members__.get(normalized)
+        return None
+
+    def database_value(self) -> bool | None:
+        if self is self.ACTIVE:
+            return True
+        if self is self.INACTIVE:
+            return False
+        return None
 
 
 def normalize_product_code(value: str, *, field_name: str, max_length: int) -> str:

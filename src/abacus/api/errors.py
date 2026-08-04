@@ -11,6 +11,71 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute, RouteContext, iter_route_contexts
 from pydantic import BaseModel
 
+# These responses are operation-specific runtime behavior, not an assumption that
+# every write can conflict. Keeping the registry keyed by stable operationId makes
+# a renamed or removed operation fail OpenAPI generation instead of silently drifting.
+OPERATION_PROBLEM_RESPONSES: dict[str, dict[str, str]] = {
+    "createTenant": {
+        "409": "The tenant code conflicts with existing tenant data",
+    },
+    "createStoreImport": {
+        "400": "The idempotency key is blank",
+        "409": "The idempotency key or requested store data conflicts with existing data",
+    },
+    "createStoreZone": {
+        "409": "The zone code already exists in the store",
+    },
+    "registerStoreDevice": {
+        "409": "The device serial or assignment conflicts with existing data",
+    },
+    "createCatalogImport": {
+        "400": "The idempotency key is blank",
+        "409": "The idempotency key conflicts with a previous catalog import",
+    },
+    "submitRfidObservationBatch": {
+        "409": "An event identifier conflicts with a previously accepted observation",
+    },
+    "createUser": {
+        "409": "The user email or requested access conflicts with existing data",
+    },
+    "replaceUserAccess": {
+        "409": "The access update conflicts with protected or concurrently changed access",
+    },
+    "replaceUserRoles": {
+        "409": "The role update conflicts with protected or concurrently changed access",
+    },
+    "replaceUserStoreAssignments": {
+        "409": "The assignment update conflicts with concurrently changed access",
+    },
+    "suspendUser": {
+        "409": "The user cannot be suspended in the current state",
+    },
+    "createReplenishmentPolicy": {
+        "409": "The policy name or rules conflict with existing policy data",
+    },
+    "createReplenishmentPolicyVersion": {
+        "409": "A policy version was created concurrently or has no source version",
+    },
+    "patchReplenishmentPolicyVersion": {
+        "409": "The policy version is immutable or its rules changed concurrently",
+    },
+    "activateReplenishmentPolicyVersion": {
+        "409": "The version cannot be activated or its rules overlap an active policy",
+    },
+    "evaluateReplenishment": {
+        "409": "Policy selection is ambiguous or an active task was created concurrently",
+    },
+    "patchReplenishmentTask": {
+        "409": "The task transition or optimistic-lock version conflicts with current state",
+    },
+    "login": {
+        "429": "Too many login attempts",
+    },
+    "readiness": {
+        "503": "A readiness dependency is unavailable",
+    },
+}
+
 
 class ProblemDetail(BaseModel):
     type: str = "about:blank"
@@ -156,12 +221,14 @@ def install_openapi_error_contract(app: FastAPI) -> None:
             if isinstance(route.original_route, APIRoute)
             for method in (route.methods or set())
         }
+        documented_operation_ids: set[str] = set()
         for path, path_item in schema.get("paths", {}).items():
             for method, operation in path_item.items():
                 if not isinstance(operation, dict) or "responses" not in operation:
                     continue
                 operation_id = operation.get("operationId")
                 if isinstance(operation_id, str):
+                    documented_operation_ids.add(operation_id)
                     words = re.sub(r"(?<!^)(?=[A-Z])", " ", operation_id)
                     words = (
                         words.replace("Rfid", "RFID").replace("Skus", "SKUs").replace("Sku", "SKU")
@@ -200,21 +267,16 @@ def install_openapi_error_contract(app: FastAPI) -> None:
                     responses.setdefault(
                         "404", problem_response("The requested resource was not found")
                     )
-                if (
-                    method.lower() in {"post", "put", "patch", "delete"}
-                    and path != "/v1/auth/login"
-                ):
-                    responses.setdefault(
-                        "409",
-                        problem_response("The request conflicts with the current resource state"),
-                    )
-                if path == "/v1/auth/login":
-                    responses.setdefault("429", problem_response("Too many login attempts"))
-                if path == "/health/ready":
-                    responses.setdefault(
-                        "503", problem_response("A readiness dependency is unavailable")
-                    )
+                if isinstance(operation_id, str):
+                    for status_code, description in OPERATION_PROBLEM_RESPONSES.get(
+                        operation_id, {}
+                    ).items():
+                        responses.setdefault(status_code, problem_response(description))
                 responses.setdefault("500", problem_response("An unexpected server error occurred"))
+        missing_operations = set(OPERATION_PROBLEM_RESPONSES).difference(documented_operation_ids)
+        if missing_operations:
+            missing = ", ".join(sorted(missing_operations))
+            raise RuntimeError(f"OpenAPI error metadata references unknown operations: {missing}")
         app.openapi_schema = schema
         return schema
 
