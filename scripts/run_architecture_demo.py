@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from scripts.generate_showcase_catalog import (
         build_showcase_catalog,
         epcs_for_sku,
+        sku_for_number,
     )
     from scripts.generate_store_batch import build_store_batch
 else:
@@ -24,16 +25,18 @@ else:
         from scripts.generate_showcase_catalog import (
             build_showcase_catalog,
             epcs_for_sku,
+            sku_for_number,
         )
         from scripts.generate_store_batch import build_store_batch
     else:  # Executed as `python scripts/run_architecture_demo.py`.
-        from generate_showcase_catalog import build_showcase_catalog, epcs_for_sku
+        from generate_showcase_catalog import build_showcase_catalog, epcs_for_sku, sku_for_number
         from generate_store_batch import build_store_batch
 
 # Use a release-specific SKU for the stateful workflow. PRIMARY_EPCS remain in
 # the catalog for existing integrations, but may already have authoritative
 # history on a long-lived hosted demo.
 EPCS = epcs_for_sku(4)
+WORKFLOW_SKU = sku_for_number(4)
 
 
 class DemoFailure(RuntimeError):
@@ -389,7 +392,12 @@ def seed_showcase_store_inventory(
             )[1]
         },
         lambda item: (
-            sum(int(row["quantity"]) for row in page_items(item["page"], "showcase inventory")) == 4
+            sum(
+                int(row["quantity"])
+                for row in page_items(item["page"], "showcase inventory")
+                if row["sku"] == sku_for_number(sku_number)
+            )
+            == 4
         ),
         timeout=poll_timeout,
     )
@@ -579,10 +587,17 @@ def run(args: argparse.Namespace) -> None:
                 "GET", f"/v1/stores/{store1_id}/inventory", headers=bearer(admin_token)
             )[1]
         },
-        lambda item: sum(row["quantity"] for row in page_items(item["page"], "inventory")) == 4,
+        lambda item: (
+            sum(
+                row["quantity"]
+                for row in page_items(item["page"], "inventory")
+                if row["sku"] == WORKFLOW_SKU
+            )
+            == 4
+        ),
         timeout=args.poll_timeout,
     )
-    rows = page_items(inventory["page"], "inventory")
+    rows = [row for row in page_items(inventory["page"], "inventory") if row["sku"] == WORKFLOW_SKU]
     quantities = {str(row["zone"]): int(row["quantity"]) for row in rows}
     if quantities != {"backroom": 3, "floor": 1}:
         raise DemoFailure(f"unexpected inventory: {quantities}")
@@ -826,7 +841,12 @@ def run(args: argparse.Namespace) -> None:
         },
         lambda item: (
             item["item"]["presence_status"] == "REMOVED"
-            and sum(row["quantity"] for row in page_items(item["inventory"], "inventory")) == 3
+            and sum(
+                row["quantity"]
+                for row in page_items(item["inventory"], "inventory")
+                if row["sku"] == WORKFLOW_SKU
+            )
+            == 3
         ),
         timeout=args.poll_timeout,
     )

@@ -12,6 +12,7 @@ from scripts.generate_showcase_catalog import (
     PRIMARY_EPCS,
     build_showcase_catalog,
     epcs_for_sku,
+    sku_for_number,
     upc_for_sku,
 )
 
@@ -30,6 +31,7 @@ def test_showcase_catalog_is_deterministic_and_reviewer_sized() -> None:
     assert len({row["upc"] for row in rows}) == 100
     assert len(epcs_for_sku(2)) == len(epcs_for_sku(3)) == 4
     assert len(epcs_for_sku(4)) == 4
+    assert sku_for_number(4) == "SKU-DEMO-004-L"
     assert upc_for_sku(1) == "036000291452"
     parsed = parse_catalog_csv(content)
     assert parsed.issues == []
