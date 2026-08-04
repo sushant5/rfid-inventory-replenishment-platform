@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from scripts.generate_showcase_catalog import (
-        PRIMARY_EPCS,
         build_showcase_catalog,
         epcs_for_sku,
     )
@@ -23,16 +22,18 @@ if TYPE_CHECKING:
 else:
     if __package__:
         from scripts.generate_showcase_catalog import (
-            PRIMARY_EPCS,
             build_showcase_catalog,
             epcs_for_sku,
         )
         from scripts.generate_store_batch import build_store_batch
     else:  # Executed as `python scripts/run_architecture_demo.py`.
-        from generate_showcase_catalog import PRIMARY_EPCS, build_showcase_catalog, epcs_for_sku
+        from generate_showcase_catalog import build_showcase_catalog, epcs_for_sku
         from generate_store_batch import build_store_batch
 
-EPCS = PRIMARY_EPCS
+# Use a release-specific SKU for the stateful workflow. PRIMARY_EPCS remain in
+# the catalog for existing integrations, but may already have authoritative
+# history on a long-lived hosted demo.
+EPCS = epcs_for_sku(4)
 
 
 class DemoFailure(RuntimeError):
