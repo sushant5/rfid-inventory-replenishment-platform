@@ -841,6 +841,7 @@ def evaluate_replenishment(
     settings: Settings,
     minimum_confidence: float,
 ) -> EvaluationResult:
+    _ensure_store_scope(principal, Permission.REPLENISHMENT_MANAGE, request.store_id)
     store = db.scalar(
         select(Store)
         .where(
@@ -852,7 +853,6 @@ def evaluate_replenishment(
     )
     if store is None:
         raise ApiError(404, "Store not found", "The requested store does not exist.")
-    _ensure_store_scope(principal, Permission.REPLENISHMENT_MANAGE, store.id)
     connectivity = db.scalar(
         select(StoreConnectivity).where(
             StoreConnectivity.tenant_id == principal.tenant_id,
@@ -1100,6 +1100,7 @@ def list_store_tasks(
     limit: int,
     offset: int,
 ) -> tuple[list[ReplenishmentTask], int]:
+    _ensure_store_scope(principal, Permission.REPLENISHMENT_READ, store_id)
     store_exists = db.scalar(
         select(Store.id).where(
             Store.tenant_id == principal.tenant_id,
@@ -1108,7 +1109,6 @@ def list_store_tasks(
     )
     if store_exists is None:
         raise ApiError(404, "Store not found", "The requested store does not exist.")
-    _ensure_store_scope(principal, Permission.REPLENISHMENT_READ, store_id)
     predicates = [
         ReplenishmentTask.tenant_id == principal.tenant_id,
         ReplenishmentTask.store_id == store_id,

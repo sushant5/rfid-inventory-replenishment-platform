@@ -104,6 +104,13 @@ def _store_in_principal_tenant(
     principal: Principal,
     store_id: uuid.UUID,
 ) -> Store:
+    if not principal.can_access_store(Permission.TENANT_CONFIGURE, store_id):
+        raise ApiError(
+            403,
+            "Forbidden",
+            "The requested store is outside the current user's access scope.",
+            code="store_scope_denied",
+        )
     store = db.scalar(
         select(Store).where(
             Store.id == store_id,
@@ -113,13 +120,6 @@ def _store_in_principal_tenant(
     if store is None:
         # Tenant-scoped lookup avoids confirming another tenant's identifiers.
         raise ApiError(404, "Store not found", "The requested store does not exist.")
-    if not principal.can_access_store(Permission.TENANT_CONFIGURE, store.id):
-        raise ApiError(
-            403,
-            "Forbidden",
-            "The requested store is outside the current user's access scope.",
-            code="store_scope_denied",
-        )
     return store
 
 
