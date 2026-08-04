@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import structlog
 from pydantic import ValidationError
-from sqlalchemy import select, text
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.orm import Session
 
 from abacus.config import get_settings
@@ -29,7 +29,6 @@ from abacus.models.architecture import (
 from abacus.services.streaming_inventory import (
     RecentObservationState,
     apply_inventory_deltas,
-    confirm_timed_out_removals,
     process_observation,
     quarantine_observation,
 )
@@ -179,7 +178,6 @@ def process_tenant_once(
     recent: RecentObservationState,
     *,
     limit: int = 250,
-    sweep_removals: bool = True,
 ) -> tuple[int, int]:
     """Drain raw events, then their ordered inventory transitions in one tenant."""
 
@@ -277,22 +275,32 @@ def process_tenant_once(
             raw_error = exc
             break
 
-    if sweep_removals:
-        with tenant_session_scope(tenant_id) as db:
-            confirm_timed_out_removals(
-                db,
-                tenant_id=tenant_id,
-                settings=settings,
-                limit=limit,
-            )
-            db.commit()
-
     # Each transition commits independently. A malformed payload is retried without
     # rolling back valid work or blocking unrelated items behind it.
     with tenant_session_scope(tenant_id) as db:
+        earliest_pending = (
+            select(
+                InventoryTransitionOutbox.epc.label("epc"),
+                func.min(InventoryTransitionOutbox.state_version).label("state_version"),
+            )
+            .where(
+                InventoryTransitionOutbox.tenant_id == tenant_id,
+                InventoryTransitionOutbox.published_at.is_(None),
+                InventoryTransitionOutbox.quarantined_at.is_(None),
+            )
+            .group_by(InventoryTransitionOutbox.epc)
+            .subquery()
+        )
         transition_ids = list(
             db.scalars(
                 select(InventoryTransitionOutbox.transition_id)
+                .join(
+                    earliest_pending,
+                    and_(
+                        earliest_pending.c.epc == InventoryTransitionOutbox.epc,
+                        earliest_pending.c.state_version == InventoryTransitionOutbox.state_version,
+                    ),
+                )
                 .where(
                     InventoryTransitionOutbox.tenant_id == tenant_id,
                     InventoryTransitionOutbox.published_at.is_(None),
@@ -300,7 +308,6 @@ def process_tenant_once(
                 )
                 .order_by(
                     InventoryTransitionOutbox.created_at,
-                    InventoryTransitionOutbox.state_version,
                     InventoryTransitionOutbox.transition_id,
                 )
                 .limit(limit)
@@ -370,23 +377,15 @@ def run() -> None:
     settings = get_settings()
     worker_id = f"event-{socket.gethostname()}-{uuid.uuid4()}"
     recent = RecentObservationState()
-    next_removal_sweep: dict[uuid.UUID, float] = {}
     logger.info("event_worker_started", worker_id=worker_id)
     while not _stop_requested:
         processed = 0
         for tenant_id in _active_tenants():
             try:
-                now = time.monotonic()
-                sweep_removals = now >= next_removal_sweep.get(tenant_id, 0.0)
                 raw_count, transition_count = process_tenant_once(
                     tenant_id,
                     recent,
-                    sweep_removals=sweep_removals,
                 )
-                if sweep_removals:
-                    next_removal_sweep[tenant_id] = (
-                        now + settings.rfid_removal_sweep_interval_seconds
-                    )
                 processed += raw_count + transition_count
             except Exception:
                 logger.exception("event_worker_tenant_failed", tenant_id=str(tenant_id))

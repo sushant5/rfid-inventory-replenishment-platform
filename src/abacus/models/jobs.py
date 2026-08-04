@@ -20,6 +20,14 @@ class DurableJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="ck_durable_jobs_processing_lease",
         ),
         Index("ix_durable_jobs_claim", "status", "available_at", "created_at"),
+        Index(
+            "ix_durable_jobs_tenant_claim",
+            "tenant_id",
+            "kind",
+            "status",
+            "available_at",
+            "created_at",
+        ),
         Index("ix_durable_jobs_tenant_kind", "tenant_id", "kind"),
     )
 

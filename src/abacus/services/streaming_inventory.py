@@ -22,6 +22,7 @@ from abacus.models.architecture import (
     FreshnessStatus,
     InventoryProjection,
     InventoryTransitionOutbox,
+    ItemPresenceStatus,
     ObservationBatchStatus,
     RfidEventProcessingStatus,
     RfidObservationBatch,
@@ -36,7 +37,14 @@ from abacus.models.tenancy import Device, DeviceAssignment
 
 @dataclass(frozen=True, slots=True)
 class ProcessingResult:
-    disposition: Literal["PROCESSED", "DUPLICATE", "LATE", "QUARANTINED", "AMBIGUOUS"]
+    disposition: Literal[
+        "PROCESSED",
+        "DUPLICATE",
+        "LATE",
+        "QUARANTINED",
+        "AMBIGUOUS",
+        "REMOVED_ITEM_OBSERVED",
+    ]
     reason: str | None = None
     state_changed: bool = False
 
@@ -342,6 +350,27 @@ def effective_freshness(
     return FreshnessStatus.DEGRADED
 
 
+def effective_presence_status(
+    state: CurrentItemState,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> ItemPresenceStatus:
+    """Classify observation age without mutating or decrementing inventory."""
+
+    if state.authoritative_removal_event_id is not None:
+        return ItemPresenceStatus.REMOVED
+    if state.store_id is None or state.zone_id is None:
+        # Releases before the authoritative-event ledger used a null location for
+        # timeout tombstones. Leave those rows recoverable by a stable RFID window.
+        return ItemPresenceStatus.LOCATION_UNKNOWN
+    current_time = now or datetime.now(UTC)
+    age_seconds = max(0.0, (current_time - state.last_observed_at).total_seconds())
+    if age_seconds > settings.rfid_unobserved_after_seconds:
+        return ItemPresenceStatus.UNOBSERVED
+    return ItemPresenceStatus.OBSERVED
+
+
 def _quarantine(
     db: Session,
     event: RfidObservationEvent,
@@ -501,7 +530,11 @@ def _update_connectivity(
     return connectivity
 
 
-def _processed_observation_watermark(db: Session, event: RfidObservationEvent) -> datetime | None:
+def processed_observation_watermark(
+    db: Session,
+    tenant_id: uuid.UUID,
+    epc: str,
+) -> datetime | None:
     """Return the latest durable event-time watermark for one physical item.
 
     The immutable event ledger is updated for every accepted event anyway. Using it
@@ -511,8 +544,8 @@ def _processed_observation_watermark(db: Session, event: RfidObservationEvent) -
 
     return db.scalar(
         select(func.max(RfidObservationEventLedger.observed_at)).where(
-            RfidObservationEventLedger.tenant_id == event.tenant_id,
-            RfidObservationEventLedger.epc == event.epc,
+            RfidObservationEventLedger.tenant_id == tenant_id,
+            RfidObservationEventLedger.epc == epc,
             RfidObservationEventLedger.processing_status == RfidEventProcessingStatus.PROCESSED,
         )
     )
@@ -690,7 +723,7 @@ def process_observation(
         )
         .with_for_update()
     )
-    processed_watermark = _processed_observation_watermark(db, event)
+    processed_watermark = processed_observation_watermark(db, event.tenant_id, event.epc)
     state_watermark = state.last_observed_at if state is not None else None
     durable_watermark = max(
         (value for value in (processed_watermark, state_watermark) if value is not None),
@@ -699,6 +732,16 @@ def process_observation(
     if durable_watermark is not None and event.observed_at < durable_watermark:
         _advance_batch(db, event, rejected=False, disposition="LATE")
         return ProcessingResult("LATE", reason="OBSERVED_AT_BEFORE_CURRENT_STATE")
+
+    if state is not None and state.authoritative_removal_event_id is not None:
+        # RFID is evidence of location, not authority to reverse a POS/WMS removal.
+        # Keep the observation in the durable ledger for investigation, but require
+        # an explicit future receipt/return command before this EPC can be counted.
+        _advance_batch(db, event, rejected=False, disposition="REMOVED_ITEM_OBSERVED")
+        return ProcessingResult(
+            "REMOVED_ITEM_OBSERVED",
+            reason="AUTHORITATIVELY_REMOVED",
+        )
 
     window = recent.add(resolved_event, settings.rfid_move_confirmation_window_seconds)
     decision = infer_stable_zone(window, settings)
@@ -825,71 +868,6 @@ def process_observation(
     )
     _advance_batch(db, event, rejected=False, disposition="PROCESSED")
     return ProcessingResult("PROCESSED", state_changed=True)
-
-
-def confirm_timed_out_removals(
-    db: Session,
-    *,
-    tenant_id: uuid.UUID,
-    settings: Settings,
-    now: datetime | None = None,
-    limit: int = 1000,
-) -> int:
-    current_time = now or datetime.now(UTC)
-    cutoff = current_time - timedelta(seconds=settings.rfid_removal_timeout_seconds)
-    live_cutoff = current_time - timedelta(seconds=settings.connectivity_live_window_seconds)
-    states = list(
-        db.scalars(
-            select(CurrentItemState)
-            .join(
-                StoreConnectivity,
-                (StoreConnectivity.tenant_id == CurrentItemState.tenant_id)
-                & (StoreConnectivity.store_id == CurrentItemState.store_id),
-            )
-            .where(
-                CurrentItemState.tenant_id == tenant_id,
-                CurrentItemState.zone_id.is_not(None),
-                CurrentItemState.last_observed_at < cutoff,
-                StoreConnectivity.backlog_drained.is_(True),
-                StoreConnectivity.reader_coverage_ok.is_(True),
-                StoreConnectivity.oldest_buffered_event_at.is_(None),
-                StoreConnectivity.gateway_last_heartbeat >= live_cutoff,
-                StoreConnectivity.last_live_event_at >= live_cutoff,
-            )
-            .order_by(CurrentItemState.last_observed_at)
-            .with_for_update(skip_locked=True)
-            .limit(limit)
-        ).all()
-    )
-    for state in states:
-        assert state.store_id is not None and state.zone_id is not None
-        next_version = state.state_version + 1
-        transition_id = deterministic_transition_id(tenant_id, state.epc, next_version)
-        delta = _delta_payload(
-            transition_id=transition_id,
-            tenant_id=tenant_id,
-            epc=state.epc,
-            sku_id=state.sku_id,
-            store_id=state.store_id,
-            zone_id=state.zone_id,
-            quantity_delta=-1,
-            confidence=state.confidence,
-            observed_at=current_time,
-        )
-        state.store_id = None
-        state.zone_id = None
-        state.state_version = next_version
-        db.add(
-            InventoryTransitionOutbox(
-                transition_id=transition_id,
-                tenant_id=tenant_id,
-                epc=state.epc,
-                state_version=next_version,
-                deltas=[delta],
-                publish_attempts=0,
-            )
-        )
-    return len(states)
 
 
 def apply_inventory_deltas(db: Session, deltas: list[InventoryDeltaEvent]) -> int:

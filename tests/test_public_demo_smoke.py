@@ -82,10 +82,11 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
         "policies",
         "tasks",
         "quarantine",
-        "seven write categories denied",
+        "eight write categories denied",
     ]
-    mutation_requests = requests[-7:]
+    mutation_requests = requests[-8:]
     assert [method for method, _, _ in mutation_requests] == [
+        "POST",
         "POST",
         "POST",
         "POST",
@@ -98,6 +99,7 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
         "users",
         "stores/store-1/zones",
         "stores/store-1/devices",
+        "stores/store-1/business-events",
         "replenishment-policy-versions/00000000-0000-0000-0000-000000000000/activate",
         "replenishment/evaluations",
         "devices/00000000-0000-0000-0000-000000000000/credentials:rotate",

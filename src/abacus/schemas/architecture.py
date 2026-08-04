@@ -5,6 +5,7 @@ from pydantic import Field, field_validator, model_validator
 
 from abacus.models.architecture import (
     FreshnessStatus,
+    ItemPresenceStatus,
     ObservationBatchStatus,
     RfidEventProcessingStatus,
 )
@@ -130,6 +131,19 @@ class ItemStateRead(ApiModel):
     last_received_at: datetime
     confidence: float = Field(
         description="Effective item-location confidence after read-time recency decay."
+    )
+    presence_status: ItemPresenceStatus = Field(
+        description=(
+            "OBSERVED while recent, UNOBSERVED after the configured age threshold, "
+            "LOCATION_UNKNOWN for a recoverable pre-upgrade timeout tombstone, or REMOVED "
+            "after an authoritative business event. Located UNOBSERVED items remain inventory."
+        )
+    )
+    authoritative_removal_event_id: uuid.UUID | None = Field(
+        description="Business event that authoritatively removed the item, when applicable."
+    )
+    authoritative_removed_at: datetime | None = Field(
+        description="Business-event time of the authoritative removal, when applicable."
     )
     state_version: int
     freshness_status: FreshnessStatus

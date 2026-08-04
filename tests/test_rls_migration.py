@@ -65,10 +65,29 @@ def _load_catalog_source_migration() -> ModuleType:
     return module
 
 
+def _load_business_event_migration() -> ModuleType:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "f8c1d2e3a4b6_authoritative_business_events.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "abacus_business_event_migration",
+        migration_path,
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("Unable to load business-event migration")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 def test_rls_table_inventory_matches_all_tenant_owned_models() -> None:
     migration = _load_rls_migration()
     retirement = _load_retirement_migration()
     catalog_source = _load_catalog_source_migration()
+    business_events = _load_business_event_migration()
     modeled_tenant_tables = {
         table.name for table in Base.metadata.tables.values() if "tenant_id" in table.columns
     }
@@ -76,7 +95,9 @@ def test_rls_table_inventory_matches_all_tenant_owned_models() -> None:
 
     historical_tables = set(migration.TENANT_OWNED_TABLES)
     retired_tables = set(retirement.RETIRED_TABLES)
-    added_tables = set(catalog_source.ADDED_TENANT_TABLES)
+    added_tables = set(catalog_source.ADDED_TENANT_TABLES) | set(
+        business_events.ADDED_TENANT_TABLES
+    )
     assert historical_tables | added_tables == modeled_tenant_tables | retired_tables
     assert historical_tables.isdisjoint(added_tables)
     assert modeled_tenant_tables.isdisjoint(retired_tables)

@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -44,6 +45,7 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "users"
     __table_args__ = (
         UniqueConstraint("tenant_id", "email", name="uq_users_tenant_email"),
+        UniqueConstraint("tenant_id", "id", name="uq_users_tenant_id"),
         CheckConstraint("email = lower(email)", name="ck_users_email_lowercase"),
         CheckConstraint("token_version >= 1", name="ck_users_token_version_positive"),
         Index("ix_users_tenant_status", "tenant_id", "status"),
@@ -72,6 +74,18 @@ class UserAccessGrant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "(role = 'CORPORATE_ADMIN' AND store_id IS NULL) OR "
             "(role IN ('STORE_MANAGER', 'STORE_ASSOCIATE') AND store_id IS NOT NULL)",
             name="ck_user_access_grants_role_scope",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "user_id"],
+            ["users.tenant_id", "users.id"],
+            name="fk_user_access_grants_tenant_user",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_user_access_grants_tenant_store",
+            ondelete="CASCADE",
         ),
         Index(
             "uq_user_access_grants_tenant_role",
@@ -112,6 +126,11 @@ class UserAccessGrant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 class IdentityAuditRecord(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "identity_audit_records"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "actor_user_id"],
+            ["users.tenant_id", "users.id"],
+            name="fk_identity_audit_tenant_actor",
+        ),
         Index("ix_identity_audit_tenant_occurred", "tenant_id", "occurred_at"),
         Index("ix_identity_audit_actor", "tenant_id", "actor_user_id"),
     )

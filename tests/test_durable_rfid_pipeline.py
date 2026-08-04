@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import delete, event, func, select, text, update
+from sqlalchemy import delete, event, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 import abacus.processes.event_worker as event_worker
@@ -20,13 +22,17 @@ from abacus.api.routes.rfid import (
 )
 from abacus.config import Settings
 from abacus.enums import DeviceStatus, StoreStatus, TenantStatus, ZoneKind
+from abacus.events.inventory import InventoryDeltaEvent
 from abacus.events.rfid import RfidObservationEvent
 from abacus.models.architecture import (
     AppliedInventoryDelta,
+    BusinessEvent,
+    BusinessEventType,
     CurrentItemState,
     FreshnessStatus,
     InventoryProjection,
     InventoryTransitionOutbox,
+    ItemPresenceStatus,
     ObservationBatchStatus,
     PolicyDefinition,
     PolicyRule,
@@ -58,13 +64,16 @@ from abacus.schemas.architecture import (
     ObservationBatchCreate,
     ObservationInput,
 )
+from abacus.schemas.business_events import BusinessEventCreate
 from abacus.schemas.replenishment import ReplenishmentEvaluationCreate
 from abacus.security import Principal, RoleScope
+from abacus.services.business_events import accept_authoritative_removal
 from abacus.services.replenishment import evaluate_replenishment
 from abacus.services.rfid_ingress import accept_observation_batch
 from abacus.services.streaming_inventory import (
     ProcessingResult,
     RecentObservationState,
+    deterministic_transition_id,
     effective_freshness,
     rebuild_inventory_projection,
 )
@@ -225,6 +234,7 @@ def durable_pipeline(
             )
         )
         db.commit()
+
         fixture = DurablePipelineFixture(
             tenant_id=tenant_id,
             store_id=store_id,
@@ -239,17 +249,7 @@ def durable_pipeline(
         yield fixture
     finally:
         with postgres_session_factory() as db:
-            # Activated versions are immutable, including during FK cascades.
             db.scalar(select(func.set_config("app.tenant_id", str(fixture.tenant_id), True)))
-            db.execute(
-                update(PolicyVersion)
-                .where(PolicyVersion.tenant_id == fixture.tenant_id)
-                .values(status=PolicyVersionStatus.DRAFT)
-            )
-            # Delete rules while their DRAFT parent still exists. A tenant cascade
-            # may remove the version before the rule trigger checks its status.
-            db.execute(delete(PolicyRule).where(PolicyRule.tenant_id == fixture.tenant_id))
-            db.commit()
             db.execute(delete(Tenant).where(Tenant.id == fixture.tenant_id))
             db.commit()
 
@@ -324,6 +324,427 @@ def _tenant_admin(fixture: DurablePipelineFixture) -> Principal:
     )
 
 
+def test_pre_upgrade_timeout_tombstone_is_recoverable_from_stable_reads(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    _establish_projection(postgres_session_factory, durable_pipeline)
+    legacy_removed_at = durable_pipeline.observed_at + timedelta(seconds=30)
+    legacy_transition_id = deterministic_transition_id(
+        durable_pipeline.tenant_id,
+        durable_pipeline.epc,
+        2,
+    )
+    with postgres_session_factory() as db:
+        state = db.get(CurrentItemState, (durable_pipeline.tenant_id, durable_pipeline.epc))
+        projection = db.get(
+            InventoryProjection,
+            (
+                durable_pipeline.tenant_id,
+                durable_pipeline.store_id,
+                durable_pipeline.sku_id,
+                durable_pipeline.zone_id,
+            ),
+        )
+        assert state is not None and projection is not None
+        state.store_id = None
+        state.zone_id = None
+        state.state_version = 2
+        projection.quantity = 0
+        db.add(
+            InventoryTransitionOutbox(
+                transition_id=legacy_transition_id,
+                tenant_id=durable_pipeline.tenant_id,
+                epc=durable_pipeline.epc,
+                state_version=2,
+                deltas=[
+                    InventoryDeltaEvent(
+                        delta_id=(
+                            f"{legacy_transition_id}:{durable_pipeline.sku_id}:"
+                            f"{durable_pipeline.zone_id}"
+                        ),
+                        transition_id=legacy_transition_id,
+                        tenant_id=durable_pipeline.tenant_id,
+                        store_id=durable_pipeline.store_id,
+                        sku_id=durable_pipeline.sku_id,
+                        zone_id=durable_pipeline.zone_id,
+                        epc=durable_pipeline.epc,
+                        quantity_delta=-1,
+                        confidence=state.confidence,
+                        observed_at=legacy_removed_at,
+                    ).model_dump(mode="json")
+                ],
+                published_at=legacy_removed_at,
+                publish_attempts=1,
+            )
+        )
+        db.commit()
+
+        legacy_item = get_item_state_endpoint(
+            durable_pipeline.epc,
+            db,
+            Settings(),
+            _tenant_admin(durable_pipeline),
+        )
+        assert legacy_item.presence_status == ItemPresenceStatus.LOCATION_UNKNOWN
+
+    reappeared_at = legacy_removed_at + timedelta(seconds=30)
+    request = ObservationBatchCreate(
+        device_id=durable_pipeline.device_id,
+        observations=[
+            ObservationInput(
+                event_id=str(uuid.uuid4()),
+                epc=durable_pipeline.epc,
+                observed_at=reappeared_at + timedelta(seconds=index),
+                rssi=-40,
+            )
+            for index in range(3)
+        ],
+    )
+    _accept(
+        postgres_session_factory,
+        durable_pipeline,
+        request,
+        received_at=reappeared_at + timedelta(seconds=4),
+    )
+    assert event_worker.process_tenant_once(
+        durable_pipeline.tenant_id,
+        RecentObservationState(),
+    ) == (3, 1)
+
+    with postgres_session_factory() as db:
+        state = db.get(CurrentItemState, (durable_pipeline.tenant_id, durable_pipeline.epc))
+        projection = db.get(
+            InventoryProjection,
+            (
+                durable_pipeline.tenant_id,
+                durable_pipeline.store_id,
+                durable_pipeline.sku_id,
+                durable_pipeline.zone_id,
+            ),
+        )
+        assert state is not None and projection is not None
+        assert state.state_version == 3
+        assert state.store_id == durable_pipeline.store_id
+        assert state.zone_id == durable_pipeline.zone_id
+        assert state.authoritative_removal_event_id is None
+        assert projection.quantity == 1
+
+
+def test_business_event_uses_durable_read_watermark_and_rejects_invalid_removals(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    _establish_projection(postgres_session_factory, durable_pipeline)
+    later_read_at = durable_pipeline.observed_at + timedelta(seconds=10)
+    _accept(
+        postgres_session_factory,
+        durable_pipeline,
+        ObservationBatchCreate(
+            device_id=durable_pipeline.device_id,
+            observations=[
+                ObservationInput(
+                    event_id=str(uuid.uuid4()),
+                    epc=durable_pipeline.epc,
+                    observed_at=later_read_at,
+                    rssi=-40,
+                )
+            ],
+        ),
+        received_at=later_read_at + timedelta(seconds=1),
+    )
+    assert event_worker.process_tenant_once(
+        durable_pipeline.tenant_id,
+        RecentObservationState(),
+    ) == (1, 0)
+
+    other_store_id = uuid.uuid4()
+    with postgres_session_factory() as db:
+        state = db.get(CurrentItemState, (durable_pipeline.tenant_id, durable_pipeline.epc))
+        assert state is not None and state.last_observed_at < later_read_at
+        db.add(
+            Store(
+                id=other_store_id,
+                tenant_id=durable_pipeline.tenant_id,
+                code=f"other-{uuid.uuid4().hex[:12]}",
+                name="Other Store",
+                timezone="UTC",
+                status=StoreStatus.ACTIVE,
+                configuration={},
+            )
+        )
+        db.commit()
+
+    def removal_request(
+        external_event_id: str,
+        occurred_at: datetime,
+        *,
+        epc: str = durable_pipeline.epc,
+    ) -> BusinessEventCreate:
+        return BusinessEventCreate(
+            source_system="TEST_POS",
+            external_event_id=external_event_id,
+            event_type=BusinessEventType.SALE,
+            epc=epc,
+            occurred_at=occurred_at,
+        )
+
+    with postgres_session_factory() as db, pytest.raises(ApiError) as stale:
+        accept_authoritative_removal(
+            db,
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=durable_pipeline.store_id,
+            request=removal_request(
+                "stale-sale",
+                durable_pipeline.observed_at + timedelta(seconds=5),
+            ),
+            settings=Settings(),
+        )
+    assert stale.value.code == "stale_business_event"
+
+    with postgres_session_factory() as db, pytest.raises(ApiError) as future:
+        accept_authoritative_removal(
+            db,
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=durable_pipeline.store_id,
+            request=removal_request(
+                "future-sale",
+                datetime.now(UTC) + timedelta(seconds=600),
+            ),
+            settings=Settings(rfid_max_future_skew_seconds=300),
+        )
+    assert future.value.code == "business_event_time_too_far_in_future"
+
+    with postgres_session_factory() as db, pytest.raises(ApiError) as wrong_store:
+        accept_authoritative_removal(
+            db,
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=other_store_id,
+            request=removal_request("wrong-store-sale", later_read_at + timedelta(seconds=1)),
+            settings=Settings(),
+        )
+    assert wrong_store.value.code == "business_event_store_mismatch"
+
+    with postgres_session_factory() as db, pytest.raises(ApiError) as unknown:
+        accept_authoritative_removal(
+            db,
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=durable_pipeline.store_id,
+            request=removal_request(
+                "unknown-item-sale",
+                later_read_at + timedelta(seconds=1),
+                epc="3034FFFFFFFFFFFFFFFFFFFF",
+            ),
+            settings=Settings(),
+        )
+    assert unknown.value.code == "business_event_item_not_found"
+
+    accepted_request = removal_request("accepted-sale", later_read_at + timedelta(seconds=1))
+    with postgres_session_factory() as db:
+        accepted = accept_authoritative_removal(
+            db,
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=durable_pipeline.store_id,
+            request=accepted_request,
+            settings=Settings(),
+        )
+        accepted_event_id = accepted.event.id
+        assert accepted.created is True
+
+    with postgres_session_factory() as db:
+        retry = accept_authoritative_removal(
+            db,
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=durable_pipeline.store_id,
+            request=accepted_request,
+            settings=Settings(),
+        )
+        assert retry.created is False
+        assert retry.event.id == accepted_event_id
+
+    with postgres_session_factory() as db, pytest.raises(ApiError) as second_removal:
+        accept_authoritative_removal(
+            db,
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=durable_pipeline.store_id,
+            request=removal_request(
+                "different-sale",
+                later_read_at + timedelta(seconds=2),
+            ),
+            settings=Settings(),
+        )
+    assert second_removal.value.code == "business_event_item_already_removed"
+
+    with postgres_session_factory() as db:
+        state = db.get(CurrentItemState, (durable_pipeline.tenant_id, durable_pipeline.epc))
+        assert state is not None
+        assert state.authoritative_removal_event_id == accepted_event_id
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(BusinessEvent)
+                .where(BusinessEvent.tenant_id == durable_pipeline.tenant_id)
+            )
+            == 1
+        )
+
+
+def test_concurrent_identical_business_events_create_one_removal(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    _establish_projection(postgres_session_factory, durable_pipeline)
+    request = BusinessEventCreate(
+        source_system="CONCURRENT_POS",
+        external_event_id="same-source-event",
+        event_type=BusinessEventType.SALE,
+        epc=durable_pipeline.epc,
+        occurred_at=datetime.now(UTC),
+    )
+    barrier = Barrier(2)
+
+    def submit() -> tuple[uuid.UUID, bool]:
+        barrier.wait(timeout=15)
+        with postgres_session_factory() as db:
+            result = accept_authoritative_removal(
+                db,
+                tenant_id=durable_pipeline.tenant_id,
+                store_id=durable_pipeline.store_id,
+                request=request,
+                settings=Settings(),
+            )
+            return result.event.id, result.created
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: submit(), range(2)))
+
+    assert len({event_id for event_id, _created in results}) == 1
+    assert sorted(created for _event_id, created in results) == [False, True]
+    with postgres_session_factory() as db:
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(BusinessEvent)
+                .where(BusinessEvent.tenant_id == durable_pipeline.tenant_id)
+            )
+            == 1
+        )
+
+
+def test_inventory_transitions_are_applied_in_state_version_order_per_epc(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    _establish_projection(postgres_session_factory, durable_pipeline)
+    second_zone_id = uuid.uuid4()
+    version_two_id = deterministic_transition_id(
+        durable_pipeline.tenant_id,
+        durable_pipeline.epc,
+        2,
+    )
+    version_three_id = deterministic_transition_id(
+        durable_pipeline.tenant_id,
+        durable_pipeline.epc,
+        3,
+    )
+    observed_at = durable_pipeline.observed_at + timedelta(seconds=30)
+
+    def delta(
+        transition_id: uuid.UUID,
+        zone_id: uuid.UUID,
+        quantity_delta: int,
+    ) -> dict[str, object]:
+        return InventoryDeltaEvent(
+            delta_id=f"{transition_id}:{durable_pipeline.sku_id}:{zone_id}",
+            transition_id=transition_id,
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=durable_pipeline.store_id,
+            sku_id=durable_pipeline.sku_id,
+            zone_id=zone_id,
+            epc=durable_pipeline.epc,
+            quantity_delta=quantity_delta,
+            confidence=0.9,
+            observed_at=observed_at,
+        ).model_dump(mode="json")
+
+    with postgres_session_factory() as db:
+        db.add(
+            Zone(
+                id=second_zone_id,
+                tenant_id=durable_pipeline.tenant_id,
+                store_id=durable_pipeline.store_id,
+                code="ordered-zone",
+                name="Ordered Zone",
+                kind=ZoneKind.BACKROOM,
+            )
+        )
+        db.flush()
+        db.add_all(
+            [
+                InventoryTransitionOutbox(
+                    transition_id=version_two_id,
+                    tenant_id=durable_pipeline.tenant_id,
+                    epc=durable_pipeline.epc,
+                    state_version=2,
+                    deltas=[
+                        delta(version_two_id, durable_pipeline.zone_id, -1),
+                        delta(version_two_id, second_zone_id, 1),
+                    ],
+                    created_at=observed_at + timedelta(seconds=10),
+                    publish_attempts=0,
+                ),
+                InventoryTransitionOutbox(
+                    transition_id=version_three_id,
+                    tenant_id=durable_pipeline.tenant_id,
+                    epc=durable_pipeline.epc,
+                    state_version=3,
+                    deltas=[delta(version_three_id, second_zone_id, -1)],
+                    created_at=observed_at,
+                    publish_attempts=0,
+                ),
+            ]
+        )
+        db.commit()
+
+    assert event_worker.process_tenant_once(
+        durable_pipeline.tenant_id,
+        RecentObservationState(),
+    ) == (0, 1)
+    with postgres_session_factory() as db:
+        version_two = db.get(InventoryTransitionOutbox, version_two_id)
+        version_three = db.get(InventoryTransitionOutbox, version_three_id)
+        second_projection = db.get(
+            InventoryProjection,
+            (
+                durable_pipeline.tenant_id,
+                durable_pipeline.store_id,
+                durable_pipeline.sku_id,
+                second_zone_id,
+            ),
+        )
+        assert version_two is not None and version_two.published_at is not None
+        assert version_three is not None and version_three.published_at is None
+        assert second_projection is not None and second_projection.quantity == 1
+
+    assert event_worker.process_tenant_once(
+        durable_pipeline.tenant_id,
+        RecentObservationState(),
+    ) == (0, 1)
+    with postgres_session_factory() as db:
+        version_three = db.get(InventoryTransitionOutbox, version_three_id)
+        second_projection = db.get(
+            InventoryProjection,
+            (
+                durable_pipeline.tenant_id,
+                durable_pipeline.store_id,
+                durable_pipeline.sku_id,
+                second_zone_id,
+            ),
+        )
+        assert version_three is not None and version_three.published_at is not None
+        assert second_projection is not None and second_projection.quantity == 0
+
+
 def test_inventory_api_reads_bucket_metadata_from_current_item_state(
     postgres_session_factory: sessionmaker[Session],
     durable_pipeline: DurablePipelineFixture,
@@ -375,7 +796,10 @@ def test_item_and_bucket_confidence_age_while_store_remains_live(
 ) -> None:
     _establish_projection(postgres_session_factory, durable_pipeline)
     now = datetime.now(UTC)
-    settings = Settings(rfid_confidence_half_life_seconds=1800)
+    settings = Settings(
+        rfid_confidence_half_life_seconds=1800,
+        rfid_unobserved_after_seconds=900,
+    )
 
     with postgres_session_factory() as db:
         state = db.get(CurrentItemState, (durable_pipeline.tenant_id, durable_pipeline.epc))
@@ -411,6 +835,7 @@ def test_item_and_bucket_confidence_age_while_store_remains_live(
         assert inventory.items[0].confidence == pytest.approx(0.5, abs=0.001)
         assert item.freshness_status == FreshnessStatus.LIVE
         assert item.confidence == pytest.approx(0.5, abs=0.001)
+        assert item.presence_status == ItemPresenceStatus.UNOBSERVED
 
         # Rebuilding snapshot metadata must not make old item evidence look fresh.
         assert rebuild_inventory_projection(db, durable_pipeline.tenant_id) == 1
@@ -1202,7 +1627,7 @@ def test_projection_rebuild_rejects_pending_transition(
         assert projection.quantity == 1
 
 
-def test_event_worker_confirms_timed_out_removal(
+def test_rfid_silence_does_not_remove_inventory(
     postgres_session_factory: sessionmaker[Session],
     durable_pipeline: DurablePipelineFixture,
 ) -> None:
@@ -1241,10 +1666,9 @@ def test_event_worker_confirms_timed_out_removal(
     assert event_worker.process_tenant_once(
         durable_pipeline.tenant_id,
         RecentObservationState(),
-        sweep_removals=True,
-    ) == (0, 1)
+    ) == (0, 0)
     with postgres_session_factory() as db:
-        removed = db.get(CurrentItemState, (durable_pipeline.tenant_id, durable_pipeline.epc))
+        unobserved = db.get(CurrentItemState, (durable_pipeline.tenant_id, durable_pipeline.epc))
         projection = db.get(
             InventoryProjection,
             (
@@ -1254,12 +1678,12 @@ def test_event_worker_confirms_timed_out_removal(
                 durable_pipeline.zone_id,
             ),
         )
-        assert removed is not None
-        assert removed.store_id is None
-        assert removed.zone_id is None
-        assert removed.state_version == 2
+        assert unobserved is not None
+        assert unobserved.store_id == durable_pipeline.store_id
+        assert unobserved.zone_id == durable_pipeline.zone_id
+        assert unobserved.state_version == 1
         assert projection is not None
-        assert projection.quantity == 0
+        assert projection.quantity == 1
 
 
 def test_unknown_epc_rejects_every_link_and_completes_retry_batches(
@@ -1739,7 +2163,6 @@ def test_poison_transition_does_not_block_later_projection_and_requires_rebuild(
     assert event_worker.process_tenant_once(
         durable_pipeline.tenant_id,
         recent,
-        sweep_removals=False,
     ) == (0, 1)
     with postgres_session_factory() as db:
         poison = db.get(InventoryTransitionOutbox, poison_transition_id)
@@ -1762,7 +2185,6 @@ def test_poison_transition_does_not_block_later_projection_and_requires_rebuild(
     assert event_worker.process_tenant_once(
         durable_pipeline.tenant_id,
         recent,
-        sweep_removals=False,
     ) == (0, 0)
     with postgres_session_factory() as db:
         poison = db.get(InventoryTransitionOutbox, poison_transition_id)

@@ -3,8 +3,9 @@ flowchart LR
         Reviewer[Reviewer / Swagger] -->|JWT| API[FastAPI API]
         Platform[Platform onboarding operator] -->|platform key| API
         Gateway[RFID gateway] -->|device token + batches| API
+        POS[POS / WMS] -->|idempotent authoritative removal| API
 
-        API -->|tenant-scoped transactions| PG[(PostgreSQL 17 + RLS)]
+        API -->|tenant-scoped transactions| PG[(PostgreSQL + RLS)]
         API -->|immutable catalog source + durable job| PG
         PG -->|accepted import| Catalog[Catalog worker]
         Catalog -->|validate staging + atomic promotion| PG
@@ -14,6 +15,7 @@ flowchart LR
         Events -->|effective assignment + stable-zone state| PG
         Events -->|deduped projection updates| PG
         Events --> Quarantine[Quarantine records]
+        API -->|item state + transactional outbox| PG
 
         PG -->|fresh projection + active policy| Replenishment[Policy evaluation]
         Replenishment -->|one active task per store / SKU| PG

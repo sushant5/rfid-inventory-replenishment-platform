@@ -42,6 +42,7 @@ from abacus.services.streaming_inventory import (
     effective_bucket_confidence,
     effective_freshness,
     effective_item_confidence,
+    effective_presence_status,
 )
 
 router = APIRouter(prefix="/v1", tags=["3. RFID and Inventory"])
@@ -375,6 +376,13 @@ def get_item_state_endpoint(
             evaluated_at=evaluated_at,
             half_life_seconds=settings.rfid_confidence_half_life_seconds,
         ),
+        presence_status=effective_presence_status(
+            item,
+            settings,
+            now=evaluated_at,
+        ),
+        authoritative_removal_event_id=item.authoritative_removal_event_id,
+        authoritative_removed_at=item.authoritative_removed_at,
         state_version=item.state_version,
         freshness_status=effective_freshness(connectivity, settings, now=evaluated_at),
     )

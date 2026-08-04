@@ -37,7 +37,10 @@ PUBLIC_DEMO_PASSWORD = os.getenv(
 OPENAPI_TAGS = [
     {"name": "1. Onboarding", "description": "Tenant, store, zone, and device setup."},
     {"name": "2. Product catalog", "description": "Asynchronous catalog import and SKU lookup."},
-    {"name": "3. RFID and Inventory", "description": "RFID ingestion and current inventory state."},
+    {
+        "name": "3. RFID and Inventory",
+        "description": "RFID ingestion, current inventory, and authoritative item removals.",
+    },
     {
         "name": "4. Identity and Access",
         "description": "Authentication, users, roles, and store scope.",

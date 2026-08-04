@@ -305,6 +305,11 @@ def test_invalid_catalog_is_rejected_asynchronously_and_source_is_retained(
 ) -> None:
     tenant_id, access_token = _create_tenant(api_client, postgres_session_factory)
     try:
+        valid_import = _submit_catalog(api_client, tenant_id, access_token, VALID_CSV)
+        valid_worker_id = f"async-catalog-valid-{uuid.uuid4()}"
+        valid_job = _claim_catalog_job(tenant_id, valid_worker_id)
+        catalog_worker._process_job(tenant_id, valid_job, valid_worker_id)
+
         accepted = _submit_catalog(api_client, tenant_id, access_token, INVALID_CSV)
         import_id = uuid.UUID(str(accepted["id"]))
         assert accepted["status"] == CatalogImportStatus.VALIDATING
@@ -321,6 +326,19 @@ def test_invalid_catalog_is_rejected_asynchronously_and_source_is_retained(
             assert catalog_import.status is CatalogImportStatus.REJECTED
             assert source is not None and source.content == INVALID_CSV
             assert persisted_job is not None and persisted_job.status is JobStatus.COMPLETED
+            promoted = db.get(CatalogImport, uuid.UUID(str(valid_import["id"])))
+            assert promoted is not None
+            assert promoted.status is CatalogImportStatus.COMPLETED
+            assert (
+                db.scalar(select(func.count()).select_from(Sku).where(Sku.tenant_id == tenant_id))
+                == 1
+            )
+            assert (
+                db.scalar(
+                    select(func.count()).select_from(RfidTag).where(RfidTag.tenant_id == tenant_id)
+                )
+                == 1
+            )
             assert (
                 db.scalar(
                     select(func.count())

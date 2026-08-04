@@ -268,6 +268,18 @@ def run_checks(
             },
         ),
         (
+            "authoritative inventory removal",
+            "POST",
+            f"/v1/stores/{store_id}/business-events",
+            {
+                "source_system": "PUBLIC_REVIEWER",
+                "external_event_id": "write-must-be-denied",
+                "event_type": "SALE",
+                "epc": "303400000000000000000001",
+                "occurred_at": "2026-01-01T00:00:00Z",
+            },
+        ),
+        (
             "policy activation",
             "POST",
             f"/v1/replenishment-policy-versions/{ZERO_UUID}/activate",
@@ -310,7 +322,7 @@ def run_checks(
         "policies",
         "tasks",
         "quarantine",
-        "seven write categories denied",
+        "eight write categories denied",
     ]
 
 

@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -43,6 +44,13 @@ class OrganizationUnit(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "organization_units"
     __table_args__ = (
         UniqueConstraint("tenant_id", "code", name="uq_org_units_tenant_code"),
+        UniqueConstraint("tenant_id", "id", name="uq_organization_units_tenant_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "parent_id"],
+            ["organization_units.tenant_id", "organization_units.id"],
+            name="fk_organization_units_tenant_parent",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint("code = lower(code)", name="ck_org_units_code_lowercase"),
         Index("ix_org_units_tenant_parent", "tenant_id", "parent_id"),
     )
@@ -64,6 +72,13 @@ class Store(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "stores"
     __table_args__ = (
         UniqueConstraint("tenant_id", "code", name="uq_stores_tenant_code"),
+        UniqueConstraint("tenant_id", "id", name="uq_stores_tenant_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "organization_unit_id"],
+            ["organization_units.tenant_id", "organization_units.id"],
+            name="fk_stores_tenant_organization_unit",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint("code = lower(code)", name="ck_stores_code_lowercase"),
         Index("ix_stores_tenant_status", "tenant_id", "status"),
     )
@@ -95,6 +110,13 @@ class Zone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "zones"
     __table_args__ = (
         UniqueConstraint("store_id", "code", name="uq_zones_store_code"),
+        UniqueConstraint("tenant_id", "store_id", "id", name="uq_zones_tenant_store_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_zones_tenant_store",
+            ondelete="CASCADE",
+        ),
         CheckConstraint("code = lower(code)", name="ck_zones_code_lowercase"),
         Index("ix_zones_tenant_store_kind", "tenant_id", "store_id", "kind"),
     )
@@ -119,6 +141,7 @@ class Device(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "devices"
     __table_args__ = (
         UniqueConstraint("serial_number", name="uq_devices_serial_number"),
+        UniqueConstraint("tenant_id", "id", name="uq_devices_tenant_id"),
         Index("ix_devices_tenant_status", "tenant_id", "status"),
     )
 
@@ -142,6 +165,24 @@ class DeviceAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "effective_to IS NULL OR effective_to > effective_from",
             name="ck_device_assignments_valid_interval",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "device_id"],
+            ["devices.tenant_id", "devices.id"],
+            name="fk_device_assignments_tenant_device",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_device_assignments_tenant_store",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id", "zone_id"],
+            ["zones.tenant_id", "zones.store_id", "zones.id"],
+            name="fk_device_assignments_tenant_store_zone",
+            ondelete="RESTRICT",
         ),
         Index(
             "ix_device_assignments_lookup",

@@ -25,6 +25,8 @@ EXPECTED_PROBLEM_STATUSES = {
     "replayRfidQuarantine": {"401", "403", "404", "409", "422", "500"},
     "getStoreInventory": {"401", "403", "404", "422", "500"},
     "getCurrentItemState": {"401", "403", "404", "422", "500"},
+    "createBusinessEvent": {"401", "403", "404", "409", "422", "500"},
+    "getBusinessEvent": {"401", "403", "404", "422", "500"},
     "getCurrentUser": {"401", "500"},
     "login": {"401", "422", "429", "500"},
     "createUser": {"401", "403", "409", "422", "500"},
@@ -69,7 +71,7 @@ def test_openapi_documents_runtime_error_contract() -> None:
     assert len(operations) == len(EXPECTED_PROBLEM_STATUSES)
     assert all("500" in operation["responses"] for operation in operations)
     secured = [operation for operation in operations if operation.get("security")]
-    assert len(secured) == 38
+    assert len(secured) == 40
     assert all("401" in operation["responses"] for operation in secured)
     assert "401" in schema["paths"]["/v1/auth/login"]["post"]["responses"]
 

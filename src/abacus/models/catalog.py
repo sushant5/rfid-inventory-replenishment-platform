@@ -57,6 +57,7 @@ class ProductStyle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "product_styles"
     __table_args__ = (
         UniqueConstraint("tenant_id", "code", name="uq_product_styles_tenant_code"),
+        UniqueConstraint("tenant_id", "id", name="uq_product_styles_tenant_id"),
         CheckConstraint("code = upper(code)", name="ck_product_styles_code_uppercase"),
         Index("ix_product_styles_tenant_active", "tenant_id", "active"),
     )
@@ -76,6 +77,19 @@ class Sku(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "code", name="uq_skus_tenant_code"),
         UniqueConstraint("tenant_id", "upc", name="uq_skus_tenant_upc"),
+        UniqueConstraint("tenant_id", "id", name="uq_skus_tenant_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "product_style_id"],
+            ["product_styles.tenant_id", "product_styles.id"],
+            name="fk_skus_tenant_product_style",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "product_variant_id"],
+            ["product_variants.tenant_id", "product_variants.id"],
+            name="fk_skus_tenant_product_variant",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint("code = upper(code)", name="ck_skus_code_uppercase"),
         Index("ix_skus_tenant_style_active", "tenant_id", "product_style_id", "active"),
     )
@@ -199,6 +213,12 @@ class CatalogImportRow(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "catalog_import_rows"
     __table_args__ = (
         UniqueConstraint("import_id", "row_number", name="uq_catalog_import_rows_number"),
+        ForeignKeyConstraint(
+            ["tenant_id", "import_id"],
+            ["catalog_imports.tenant_id", "catalog_imports.id"],
+            name="fk_catalog_import_rows_tenant_import",
+            ondelete="CASCADE",
+        ),
         CheckConstraint("row_number >= 2", name="ck_catalog_import_rows_data_row_number"),
         Index("ix_catalog_import_rows_tenant_import", "tenant_id", "import_id"),
     )
@@ -236,7 +256,15 @@ class CatalogImportRow(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 class CatalogImportError(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "catalog_import_errors"
-    __table_args__ = (Index("ix_catalog_import_errors_tenant_import", "tenant_id", "import_id"),)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "import_id"],
+            ["catalog_imports.tenant_id", "catalog_imports.id"],
+            name="fk_catalog_import_errors_tenant_import",
+            ondelete="CASCADE",
+        ),
+        Index("ix_catalog_import_errors_tenant_import", "tenant_id", "import_id"),
+    )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"),
@@ -260,6 +288,18 @@ class EpcBinding(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "effective_to IS NULL OR effective_to > effective_from",
             name="ck_epc_bindings_valid_interval",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "sku_id"],
+            ["skus.tenant_id", "skus.id"],
+            name="fk_epc_bindings_tenant_sku",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "source_import_id"],
+            ["catalog_imports.tenant_id", "catalog_imports.id"],
+            name="fk_epc_bindings_tenant_source_import",
+            ondelete="RESTRICT",
         ),
         Index(
             "uq_epc_bindings_active_tenant_epc",

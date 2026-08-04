@@ -4,7 +4,7 @@ Production-shaped backend for Orange's RFID inventory and replenishment workflow
 
 `Tenant/Store → Zones/Devices → Catalog/EPCs → RFID → Item State → Inventory → Policy → Task`
 
-The reference API is Python 3.12, FastAPI, SQLAlchemy 2, PostgreSQL 17, Alembic,
+The reference API is Python 3.12, FastAPI, SQLAlchemy 2, PostgreSQL, Alembic,
 JWT, and Pytest. There is intentionally no frontend or external message broker.
 
 ## Hosted demo
@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.7.0` on Render with PostgreSQL 16. Render may need
+The hosted demo runs release `0.8.0` on Render with managed PostgreSQL. Render may need
 about a minute to wake the free web service after inactivity.
 
 Public reviewer login:
@@ -69,6 +69,8 @@ key is limited to platform-led tenant/store onboarding; the tenant administrator
 catalog and identity changes, and device credentials permit RFID ingestion. None are
 needed to inspect the hosted API. The repository owner can run the full
 write-path walkthrough with those credentials through `scripts/run_architecture_demo.py`.
+The public Orange tenant must contain dummy data only: this tenant-wide read-only identity
+can inspect its stores, inventory, device metadata, and quarantine payloads.
 
 The hosted database is preseeded. Startup intentionally reconciles identities but does
 not recreate mutable stores, catalog, or inventory; after attaching a fresh database,
@@ -90,8 +92,9 @@ make demo
 make test
 ```
 
-The demo prints six end-to-end checks, including duplicate/late RFID protection and
-store-level authorization. Swagger is at <http://localhost:8000/docs>; readiness is
+The demo prints seven end-to-end checks, including duplicate/late RFID protection,
+store-level authorization, and an idempotent authoritative sale. Swagger is at
+<http://localhost:8000/docs>; readiness is
 at <http://localhost:8000/health/ready>.
 
 Required commands:
@@ -100,7 +103,7 @@ Required commands:
 |---|---|
 | `docker compose up --build` | Start the API, PostgreSQL, and both workers |
 | `make migrate` | Apply Alembic with the migration-owner credential |
-| `make seed` | Idempotently create Orange and its demo tenant administrator |
+| `make seed` | Idempotently create Orange, its demo administrator, and public read-only reviewer |
 | `make test` | Run unit and PostgreSQL integration tests in an isolated test database |
 | `make demo` | Build/start the stack and run the complete end-to-end workflow |
 
@@ -112,6 +115,7 @@ credentials in `docker-compose.yml` are deliberately marked local-only.
 ```mermaid
 flowchart LR
     Gateway[RFID gateway] -->|device token| API[FastAPI]
+    POS[POS / WMS] -->|manager JWT + idempotent event| API
     Reviewer[Reviewer / Swagger] -->|read-only JWT| API
     Operator[Repository owner] -->|private platform and device credentials| API
     API --> PG[(PostgreSQL + RLS)]
@@ -145,8 +149,13 @@ also a production extension, not a demo dependency.
   uses the owner credential.
 - Runtime connections enforce statement, lock-wait, and idle-transaction timeouts;
   schema migrations use a separate owner connection without those request limits.
+  Each hosted process uses a bounded `3 + 2` connection pool by default, keeping the
+  three-process connection budget at 15 rather than relying on SQLAlchemy defaults.
 - Every tenant transaction sets `app.tenant_id`; forced RLS fails closed when the
   context is absent. Tenant IDs in request bodies are never trusted.
+- Composite tenant-aware foreign keys bind every child to a parent in the same tenant.
+  Store/zone tuples are also constrained together, so a device, observation, item,
+  projection, or delta cannot reference a zone from another store.
 - RLS deliberately enforces the tenant boundary. Store authorization is a separate,
   explicit application boundary: current role and store assignments are loaded from
   PostgreSQL on every request, and collection/resource handlers apply the centralized
@@ -173,22 +182,24 @@ also a production extension, not a demo dependency.
   ledger provides the durable event-time watermark after a worker restart, so this
   optimization cannot allow a late event to regress state.
 - Freshness is derived from heartbeat age, live-event age, backlog drain, and reader
-  coverage. It decays without needing another event. Non-live stores cannot trigger
-  automatic replenishment or RFID timeout removals.
+  coverage. It decays without needing another event. RFID silence never decrements
+  inventory: an old item becomes `UNOBSERVED`, remains counted, and loses confidence.
+  Only an idempotent authoritative sale, transfer-out, or approved removal adjustment
+  clears its location and emits `-1` through the same transactional outbox.
 - Role and store-scope changes are atomic, invalidate existing JWTs, and append an
   audit record. The corresponding migration downgrade deliberately refuses to narrow
   the action constraint after such records exist rather than discard audit history.
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.7.0`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.0`).
 
 The visible contract includes all required endpoints:
 
 - Onboarding: tenants, store imports, scoped store discovery, zones, devices
 - Catalog: create import, status, row errors, SKU discovery
 - RFID: submit batch, batch status, tenant-wide quarantine inspection and recovery
-- Inventory: store projection, physical item state
+- Inventory: store projection, physical item state, authoritative business-event removal
 - Identity: create user, atomically replace access, replace roles/store assignments, current user
 - Replenishment: policy discovery/version/activation, evaluation, task list/lifecycle
 - Operations: liveness, readiness, version
@@ -226,12 +237,16 @@ Hosted stable-zone defaults are configurable:
 - 10-second evidence window
 - median-RSSI tie-break across competing observed zones
 - previous zone retained with lower confidence when evidence is ambiguous
-- 30-minute absence before confirmed removal, only while the store is live
+- 30 minutes without a confirmed read before an item is reported `UNOBSERVED`; it stays counted
 - 30-minute confidence half-life, evaluated at read time without rewriting item rows
 
-Production thresholds require pilot calibration. The confidence half-life and removal
-timeout are independently configurable: confidence can suppress automation before a
-location is confirmed absent. Recent evidence is intentionally
+Production thresholds require pilot calibration. The confidence half-life and
+`UNOBSERVED` threshold are independently configurable; neither changes quantity.
+
+An upgraded timeout tombstone that already lost its former location is reported
+`LOCATION_UNKNOWN` and remains excluded until three stable reads re-establish its location. New
+silence never creates this state.
+Recent evidence is intentionally
 process-local for this hosted slice. The event ledger and current state are durable;
 after a worker restart, new reads rebuild the evidence window while database
 watermarks and conditional state updates prevent state regression. The demo uses
@@ -272,6 +287,20 @@ A partial unique index permits only one `OPEN`, `CLAIMED`, or `IN_PROGRESS` task
 tenant/store/SKU. The lifecycle is `OPEN → CLAIMED → IN_PROGRESS → COMPLETED`, with
 `CANCELED` and `EXPIRED` terminal alternatives.
 
+If a later evaluation finds an uncovered shortage, it grows an existing `OPEN` task
+under a row lock and increments its optimistic version. It never changes a task already
+`CLAIMED` or `IN_PROGRESS`; the response reports that quantity as deferred for a later
+evaluation.
+
+The hosted business-event slice exposes
+`POST /v1/stores/{store_id}/business-events` and
+`GET /v1/stores/{store_id}/business-events/{event_id}`. Store managers and tenant
+administrators may submit `SALE`, `TRANSFER_OUT`, or `ADJUSTMENT_REMOVE` for a known
+EPC. `(tenant_id, source_system, external_event_id)` is the idempotency boundary.
+The item-state change and `-1` outbox row commit together; the event worker projects it
+at least once with deterministic delta deduplication. Expected-ledger quantities,
+receipts/returns, and variance reporting remain production extensions.
+
 Quarantined RFID records expose their reason and original payload through
 `GET /v1/rfid/quarantine` to tenant-wide inventory readers. The response derives each
 record's processing status and resolution time from the event ledger. A tenant
@@ -299,6 +328,11 @@ bounded poison-event handling, outbox transitions, delta dedupe, projection
 reconstruction, policy precedence, size curves, active-task uniqueness, and
 stale-store suppression.
 
+CI has two independent gates. One runs lint, strict typing, dependency audit, a full
+Alembic downgrade/upgrade, PostgreSQL tests, coverage, image build, and metadata drift
+checks. The other starts a clean Compose stack and literally runs `make migrate`,
+`make seed`, `make demo`, `make test`, the smoke test, and an API/worker restart check.
+
 `scripts/rfid_simulator.py` generates normal, duplicate, conflicting event-ID,
 repeated, late/out-of-order, competing-zone, unknown-EPC, outage/replay, and
 stationary-burst scenarios.
@@ -306,7 +340,7 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.7.0 --expected-build-sha <release-sha> --expected-schema-revision e2f6a1b3c904
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.0 --expected-build-sha <release-sha> --expected-schema-revision a9d4e6f2b713
 ```
 
 ## Hosting
@@ -316,6 +350,19 @@ and both worker entry points in one container. Docker Compose keeps those proces
 separate, which is the production-shaped topology. Hosted deployment needs one
 managed PostgreSQL database with two credentials: a migration owner and a non-owner
 `abacus_app` runtime role.
+
+Important environment variables are also enumerated in `.env.example`:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Restricted runtime-role connection used by API and workers |
+| `MIGRATION_DATABASE_URL` | Owner connection used only during migration startup |
+| `JWT_SECRET`, `PLATFORM_API_KEY` | Production secrets; demo defaults are rejected in production |
+| `DATABASE_POOL_SIZE`, `DATABASE_POOL_MAX_OVERFLOW` | Per-process connection budget |
+| `DATABASE_POOL_TIMEOUT_SECONDS`, `DATABASE_POOL_RECYCLE_SECONDS` | Pool wait and stale-connection limits |
+| `RFID_UNOBSERVED_AFTER_SECONDS` | Age threshold for reporting `UNOBSERVED`; never decrements quantity |
+| `RFID_CONFIDENCE_HALF_LIFE_SECONDS` | Read-time confidence decay |
+| `WORKER_LEASE_SECONDS`, `WORKER_MAX_ATTEMPTS` | Durable-job recovery and retry bounds |
 
 Create that role once with the database owner before the first deployment (replace
 the password and database name):

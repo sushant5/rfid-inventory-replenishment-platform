@@ -3,7 +3,7 @@ import uuid
 import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
-from sqlalchemy import delete, update
+from sqlalchemy import delete
 from sqlalchemy.orm import Session, sessionmaker
 
 from abacus.api.errors import ApiError
@@ -348,13 +348,6 @@ def test_policy_discovery_prefers_active_and_can_select_latest_draft(
             assert forbidden.value.status_code == 403
             assert forbidden.value.code == "policy_version_status_forbidden"
         finally:
-            db.execute(
-                update(PolicyVersion)
-                .where(PolicyVersion.tenant_id == tenant_id)
-                .values(status=PolicyVersionStatus.DRAFT)
-            )
-            db.commit()
-            db.execute(delete(PolicyRule).where(PolicyRule.tenant_id == tenant_id))
             db.execute(delete(Tenant).where(Tenant.id == tenant_id))
             db.commit()
 

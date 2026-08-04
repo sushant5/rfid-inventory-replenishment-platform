@@ -54,7 +54,7 @@ def liveness() -> HealthResponse:
 
 
 @router.get("/health/ready", response_model=ReadinessResponse, operation_id="readiness")
-async def readiness(db: Annotated[Session, Depends(get_db)]) -> ReadinessResponse:
+def readiness(db: Annotated[Session, Depends(get_db)]) -> ReadinessResponse:
     settings = get_settings()
     try:
         runtime_role_ready = db.scalar(

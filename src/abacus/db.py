@@ -2,26 +2,38 @@ import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 
-from sqlalchemy import Connection, create_engine, event, text
+from sqlalchemy import Connection, Engine, create_engine, event, text
 from sqlalchemy.orm import Session, SessionTransaction, sessionmaker
 
-from abacus.config import get_settings
+from abacus.config import Settings, get_settings
 
 settings = get_settings()
 
-engine = create_engine(
-    settings.database_url,
-    pool_pre_ping=True,
-    future=True,
-    connect_args={
-        "options": (
-            f"-c statement_timeout={settings.database_statement_timeout_ms} "
-            f"-c lock_timeout={settings.database_lock_timeout_ms} "
-            "-c idle_in_transaction_session_timeout="
-            f"{settings.database_idle_transaction_timeout_ms}"
-        )
-    },
-)
+
+def create_database_engine(runtime_settings: Settings) -> Engine:
+    """Create a bounded, stale-connection-safe application engine."""
+
+    return create_engine(
+        runtime_settings.database_url,
+        pool_pre_ping=True,
+        pool_size=runtime_settings.database_pool_size,
+        max_overflow=runtime_settings.database_pool_max_overflow,
+        pool_timeout=runtime_settings.database_pool_timeout_seconds,
+        pool_recycle=runtime_settings.database_pool_recycle_seconds,
+        hide_parameters=True,
+        future=True,
+        connect_args={
+            "options": (
+                f"-c statement_timeout={runtime_settings.database_statement_timeout_ms} "
+                f"-c lock_timeout={runtime_settings.database_lock_timeout_ms} "
+                "-c idle_in_transaction_session_timeout="
+                f"{runtime_settings.database_idle_transaction_timeout_ms}"
+            )
+        },
+    )
+
+
+engine = create_database_engine(settings)
 
 TENANT_CONTEXT_KEY = "tenant_id"
 

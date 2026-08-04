@@ -7,18 +7,16 @@ from typing import Any
 import pytest
 import scripts.run_architecture_demo as architecture_demo
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from abacus.config import get_settings
 from abacus.db import SessionLocal, tenant_session_scope
 from abacus.enums import JobKind, JobStatus
 from abacus.models.architecture import (
+    BusinessEvent,
     CurrentItemState,
     InventoryProjection,
-    PolicyRule,
-    PolicyVersion,
-    PolicyVersionStatus,
     ReplenishmentTask,
     ReplenishmentTaskStatus,
     RfidObservationBatch,
@@ -126,7 +124,9 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
 
             if method == "POST" and path.endswith("/catalog-imports"):
                 self.catalog_jobs += _drain_catalog_jobs()
-            elif method == "POST" and path == "/v1/rfid/observation-batches":
+            elif method == "POST" and (
+                path == "/v1/rfid/observation-batches" or path.endswith("/business-events")
+            ):
                 raw_count, transition_count = _drain_events(recent)
                 self.raw_events += raw_count
                 self.inventory_transitions += transition_count
@@ -163,13 +163,14 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
         output = capsys.readouterr().out
         assert "PASS RFID stable-zone inventory: floor=1 backroom=3" in output
         assert "PASS store-scoped authorization denied Store 2" in output
+        assert "PASS idempotent authoritative sale removed one physical item" in output
         assert output.rstrip().endswith("DEMO COMPLETE")
 
         assert len(created_clients) == 1
         in_process_client = created_clients[0]
         assert in_process_client.catalog_jobs == 1
-        assert in_process_client.raw_events == 13
-        assert in_process_client.inventory_transitions == 4
+        assert in_process_client.raw_events == 16
+        assert in_process_client.inventory_transitions == 5
 
         with postgres_session_factory() as verify_db:
             assert tenant_id is not None
@@ -178,6 +179,25 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                     select(func.count()).select_from(Store).where(Store.tenant_id == tenant_id)
                 )
                 == 2
+            )
+            assert (
+                verify_db.scalar(
+                    select(func.count())
+                    .select_from(CurrentItemState)
+                    .where(
+                        CurrentItemState.tenant_id == tenant_id,
+                        CurrentItemState.authoritative_removal_event_id.is_not(None),
+                    )
+                )
+                == 1
+            )
+            assert (
+                verify_db.scalar(
+                    select(func.count())
+                    .select_from(BusinessEvent)
+                    .where(BusinessEvent.tenant_id == tenant_id)
+                )
+                == 1
             )
             assert (
                 verify_db.scalar(
@@ -193,7 +213,7 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                         InventoryProjection.tenant_id == tenant_id
                     )
                 )
-                == 4
+                == 3
             )
             assert (
                 verify_db.scalar(
@@ -216,7 +236,7 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                         == RfidObservationBatch.accepted_count,
                     )
                 )
-                == 4
+                == 5
             )
             assert (
                 verify_db.scalar(
@@ -232,14 +252,5 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
     finally:
         if tenant_id is not None:
             with postgres_session_factory() as cleanup_db:
-                cleanup_db.execute(
-                    update(PolicyVersion)
-                    .where(PolicyVersion.tenant_id == tenant_id)
-                    .values(status=PolicyVersionStatus.DRAFT)
-                )
-                cleanup_db.execute(
-                    delete(ReplenishmentTask).where(ReplenishmentTask.tenant_id == tenant_id)
-                )
-                cleanup_db.execute(delete(PolicyRule).where(PolicyRule.tenant_id == tenant_id))
                 cleanup_db.execute(delete(Tenant).where(Tenant.id == tenant_id))
                 cleanup_db.commit()
