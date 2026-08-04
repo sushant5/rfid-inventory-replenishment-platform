@@ -31,6 +31,16 @@ SIZES = ("XS", "S", "M", "L", "XL")
 CATEGORIES = ("SHIRTS", "JACKETS", "TROUSERS", "DRESSES")
 
 
+def upc_for_sku(sku_number: int) -> str:
+    if sku_number == 1:
+        return "036000291452"
+    body = f"036{sku_number:08d}"
+    weighted_sum = sum(
+        int(digit) * (3 if index % 2 == 0 else 1) for index, digit in enumerate(body)
+    )
+    return body + str((-weighted_sum) % 10)
+
+
 def epcs_for_sku(sku_number: int) -> tuple[str, ...]:
     if sku_number == 1:
         return PRIMARY_EPCS
@@ -50,7 +60,7 @@ def build_showcase_catalog(sku_count: int = 100) -> bytes:
         size = "M" if number == 1 else SIZES[(number - 1) % len(SIZES)]
         category = CATEGORIES[(style_number - 1) % len(CATEGORIES)]
         sku = "SKU-TRAIL-BLUE-M" if number == 1 else f"SKU-DEMO-{number:03d}-{size}"
-        upc = "036000291452" if number == 1 else f"036{number:09d}"
+        upc = upc_for_sku(number)
         for epc in epcs_for_sku(number):
             writer.writerow(
                 {
