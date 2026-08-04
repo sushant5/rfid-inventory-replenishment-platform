@@ -325,6 +325,21 @@ def seed_showcase_store_inventory(
         headers=bearer(admin_token),
     )
     zones = {str(item["code"]): item for item in list_result(zones_value, "showcase zones")}
+    zone_definitions = {
+        "floor": ("Sales Floor", "SALES_FLOOR"),
+        "backroom": ("Backroom", "BACKROOM"),
+    }
+    for zone_code, (name, kind) in zone_definitions.items():
+        if zone_code in zones:
+            continue
+        _, zone_value = client.request(
+            "POST",
+            f"/v1/stores/{store_id}/zones",
+            expected=201,
+            headers=bearer(admin_token),
+            payload={"code": zone_code, "name": name, "kind": kind},
+        )
+        zones[zone_code] = object_result(zone_value, "showcase zone")
     _, mappings_value = client.request(
         "GET",
         f"/v1/stores/{store_id}/devices",
@@ -337,16 +352,34 @@ def seed_showcase_store_inventory(
         zone_id = str(required(zones[zone_code], "id"))
         mapping = mapping_by_zone.get(zone_id)
         if mapping is None:
-            raise DemoFailure(f"{zone_code} reader is missing for showcase store {store_id}")
-        device = object_result(required(mapping, "device"), "showcase device")
-        device_id = str(required(device, "id"))
-        _, credential_value = client.request(
-            "POST",
-            f"/v1/devices/{device_id}/credentials:rotate",
-            headers=bearer(admin_token),
-        )
-        credential = object_result(credential_value, "showcase credential")
-        tokens[zone_code] = (device_id, str(required(credential, "device_token")))
+            serial_number = f"SHOWCASE-{sku_number:03d}-{zone_code}-{uuid.uuid4().hex[:10]}"
+            _, registration_value = client.request(
+                "POST",
+                f"/v1/stores/{store_id}/devices",
+                expected=201,
+                headers=bearer(admin_token),
+                payload={
+                    "serial_number": serial_number,
+                    "display_name": f"Showcase {zone_code} reader",
+                    "zone_id": zone_id,
+                },
+            )
+            registration = object_result(registration_value, "showcase device registration")
+            device = object_result(required(registration, "device"), "showcase device")
+            tokens[zone_code] = (
+                str(required(device, "id")),
+                str(required(registration, "device_token")),
+            )
+        else:
+            device = object_result(required(mapping, "device"), "showcase device")
+            device_id = str(required(device, "id"))
+            _, credential_value = client.request(
+                "POST",
+                f"/v1/devices/{device_id}/credentials:rotate",
+                headers=bearer(admin_token),
+            )
+            credential = object_result(credential_value, "showcase credential")
+            tokens[zone_code] = (device_id, str(required(credential, "device_token")))
 
     epcs = epcs_for_sku(sku_number)
     floor_device_id, floor_token = tokens["floor"]
