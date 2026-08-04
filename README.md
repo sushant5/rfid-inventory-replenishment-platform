@@ -9,11 +9,11 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 
 ## Hosted demo
 
-- API: <https://abacus-inventory-api.onrender.com>
-- Swagger: <https://abacus-inventory-api.onrender.com/docs>
-- OpenAPI: <https://abacus-inventory-api.onrender.com/openapi.json>
-- Readiness: <https://abacus-inventory-api.onrender.com/health/ready>
-- Release metadata: <https://abacus-inventory-api.onrender.com/version>
+- API: <https://abacus-take-home-api.onrender.com>
+- Swagger: <https://abacus-take-home-api.onrender.com/docs>
+- OpenAPI: <https://abacus-take-home-api.onrender.com/openapi.json>
+- Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
+- Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
 The hosted demo runs release `0.8.1` on Render with managed PostgreSQL. Render may need
 about a minute to wake the free web service after inactivity.
@@ -35,7 +35,7 @@ returns `403 Forbidden` for this identity.
 same flow with curl:
 
 ```bash
-BASE=https://abacus-inventory-api.onrender.com
+BASE=https://abacus-take-home-api.onrender.com
 TOKEN=$(curl -sS -X POST "$BASE/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d '{"tenant_code":"orange","email":"demo-reader@orange.example","password":"Orange-Demo-ReadOnly-2026!"}' \
@@ -340,7 +340,7 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-inventory-api.onrender.com --timeout 90 --expected-version 0.8.1 --expected-build-sha <release-sha> --expected-schema-revision a9d4e6f2b713
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.1 --expected-build-sha <release-sha> --expected-schema-revision a9d4e6f2b713
 ```
 
 ## Hosting
