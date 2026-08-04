@@ -1,1 +1,1 @@
-"""Repository operations and reviewer-demo helpers."""
+"""Repository operations, smoke tests, and workflow helpers."""

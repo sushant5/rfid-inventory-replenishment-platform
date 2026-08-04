@@ -57,7 +57,7 @@ CanConfigureTenant = Annotated[
 _device_token_header = APIKeyHeader(
     name="X-Device-Token",
     scheme_name="DeviceToken",
-    description="Demo device credential returned once during registration.",
+    description="Opaque device credential returned only once during registration.",
     auto_error=False,
 )
 DeviceToken = Annotated[str | None, Depends(_device_token_header)]

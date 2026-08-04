@@ -31,7 +31,7 @@ OPERATION_PROBLEM_RESPONSES: dict[str, dict[str, str]] = {
     "createCatalogImport": {
         "400": "The idempotency key is blank",
         "409": "The idempotency key conflicts with a previous catalog import",
-        "413": "The uploaded catalog exceeds the hosted import limit",
+        "413": "The uploaded catalog exceeds the configured import limit",
     },
     "submitRfidObservationBatch": {
         "409": "An event identifier conflicts with a previously accepted observation",

@@ -35,7 +35,7 @@ def test_public_demo_credentials_remain_aligned_across_delivery_surfaces() -> No
         assert PUBLIC_DEMO_PASSWORD in contents
 
 
-def test_assignment_sized_store_fixture_is_valid_and_deterministic() -> None:
+def test_store_import_fixture_is_valid_and_deterministic() -> None:
     payload = build_store_batch(100)
     request = BulkStoreOnboardingRequest.model_validate(payload)
 
@@ -62,7 +62,7 @@ def test_openapi_contains_the_submission_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.8.0"
+    assert __version__ == "0.8.1"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",

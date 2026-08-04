@@ -98,7 +98,7 @@ def calculate_replenishment_quantity(
     min_floor_qty: int,
     target_floor_qty: int,
 ) -> int:
-    """Apply the assignment formula exactly, without hidden safety-stock behavior."""
+    """Calculate required quantity without introducing implicit safety stock."""
 
     if floor_qty >= min_floor_qty:
         return 0
