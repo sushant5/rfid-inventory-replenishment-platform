@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.8.1` on Render with managed PostgreSQL. Render may need
+The hosted demo runs release `0.8.2` on Render with managed PostgreSQL. Render may need
 about a minute to wake the free web service after inactivity.
 
 Public reviewer login:
@@ -189,10 +189,13 @@ also a production extension, not a demo dependency.
 - Role and store-scope changes are atomic, invalidate existing JWTs, and append an
   audit record. The corresponding migration downgrade deliberately refuses to narrow
   the action constraint after such records exist rather than discard audit history.
+- Catalog and identity writes still maintain their canonical and migration-compatibility
+  representations in the same transaction. These are active cutover bridges, not a
+  second API surface; retire them only after downstream consumers have migrated.
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.1`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.2`).
 
 The visible contract includes all required endpoints:
 
@@ -340,7 +343,7 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.1 --expected-build-sha <release-sha> --expected-schema-revision a9d4e6f2b713
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.2 --expected-build-sha <release-sha> --expected-schema-revision a9d4e6f2b713
 ```
 
 ## Hosting
@@ -350,6 +353,11 @@ and both worker entry points in one container. Docker Compose keeps those proces
 separate, which is the production-shaped topology. Hosted deployment needs one
 managed PostgreSQL database with two credentials: a migration owner and a non-owner
 `abacus_app` runtime role.
+
+The existing Render service is named `abacus-inventory-api`, but Render retains the
+provider-assigned hostname from the service's initial creation. Consequently, the
+verified deployment remains at `abacus-take-home-api.onrender.com`; a newly created
+Blueprint service receives its own provider-assigned hostname.
 
 Important environment variables are also enumerated in `.env.example`:
 
@@ -376,6 +384,10 @@ GRANT CONNECT ON DATABASE <database_name> TO abacus_app;
 Use the owner connection for `MIGRATION_DATABASE_URL` and construct `DATABASE_URL`
 with the new `abacus_app` credential. `/health/ready` rejects a production runtime
 connection that is not exactly this configured non-superuser, non-`BYPASSRLS` role.
+It checks database connectivity, schema revision, and runtime privileges. The hosted
+supervisor fails when a child process exits, but readiness does not currently measure
+worker progress or queue lag; production deployment adds durable worker heartbeats,
+lag metrics, and alerts.
 Compose supplies the owner URL only to its one-shot migration service. On the free
 hosted topology, the supervisor removes that URL before launching the API and workers,
 so long-running processes receive only the restricted runtime credential.

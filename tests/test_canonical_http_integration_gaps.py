@@ -7,21 +7,27 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from abacus.config import get_settings
 from abacus.enums import StoreStatus, TenantStatus, ZoneKind
 from abacus.models.architecture import (
     CanonicalIdentityRole,
+    CurrentItemState,
+    FreshnessStatus,
+    InventoryProjection,
+    Product,
+    ProductVariant,
     RfidEventProcessingStatus,
     RfidObservationEventLedger,
+    StoreConnectivity,
     UserRole,
     UserStoreAssignment,
 )
 from abacus.models.catalog import ProductStyle, Sku
 from abacus.models.identity import IdentityAuditAction, User, UserStatus
-from abacus.models.tenancy import Store, Tenant, Zone
+from abacus.models.tenancy import OnboardingBatch, Store, Tenant, Zone
 from abacus.processes import event_worker
 from abacus.security import create_access_token
 from abacus.services.streaming_inventory import RecentObservationState
@@ -33,6 +39,7 @@ pytestmark = pytest.mark.integration
 class CanonicalHttpData:
     tenant_id: uuid.UUID
     store_id: uuid.UUID
+    second_store_id: uuid.UUID
     zone_id: uuid.UUID
     admin_token: str
     target_user_id: uuid.UUID
@@ -65,6 +72,7 @@ def canonical_http_data(
     suffix = uuid.uuid4().hex[:12]
     tenant_id = uuid.uuid4()
     store_id = uuid.uuid4()
+    second_store_id = uuid.uuid4()
     zone_id = uuid.uuid4()
     admin = User(
         id=uuid.uuid4(),
@@ -92,11 +100,28 @@ def canonical_http_data(
         attributes={"category": "SHIRTS"},
         active=True,
     )
+    product = Product(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        style_code=style.code,
+        name=style.name,
+        category="SHIRTS",
+        attributes={},
+        active=True,
+    )
+    variant = ProductVariant(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        product_id=product.id,
+        color="Orange",
+        attributes={},
+        active=True,
+    )
     sku = Sku(
         id=uuid.uuid4(),
         tenant_id=tenant_id,
         product_style_id=style.id,
-        product_variant_id=None,
+        product_variant_id=variant.id,
         code=f"SKU-{suffix.upper()}-M",
         upc=str(tenant_id.int)[:12],
         color="Orange",
@@ -126,9 +151,20 @@ def canonical_http_data(
                     status=StoreStatus.ACTIVE,
                     configuration={},
                 ),
+                Store(
+                    id=second_store_id,
+                    tenant_id=tenant_id,
+                    code=f"store-2-{suffix}",
+                    name="Canonical HTTP Second Store",
+                    timezone="UTC",
+                    status=StoreStatus.ACTIVE,
+                    configuration={},
+                ),
                 admin,
                 target,
                 style,
+                product,
+                variant,
             ]
         )
         db.flush()
@@ -165,6 +201,7 @@ def canonical_http_data(
     data = CanonicalHttpData(
         tenant_id=tenant_id,
         store_id=store_id,
+        second_store_id=second_store_id,
         zone_id=zone_id,
         admin_token=_token(admin),
         target_user_id=target.id,
@@ -294,17 +331,279 @@ def test_identity_discovery_and_atomic_access_replacement_cross_http_and_databas
     assert detail.status_code == 200, detail.text
     assert detail.json()["roles"] == [CanonicalIdentityRole.STORE_MANAGER]
 
+    roles = api_client.put(
+        f"/v1/users/{canonical_http_data.target_user_id}/roles",
+        headers=_bearer(canonical_http_data.admin_token),
+        json={"roles": [CanonicalIdentityRole.STORE_ASSOCIATE]},
+    )
+    assert roles.status_code == 200, roles.text
+    assert roles.json() == {
+        "user_id": str(canonical_http_data.target_user_id),
+        "roles": [CanonicalIdentityRole.STORE_ASSOCIATE],
+    }
+
+    assignments = api_client.put(
+        f"/v1/users/{canonical_http_data.target_user_id}/store-assignments",
+        headers=_bearer(canonical_http_data.admin_token),
+        json={"store_ids": [str(canonical_http_data.second_store_id)]},
+    )
+    assert assignments.status_code == 200, assignments.text
+    assert assignments.json() == {
+        "user_id": str(canonical_http_data.target_user_id),
+        "store_ids": [str(canonical_http_data.second_store_id)],
+    }
+
+    mutated_detail = api_client.get(
+        f"/v1/users/{canonical_http_data.target_user_id}",
+        headers=_bearer(canonical_http_data.admin_token),
+    )
+    assert mutated_detail.status_code == 200, mutated_detail.text
+    assert mutated_detail.json()["roles"] == [CanonicalIdentityRole.STORE_ASSOCIATE]
+    assert mutated_detail.json()["store_ids"] == [str(canonical_http_data.second_store_id)]
+
     audit = api_client.get(
         "/v1/users/audit-records",
         headers=_bearer(canonical_http_data.admin_token),
         params={"limit": 10, "offset": 0},
     )
     assert audit.status_code == 200, audit.text
-    assert audit.json()["total"] == 1
-    assert audit.json()["items"][0]["action"] == IdentityAuditAction.USER_ACCESS_CHANGED
-    assert uuid.UUID(audit.json()["items"][0]["target_user_id"]) == (
-        canonical_http_data.target_user_id
+    assert audit.json()["total"] == 3
+    assert all(
+        item["action"] == IdentityAuditAction.USER_ACCESS_CHANGED
+        and uuid.UUID(item["target_user_id"]) == canonical_http_data.target_user_id
+        for item in audit.json()["items"]
     )
+
+
+def test_policy_patch_zone_creation_and_policy_detail_have_persisted_effects(
+    api_client: TestClient,
+    postgres_session_factory: sessionmaker[Session],
+    canonical_http_data: CanonicalHttpData,
+) -> None:
+    backroom = api_client.post(
+        f"/v1/stores/{canonical_http_data.store_id}/zones",
+        headers=_bearer(canonical_http_data.admin_token),
+        json={
+            "code": "backroom",
+            "name": "Backroom",
+            "kind": ZoneKind.BACKROOM,
+        },
+    )
+    assert backroom.status_code == 201, backroom.text
+    backroom_payload = backroom.json()
+    backroom_zone_id = uuid.UUID(backroom_payload["id"])
+    assert backroom_payload["store_id"] == str(canonical_http_data.store_id)
+    assert backroom_payload["code"] == "backroom"
+    assert backroom_payload["kind"] == ZoneKind.BACKROOM
+
+    zones = api_client.get(
+        f"/v1/stores/{canonical_http_data.store_id}/zones",
+        headers=_bearer(canonical_http_data.admin_token),
+    )
+    assert zones.status_code == 200, zones.text
+    assert backroom_zone_id in {uuid.UUID(item["id"]) for item in zones.json()}
+
+    now = datetime.now(UTC)
+    with postgres_session_factory() as db:
+        for zone_id, label, quantity in (
+            (canonical_http_data.zone_id, "F", 1),
+            (backroom_zone_id, "B", 10),
+        ):
+            for index in range(quantity):
+                db.add(
+                    CurrentItemState(
+                        tenant_id=canonical_http_data.tenant_id,
+                        epc=f"{canonical_http_data.tenant_id.hex[:18]}{label}{index:03X}",
+                        sku_id=canonical_http_data.sku_id,
+                        store_id=canonical_http_data.store_id,
+                        zone_id=zone_id,
+                        last_observed_at=now,
+                        last_received_at=now,
+                        confidence=0.95,
+                        state_version=1,
+                    )
+                )
+            db.add(
+                InventoryProjection(
+                    tenant_id=canonical_http_data.tenant_id,
+                    store_id=canonical_http_data.store_id,
+                    sku_id=canonical_http_data.sku_id,
+                    zone_id=zone_id,
+                    quantity=quantity,
+                    as_of=now,
+                    confidence=0.95,
+                    freshness_status=FreshnessStatus.LIVE,
+                )
+            )
+        db.add(
+            StoreConnectivity(
+                tenant_id=canonical_http_data.tenant_id,
+                store_id=canonical_http_data.store_id,
+                gateway_last_heartbeat=now,
+                last_live_event_at=now,
+                oldest_buffered_event_at=None,
+                backlog_drained=True,
+                reader_coverage_ok=True,
+                freshness_status=FreshnessStatus.LIVE,
+            )
+        )
+        db.commit()
+
+    created = api_client.post(
+        "/v1/replenishment-policies",
+        headers=_bearer(canonical_http_data.admin_token),
+        json={
+            "name": "HTTP policy mutation",
+            "rules": [
+                {
+                    "sku_id": str(canonical_http_data.sku_id),
+                    "size": "M",
+                    "min_floor_qty": 2,
+                    "target_floor_qty": 3,
+                    "priority": 10,
+                }
+            ],
+        },
+    )
+    assert created.status_code == 201, created.text
+    policy_id = uuid.UUID(created.json()["policy"]["id"])
+    first_version_id = uuid.UUID(created.json()["version"]["id"])
+
+    activated_first = api_client.post(
+        f"/v1/replenishment-policy-versions/{first_version_id}/activate",
+        headers=_bearer(canonical_http_data.admin_token),
+    )
+    assert activated_first.status_code == 200, activated_first.text
+
+    cloned = api_client.post(
+        f"/v1/replenishment-policies/{policy_id}/versions",
+        headers=_bearer(canonical_http_data.admin_token),
+    )
+    assert cloned.status_code == 201, cloned.text
+    draft_version_id = uuid.UUID(cloned.json()["version"]["id"])
+
+    patched = api_client.patch(
+        f"/v1/replenishment-policy-versions/{draft_version_id}",
+        headers=_bearer(canonical_http_data.admin_token),
+        json={
+            "rules": [
+                {
+                    "sku_id": str(canonical_http_data.sku_id),
+                    "size": "M",
+                    "min_floor_qty": 2,
+                    "target_floor_qty": 5,
+                    "priority": 10,
+                }
+            ]
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert uuid.UUID(patched.json()["version"]["id"]) == draft_version_id
+    assert patched.json()["rules"][0]["target_floor_qty"] == 5
+
+    draft_detail = api_client.get(
+        f"/v1/replenishment-policies/{policy_id}",
+        headers=_bearer(canonical_http_data.admin_token),
+        params={"status": "DRAFT"},
+    )
+    assert draft_detail.status_code == 200, draft_detail.text
+    assert uuid.UUID(draft_detail.json()["version"]["id"]) == draft_version_id
+    assert draft_detail.json()["rules"][0]["target_floor_qty"] == 5
+
+    activated = api_client.post(
+        f"/v1/replenishment-policy-versions/{draft_version_id}/activate",
+        headers=_bearer(canonical_http_data.admin_token),
+    )
+    assert activated.status_code == 200, activated.text
+    assert activated.json()["version"]["status"] == "ACTIVE"
+
+    active_detail = api_client.get(
+        f"/v1/replenishment-policies/{policy_id}",
+        headers=_bearer(canonical_http_data.admin_token),
+    )
+    assert active_detail.status_code == 200, active_detail.text
+    assert uuid.UUID(active_detail.json()["version"]["id"]) == draft_version_id
+    assert active_detail.json()["rules"][0]["target_floor_qty"] == 5
+
+    evaluated = api_client.post(
+        "/v1/replenishment/evaluations",
+        headers=_bearer(canonical_http_data.admin_token),
+        json={
+            "store_id": str(canonical_http_data.store_id),
+            "sku_ids": [str(canonical_http_data.sku_id)],
+        },
+    )
+    assert evaluated.status_code == 200, evaluated.text
+    assert evaluated.json()["created_count"] == 1
+    assert evaluated.json()["tasks"][0]["quantity"] == 4
+    assert uuid.UUID(evaluated.json()["tasks"][0]["policy_version_id"]) == draft_version_id
+
+
+def test_store_import_retry_is_idempotent_through_http_and_postgres(
+    api_client: TestClient,
+    postgres_session_factory: sessionmaker[Session],
+    canonical_http_data: CanonicalHttpData,
+) -> None:
+    store_code = f"imported-{uuid.uuid4().hex[:12]}"
+    idempotency_key = f"store-import-{uuid.uuid4()}"
+    request = {
+        "stores": [
+            {
+                "code": store_code,
+                "name": "Idempotent Imported Store",
+                "timezone": "UTC",
+                "zones": [
+                    {"code": "floor", "name": "Sales Floor", "kind": "SALES_FLOOR"},
+                    {"code": "backroom", "name": "Backroom", "kind": "BACKROOM"},
+                ],
+                "devices": [],
+                "configuration": {},
+            }
+        ]
+    }
+    headers = {
+        "X-Platform-Key": get_settings().platform_api_key,
+        "Idempotency-Key": idempotency_key,
+    }
+
+    first = api_client.post(
+        f"/v1/tenants/{canonical_http_data.tenant_id}/store-imports",
+        headers=headers,
+        json=request,
+    )
+    repeated = api_client.post(
+        f"/v1/tenants/{canonical_http_data.tenant_id}/store-imports",
+        headers=headers,
+        json=request,
+    )
+
+    assert first.status_code == repeated.status_code == 201
+    assert repeated.json() == first.json()
+    assert first.json()["status"] == "COMPLETED"
+    assert (first.json()["succeeded_count"], first.json()["failed_count"]) == (1, 0)
+    with postgres_session_factory() as db:
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(OnboardingBatch)
+                .where(
+                    OnboardingBatch.tenant_id == canonical_http_data.tenant_id,
+                    OnboardingBatch.idempotency_key == idempotency_key,
+                )
+            )
+            == 1
+        )
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(Store)
+                .where(
+                    Store.tenant_id == canonical_http_data.tenant_id,
+                    Store.code == store_code,
+                )
+            )
+            == 1
+        )
 
 
 def test_quarantine_replay_and_device_credential_rotation_cross_http_and_database(
