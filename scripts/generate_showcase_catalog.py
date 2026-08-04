@@ -48,6 +48,14 @@ def epcs_for_sku(sku_number: int) -> tuple[str, ...]:
     return tuple(f"30{sku_number:06X}{tag_number:016X}" for tag_number in range(1, count + 1))
 
 
+def sku_for_number(sku_number: int) -> str:
+    return (
+        "SKU-TRAIL-BLUE-M"
+        if sku_number == 1
+        else f"SKU-DEMO-{sku_number:03d}-{SIZES[(sku_number - 1) % len(SIZES)]}"
+    )
+
+
 def build_showcase_catalog(sku_count: int = 100) -> bytes:
     if not 3 <= sku_count <= 500:
         raise ValueError("sku_count must be between 3 and 500")
@@ -59,7 +67,7 @@ def build_showcase_catalog(sku_count: int = 100) -> bytes:
         color = COLORS[(style_number - 1) % len(COLORS)]
         size = "M" if number == 1 else SIZES[(number - 1) % len(SIZES)]
         category = CATEGORIES[(style_number - 1) % len(CATEGORIES)]
-        sku = "SKU-TRAIL-BLUE-M" if number == 1 else f"SKU-DEMO-{number:03d}-{size}"
+        sku = sku_for_number(number)
         upc = upc_for_sku(number)
         for epc in epcs_for_sku(number):
             writer.writerow(
