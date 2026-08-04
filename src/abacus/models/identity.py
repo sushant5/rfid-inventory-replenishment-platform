@@ -148,9 +148,7 @@ class AuthSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
+    user_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     family_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     refresh_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     token_version: Mapped[int] = mapped_column(Integer, nullable=False)

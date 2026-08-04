@@ -1047,6 +1047,15 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             postgresql_where=text("status IN ('OPEN', 'CLAIMED', 'IN_PROGRESS')"),
         ),
         Index("ix_replenishment_tasks_store_status", "tenant_id", "store_id", "status"),
+        Index(
+            "ix_replenishment_tasks_verification_candidate",
+            "tenant_id",
+            "store_id",
+            "sku_id",
+            "status",
+            "started_at",
+            postgresql_where=text("status IN ('IN_PROGRESS', 'COMPLETED')"),
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
