@@ -1,4 +1,4 @@
-"""PostgreSQL-backed event worker used by the submitted hosted scope."""
+"""PostgreSQL-backed inventory event worker."""
 
 import signal
 import socket
