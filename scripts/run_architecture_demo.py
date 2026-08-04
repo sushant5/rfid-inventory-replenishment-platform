@@ -618,9 +618,7 @@ def run(args: argparse.Namespace) -> None:
             "PATCH",
             f"/v1/replenishment-policy-versions/{draft_version_id}",
             headers=bearer(admin_token),
-            payload={
-                "rules": [{"min_floor_qty": 2, "target_floor_qty": 4, "priority": 100}]
-            },
+            payload={"rules": [{"min_floor_qty": 2, "target_floor_qty": 4, "priority": 100}]},
         )
 
     floor_device = object_result(required(devices["floor"], "device"), "floor device")
