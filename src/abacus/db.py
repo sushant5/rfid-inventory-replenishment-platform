@@ -1,5 +1,5 @@
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 
 from sqlalchemy import Connection, Engine, create_engine, event, text
@@ -36,6 +36,8 @@ def create_database_engine(runtime_settings: Settings) -> Engine:
 engine = create_database_engine(settings)
 
 TENANT_CONTEXT_KEY = "tenant_id"
+STORE_SCOPE_CONTEXT_KEY = "store_scope"
+TENANT_WIDE_STORE_SCOPE = "*"
 
 
 class TenantSession(Session):
@@ -64,6 +66,14 @@ def _apply_transaction_tenant_context(
         text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
         {"tenant_id": str(tenant_id)},
     )
+    store_scope = session.info.get(STORE_SCOPE_CONTEXT_KEY)
+    if store_scope is not None:
+        if not isinstance(store_scope, str) or not store_scope:
+            raise RuntimeError("TenantSession contains an invalid store scope")
+        connection.execute(
+            text("SELECT set_config('app.store_scope', :store_scope, true)"),
+            {"store_scope": store_scope},
+        )
 
 
 SessionLocal: sessionmaker[TenantSession] = sessionmaker(
@@ -98,6 +108,41 @@ def pin_session_to_tenant(session: Session, tenant_id: uuid.UUID) -> TenantSessi
     return session
 
 
+def pin_session_to_store_scope(
+    session: Session,
+    store_ids: Iterable[uuid.UUID] = (),
+    *,
+    tenant_wide: bool = False,
+) -> TenantSession:
+    """Bind a tenant-pinned session to an immutable database store scope."""
+
+    if not isinstance(session, TenantSession):
+        raise TypeError("store scope requires a TenantSession")
+    if session.info.get(TENANT_CONTEXT_KEY) is None:
+        raise RuntimeError("tenant context must be pinned before store scope")
+    normalized_ids = tuple(sorted(set(store_ids), key=str))
+    if any(not isinstance(store_id, uuid.UUID) for store_id in normalized_ids):
+        raise TypeError("store scope values must be UUIDs")
+    scope = (
+        TENANT_WIDE_STORE_SCOPE
+        if tenant_wide
+        else ",".join(str(store_id) for store_id in normalized_ids)
+    )
+    if not scope:
+        raise RuntimeError("a store-scoped session requires at least one store")
+
+    existing_scope = session.info.get(STORE_SCOPE_CONTEXT_KEY)
+    if existing_scope is not None and existing_scope != scope:
+        raise RuntimeError("A TenantSession cannot be rebound to another store scope")
+    session.info[STORE_SCOPE_CONTEXT_KEY] = scope
+    if session.in_transaction():
+        session.execute(
+            text("SELECT set_config('app.store_scope', :store_scope, true)"),
+            {"store_scope": scope},
+        )
+    return session
+
+
 def get_db() -> Generator[TenantSession]:
     """Yield a session that authentication can pin to one trusted tenant.
 
@@ -118,6 +163,7 @@ def tenant_session_scope(tenant_id: uuid.UUID) -> Generator[TenantSession]:
     """Open a tenant-pinned session for trusted application and worker code."""
 
     session = pin_session_to_tenant(SessionLocal(), tenant_id)
+    pin_session_to_store_scope(session, tenant_wide=True)
     try:
         yield session
     finally:

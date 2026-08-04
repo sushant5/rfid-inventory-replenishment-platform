@@ -63,6 +63,16 @@ def _reserve(
     return decision.reservation
 
 
+def _patch_session_creation(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "abacus.api.routes.auth.create_auth_session",
+        lambda _db, _user, *, lifetime: SimpleNamespace(
+            session=SimpleNamespace(id=uuid.uuid4()),
+            refresh_token="test-refresh-token-" + "x" * 40,
+        ),
+    )
+
+
 def test_failed_attempts_are_retained_and_success_releases_only_its_reservation() -> None:
     clock = FakeClock()
     throttle = _throttle(clock, ip_limit=4, account_limit=2)
@@ -210,6 +220,7 @@ def test_login_endpoint_ignores_forwarded_for_and_releases_successful_reservatio
         return SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4(), token_version=1)
 
     monkeypatch.setattr("abacus.api.routes.auth.authenticate_user", authenticate)
+    _patch_session_creation(monkeypatch)
     app = create_app()
     app.dependency_overrides[require_tenant_session] = object
     app.dependency_overrides[get_login_throttle] = lambda: throttle
@@ -268,6 +279,7 @@ def test_successful_logins_consume_ip_but_not_account_budget(
         return SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4(), token_version=1)
 
     monkeypatch.setattr("abacus.api.routes.auth.authenticate_user", authenticate)
+    _patch_session_creation(monkeypatch)
     app = create_app()
     app.dependency_overrides[require_tenant_session] = object
     app.dependency_overrides[get_login_throttle] = lambda: throttle
@@ -317,6 +329,7 @@ def test_non_authentication_errors_release_the_reservation(monkeypatch: MonkeyPa
         return SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4(), token_version=1)
 
     monkeypatch.setattr("abacus.api.routes.auth.authenticate_user", authenticate)
+    _patch_session_creation(monkeypatch)
     app = create_app()
     app.dependency_overrides[require_tenant_session] = object
     app.dependency_overrides[get_login_throttle] = lambda: throttle

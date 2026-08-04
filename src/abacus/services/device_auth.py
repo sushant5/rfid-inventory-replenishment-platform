@@ -8,7 +8,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from abacus.api.errors import ApiError
-from abacus.db import TenantSession, pin_session_to_tenant
+from abacus.db import TenantSession, pin_session_to_store_scope, pin_session_to_tenant
 from abacus.enums import DeviceStatus, TenantStatus
 from abacus.models.tenancy import Device, Tenant
 
@@ -33,6 +33,9 @@ def authenticate_device(db: Session, raw_token: str | None) -> Device:
         if tenant_id is None:
             raise ApiError(401, "Unauthorized device", "The device token is invalid.")
         pin_session_to_tenant(db, uuid.UUID(str(tenant_id)))
+        # Device verification itself precedes assignment lookup. The request remains
+        # constrained by the authenticated device ID and effective assignments.
+        pin_session_to_store_scope(db, tenant_wide=True)
 
     device = db.get(Device, device_id)
     candidate = hashlib.sha256(secret.encode()).hexdigest()

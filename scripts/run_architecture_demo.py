@@ -11,25 +11,28 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from scripts.generate_showcase_catalog import (
+        PRIMARY_EPCS,
+        build_showcase_catalog,
+        epcs_for_sku,
+    )
     from scripts.generate_store_batch import build_store_batch
 else:
     if __package__:
+        from scripts.generate_showcase_catalog import (
+            PRIMARY_EPCS,
+            build_showcase_catalog,
+            epcs_for_sku,
+        )
         from scripts.generate_store_batch import build_store_batch
     else:  # Executed as `python scripts/run_architecture_demo.py`.
+        from generate_showcase_catalog import PRIMARY_EPCS, build_showcase_catalog, epcs_for_sku
         from generate_store_batch import build_store_batch
 
-ROOT = Path(__file__).resolve().parents[1]
-CATALOG = ROOT / "examples" / "catalog.csv"
-EPCS = (
-    "3074257BF7194E4000001A85",
-    "3074257BF7194E4000001A86",
-    "3074257BF7194E4000001A87",
-    "3074257BF7194E4000001A88",
-)
+EPCS = PRIMARY_EPCS
 
 
 class DemoFailure(RuntimeError):
@@ -92,7 +95,8 @@ class Client:
         access_token: str,
     ) -> dict[str, Any]:
         boundary = f"abacus-{uuid.uuid4().hex}"
-        content = CATALOG.read_bytes()
+        content = build_showcase_catalog()
+        content_digest = hashlib.sha256(content).hexdigest()
         body = b"".join(
             (
                 f"--{boundary}\r\n".encode(),
@@ -112,7 +116,7 @@ class Client:
             expected=202,
             headers={
                 **bearer(access_token),
-                "Idempotency-Key": "orange-demo-catalog-v2",
+                "Idempotency-Key": f"orange-demo-catalog-{content_digest[:24]}",
             },
             body=body,
             content_type=f"multipart/form-data; boundary={boundary}",
@@ -300,6 +304,96 @@ def provision_orange_estate(
     return stores
 
 
+def seed_showcase_store_inventory(
+    client: Client,
+    *,
+    admin_token: str,
+    store_id: str,
+    sku_number: int,
+    base_time: datetime,
+    poll_timeout: float,
+) -> None:
+    """Commission planned readers and place four dummy items in one store."""
+
+    _, zones_value = client.request(
+        "GET",
+        f"/v1/stores/{store_id}/zones",
+        headers=bearer(admin_token),
+    )
+    zones = {str(item["code"]): item for item in list_result(zones_value, "showcase zones")}
+    _, mappings_value = client.request(
+        "GET",
+        f"/v1/stores/{store_id}/devices",
+        headers=bearer(admin_token),
+    )
+    mappings = list_result(mappings_value, "showcase devices")
+    mapping_by_zone = {str(mapping["assignment"]["zone_id"]): mapping for mapping in mappings}
+    tokens: dict[str, tuple[str, str]] = {}
+    for zone_code in ("floor", "backroom"):
+        zone_id = str(required(zones[zone_code], "id"))
+        mapping = mapping_by_zone.get(zone_id)
+        if mapping is None:
+            raise DemoFailure(f"{zone_code} reader is missing for showcase store {store_id}")
+        device = object_result(required(mapping, "device"), "showcase device")
+        device_id = str(required(device, "id"))
+        _, credential_value = client.request(
+            "POST",
+            f"/v1/devices/{device_id}/credentials:rotate",
+            headers=bearer(admin_token),
+        )
+        credential = object_result(credential_value, "showcase credential")
+        tokens[zone_code] = (device_id, str(required(credential, "device_token")))
+
+    epcs = epcs_for_sku(sku_number)
+    floor_device_id, floor_token = tokens["floor"]
+    back_device_id, back_token = tokens["backroom"]
+    floor_batch = submit_batch(
+        client,
+        device_id=floor_device_id,
+        device_token=floor_token,
+        observations=[
+            observation(
+                str(uuid.uuid4()),
+                epcs[0],
+                base_time + timedelta(seconds=index),
+                -40,
+            )
+            for index in range(3)
+        ],
+    )
+    back_batch = submit_batch(
+        client,
+        device_id=back_device_id,
+        device_token=back_token,
+        observations=[
+            observation(
+                str(uuid.uuid4()),
+                epc,
+                base_time + timedelta(seconds=index),
+                -38,
+            )
+            for epc in epcs[1:4]
+            for index in range(3)
+        ],
+    )
+    wait_for_batch(client, admin_token, floor_batch, poll_timeout)
+    wait_for_batch(client, admin_token, back_batch, poll_timeout)
+    poll(
+        f"showcase inventory for {store_id}",
+        lambda: {
+            "page": client.request(
+                "GET",
+                f"/v1/stores/{store_id}/inventory",
+                headers=bearer(admin_token),
+            )[1]
+        },
+        lambda item: (
+            sum(int(row["quantity"]) for row in page_items(item["page"], "showcase inventory")) == 4
+        ),
+        timeout=poll_timeout,
+    )
+
+
 def run(args: argparse.Namespace) -> None:
     client = Client(args.base_url, timeout=args.request_timeout)
     platform_headers = {"X-Platform-Key": args.platform_key}
@@ -327,6 +421,7 @@ def run(args: argparse.Namespace) -> None:
     admin_token = login(client, args.admin_email, args.admin_password)
     store1_id = str(required(stores["orange-001"], "id"))
     store2_id = str(required(stores["orange-002"], "id"))
+    store3_id = str(required(stores["orange-003"], "id"))
     run_id = uuid.uuid4().hex[:10].upper()
     client.request(
         "POST",
@@ -491,6 +586,23 @@ def run(args: argparse.Namespace) -> None:
     if quantities != {"backroom": 3, "floor": 1}:
         raise DemoFailure(f"unexpected inventory: {quantities}")
 
+    seed_showcase_store_inventory(
+        client,
+        admin_token=admin_token,
+        store_id=store2_id,
+        sku_number=2,
+        base_time=base_time + timedelta(seconds=40),
+        poll_timeout=args.poll_timeout,
+    )
+    seed_showcase_store_inventory(
+        client,
+        admin_token=admin_token,
+        store_id=store3_id,
+        sku_number=3,
+        base_time=base_time + timedelta(seconds=60),
+        poll_timeout=args.poll_timeout,
+    )
+
     before_item = object_result(
         client.request("GET", f"/v1/items/{EPCS[0]}", headers=bearer(admin_token))[1],
         "item state",
@@ -589,7 +701,7 @@ def run(args: argparse.Namespace) -> None:
     task_list = page_items(task_list_value, "replenishment task list")
     if not any(str(item["id"]) == str(task["id"]) for item in task_list):
         raise DemoFailure("created replenishment task was not discoverable")
-    for next_status in ("CLAIMED", "IN_PROGRESS", "COMPLETED"):
+    for next_status in ("CLAIMED", "IN_PROGRESS"):
         _, task_value = client.request(
             "PATCH",
             f"/v1/replenishment-tasks/{task['id']}",
@@ -597,6 +709,59 @@ def run(args: argparse.Namespace) -> None:
             payload={"status": next_status, "version": task["version"]},
         )
         task = object_result(task_value, "task transition")
+
+    _, task_value = client.request(
+        "PATCH",
+        f"/v1/replenishment-tasks/{task['id']}",
+        headers=bearer(associate_token),
+        payload={"status": "COMPLETED", "version": task["version"]},
+    )
+    task = object_result(task_value, "completed task")
+    if task["verification_status"] != "PENDING":
+        raise DemoFailure(f"completed task did not await RFID verification: {task}")
+
+    moved_epcs = EPCS[1:3]
+    verification_batch = submit_batch(
+        client,
+        device_id=str(required(floor_device, "id")),
+        device_token=str(required(devices["floor"], "device_token")),
+        observations=[
+            observation(
+                str(uuid.uuid4()),
+                epc,
+                base_time + timedelta(seconds=10 + index),
+                -36,
+            )
+            for epc in moved_epcs
+            for index in range(3)
+        ],
+    )
+    wait_for_batch(client, admin_token, verification_batch, args.poll_timeout)
+    verified_task = poll(
+        "replenishment RFID evidence",
+        lambda: {
+            "page": client.request(
+                "GET",
+                f"/v1/stores/{store1_id}/replenishment-tasks",
+                headers=bearer(admin_token),
+            )[1]
+        },
+        lambda item: any(
+            str(candidate["id"]) == str(task["id"])
+            and int(candidate["verified_quantity"]) == 2
+            and candidate["verification_status"] == "VERIFIED"
+            for candidate in page_items(item["page"], "replenishment verification")
+        ),
+        timeout=args.poll_timeout,
+    )
+    task = next(
+        candidate
+        for candidate in page_items(
+            verified_task["page"],
+            "replenishment verification",
+        )
+        if str(candidate["id"]) == str(task["id"])
+    )
 
     authoritative_event = {
         "source_system": "ORANGE_POS",
@@ -689,7 +854,8 @@ def run(args: argparse.Namespace) -> None:
     print("PASS staged catalog import and atomic promotion")
     print("PASS RFID stable-zone inventory: floor=1 backroom=3")
     print("PASS duplicate and late-event replay protection")
-    print("PASS replenishment policy, quantity=2 task, and completed lifecycle")
+    print("PASS quantity=2 replenishment task completed with RFID verification")
+    print("PASS reviewer seed: 100 SKUs and inventory in three stores")
     print("PASS store-scoped authorization denied Store 2")
     print("PASS idempotent authoritative sale removed one physical item")
     print("DEMO COMPLETE")

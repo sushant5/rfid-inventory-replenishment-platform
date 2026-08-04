@@ -15,8 +15,8 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.8.5` on Render with managed PostgreSQL. Render may need
-about a minute to wake the free web service after inactivity.
+The hosted demo runs release `0.9.0` on Render with managed PostgreSQL. Render may need
+about a minute to wake after inactivity.
 
 Public reviewer login:
 
@@ -92,9 +92,9 @@ make demo
 make test
 ```
 
-The demo ensures the 100-store Orange footprint, runs the complete device and inventory
-workflow against Store 1, and prints seven end-to-end checks, including duplicate/late
-RFID protection, store-level authorization, and an idempotent authoritative sale. Swagger is at
+The demo ensures the 100-store Orange footprint, imports 100 SKUs, stocks three stores,
+and prints eight end-to-end checks. These include duplicate/late RFID protection,
+RFID verification of a completed task, store-level authorization, and an idempotent sale. Swagger is at
 <http://localhost:8000/docs>; readiness is
 at <http://localhost:8000/health/ready>.
 
@@ -157,13 +157,10 @@ also a production extension, not a demo dependency.
 - Composite tenant-aware foreign keys bind every child to a parent in the same tenant.
   Store/zone tuples are also constrained together, so a device, observation, item,
   projection, or delta cannot reference a zone from another store.
-- RLS deliberately enforces the tenant boundary. Store authorization is a separate,
-  explicit application boundary: current role and store assignments are loaded from
-  PostgreSQL on every request, and collection/resource handlers apply the centralized
-  `Principal` scope checks. Tests cover both store denial and corporate tenant-wide
-  access. A production deployment that requires database-enforced store scoping could
-  add a store-scope session setting, trading a stronger database backstop for more
-  complex policies and operational context management.
+- Every authenticated transaction also sets an immutable `app.store_scope`. Restrictive
+  PostgreSQL policies enforce assigned-store visibility for associates and managers;
+  tenant admins and corporate users receive an explicit tenant-wide scope. Application
+  permission checks remain the first authorization layer, while RLS is the backstop.
 - Accepted RFID events, retry-batch links, and their durable inbox records commit
   together. A worker outage therefore leaves recoverable work, not a false `202`.
 - Raw-event and catalog jobs have bounded retries. Exhausted work reaches a terminal
@@ -193,13 +190,16 @@ also a production extension, not a demo dependency.
   audit record. The runtime role can insert and read that audit trail but cannot update
   or delete it. The corresponding migration downgrade deliberately refuses to narrow
   the action constraint after such records exist rather than discard audit history.
-- Catalog and identity writes still maintain their canonical and migration-compatibility
-  representations in the same transaction. These are active cutover bridges, not a
-  second API surface; retire them only after downstream consumers have migrated.
+- Access tokens are bound to server-side sessions. Refresh tokens rotate on every use;
+  replay revokes the token family, and logout immediately revokes the current session.
+- A completed replenishment task remains pending until stable RFID transitions confirm
+  the expected backroom-to-floor quantity. Each transition can verify at most one task;
+  missing evidence becomes `UNVERIFIED` after the configured window.
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.5`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.9.0`).
+It contains 42 paths and 46 operations.
 
 The visible contract includes all required endpoints:
 
@@ -207,16 +207,15 @@ The visible contract includes all required endpoints:
 - Catalog: create import, status, row errors, SKU discovery
 - RFID: submit batch, batch status, tenant-wide quarantine inspection and recovery
 - Inventory: store projection, physical item state, authoritative business-event removal
-- Identity: login, create user, atomically replace access, replace roles/store assignments, current user
+- Identity: login, rotating refresh, logout/revocation, create user, access replacement, current user
 - Replenishment: policy discovery/version/activation, evaluation, task list/lifecycle
 - Operations: liveness, readiness, version
 
-Demo authentication uses a platform key, one-time device credentials, and 15-minute
-JWTs. JWTs contain only user and tenant identity; current status, roles, store
+Demo authentication uses a platform key, one-time device credentials, 15-minute
+access JWTs, and rotating refresh tokens. JWTs contain user, tenant, and session identity; current status, roles, store
 assignments, and token version are loaded from PostgreSQL on every authenticated
-request. Suspension, password rotation, and access changes invalidate all existing
-tokens immediately. Refresh and per-session logout state are deliberately outside
-this demo authentication slice; production SSO owns the interactive session lifecycle.
+request. Suspension, password rotation, and access changes invalidate existing
+tokens immediately. Production SSO remains the enterprise authentication extension.
 
 All documented failures use RFC 7807 `application/problem+json`, including validation
 and unexpected server errors. Each failure includes the request ID returned in the
@@ -337,7 +336,8 @@ the physical read; ordinary observations continue to use event-time bindings.
 python -m pytest
 ruff check .
 ruff format --check .
-mypy src scripts/run_architecture_demo.py scripts/rfid_simulator.py scripts/smoke_test.py scripts/public_demo_smoke.py scripts/generate_store_batch.py
+mypy src scripts/run_architecture_demo.py scripts/rfid_simulator.py scripts/smoke_test.py scripts/public_demo_smoke.py scripts/generate_store_batch.py scripts/generate_showcase_catalog.py scripts/check_branch_coverage.py
+python scripts/check_branch_coverage.py coverage.json --minimum 80
 ```
 
 The suite covers RLS tenant isolation, store/corporate authorization, catalog
@@ -347,7 +347,7 @@ reconstruction, policy precedence, size curves, active-task uniqueness, and
 stale-store suppression.
 
 CI has two independent gates. One runs lint, strict typing, dependency audit, a full
-Alembic downgrade/upgrade, PostgreSQL tests, coverage, image build, and metadata drift
+Alembic downgrade/upgrade, PostgreSQL tests, direct branch coverage, image build, and metadata drift
 checks. The other starts a clean Compose stack and literally runs `make migrate`,
 `make seed`, `make demo`, `make test`, the smoke test, and an API/worker restart check.
 
@@ -358,12 +358,12 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.5 --expected-build-sha <release-sha> --expected-schema-revision d7a9b3e5f820
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.9.0 --expected-build-sha <release-sha> --expected-schema-revision a1c5e7f9b042
 ```
 
 ## Hosting
 
-`render.yaml` defines a free-demo web service whose supervised launcher runs the API
+`render.yaml` defines the hosted demo service whose supervised launcher runs the API
 and both worker entry points in one container. Docker Compose keeps those processes
 separate, which is the production-shaped topology. Hosted deployment needs one
 managed PostgreSQL database with two credentials: a migration owner and a non-owner

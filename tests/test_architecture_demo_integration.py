@@ -18,9 +18,11 @@ from abacus.models.architecture import (
     CurrentItemState,
     InventoryProjection,
     ReplenishmentTask,
+    ReplenishmentTaskEvidence,
     ReplenishmentTaskStatus,
     RfidObservationBatch,
 )
+from abacus.models.catalog import Sku
 from abacus.models.identity import IdentityRole
 from abacus.models.jobs import DurableJob
 from abacus.models.tenancy import Device, DeviceAssignment, Store, Tenant, Zone
@@ -164,6 +166,8 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
         output = capsys.readouterr().out
         assert "PASS tenant/100-store footprint and Store 1 zones/devices" in output
         assert "PASS RFID stable-zone inventory: floor=1 backroom=3" in output
+        assert "PASS quantity=2 replenishment task completed with RFID verification" in output
+        assert "PASS reviewer seed: 100 SKUs and inventory in three stores" in output
         assert "PASS store-scoped authorization denied Store 2" in output
         assert "PASS idempotent authoritative sale removed one physical item" in output
         assert output.rstrip().endswith("DEMO COMPLETE")
@@ -171,11 +175,17 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
         assert len(created_clients) == 1
         in_process_client = created_clients[0]
         assert in_process_client.catalog_jobs == 1
-        assert in_process_client.raw_events == 16
-        assert in_process_client.inventory_transitions == 5
+        assert in_process_client.raw_events == 46
+        assert in_process_client.inventory_transitions == 15
 
         with postgres_session_factory() as verify_db:
             assert tenant_id is not None
+            assert (
+                verify_db.scalar(
+                    select(func.count()).select_from(Sku).where(Sku.tenant_id == tenant_id)
+                )
+                == 100
+            )
             assert (
                 verify_db.scalar(
                     select(func.count()).select_from(Store).where(Store.tenant_id == tenant_id)
@@ -227,7 +237,7 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                     .select_from(CurrentItemState)
                     .where(CurrentItemState.tenant_id == tenant_id)
                 )
-                == 4
+                == 12
             )
             assert (
                 verify_db.scalar(
@@ -235,7 +245,7 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                         InventoryProjection.tenant_id == tenant_id
                     )
                 )
-                == 3
+                == 11
             )
             assert (
                 verify_db.scalar(
@@ -251,6 +261,14 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
             assert (
                 verify_db.scalar(
                     select(func.count())
+                    .select_from(ReplenishmentTaskEvidence)
+                    .where(ReplenishmentTaskEvidence.tenant_id == tenant_id)
+                )
+                == 2
+            )
+            assert (
+                verify_db.scalar(
+                    select(func.count())
                     .select_from(RfidObservationBatch)
                     .where(
                         RfidObservationBatch.tenant_id == tenant_id,
@@ -258,7 +276,7 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                         == RfidObservationBatch.accepted_count,
                     )
                 )
-                == 5
+                == 10
             )
             assert (
                 verify_db.scalar(

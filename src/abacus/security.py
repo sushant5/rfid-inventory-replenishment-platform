@@ -20,14 +20,14 @@ from sqlalchemy import select
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
 from abacus.api.errors import ApiError
-from abacus.db import pin_session_to_tenant
+from abacus.db import pin_session_to_store_scope, pin_session_to_tenant
 from abacus.enums import TenantStatus
 from abacus.models.architecture import (
     CanonicalIdentityRole,
     UserRole,
     UserStoreAssignment,
 )
-from abacus.models.identity import IdentityRole, User, UserAccessGrant, UserStatus
+from abacus.models.identity import AuthSession, IdentityRole, User, UserAccessGrant, UserStatus
 from abacus.models.tenancy import Tenant
 
 
@@ -125,6 +125,7 @@ class Principal:
     role_scopes: tuple[RoleScope, ...]
     canonical_roles: tuple[CanonicalIdentityRole, ...] = ()
     assigned_store_ids: tuple[uuid.UUID, ...] = ()
+    session_id: uuid.UUID | None = None
 
     @property
     def permissions(self) -> frozenset[Permission]:
@@ -160,6 +161,7 @@ class AccessTokenClaims:
     tenant_id: uuid.UUID
     token_version: int
     expires_at: datetime
+    session_id: uuid.UUID | None = None
 
 
 @dataclass(slots=True)
@@ -409,6 +411,7 @@ def create_access_token(
     issuer: str,
     audience: str,
     lifetime: timedelta,
+    session_id: uuid.UUID | None = None,
     now: datetime | None = None,
 ) -> tuple[str, datetime]:
     issued_at = now or datetime.now(UTC)
@@ -422,6 +425,8 @@ def create_access_token(
         "tid": str(tenant_id),
         "token_version": token_version,
     }
+    if session_id is not None:
+        payload["sid"] = str(session_id)
     return jwt.encode(payload, secret, algorithm="HS256"), expires_at
 
 
@@ -447,17 +452,21 @@ def decode_access_token(
         raw_tenant_id = payload["tid"]
         raw_version = payload["token_version"]
         raw_expiry = payload["exp"]
+        raw_session_id = payload.get("sid")
         if not isinstance(raw_subject, str) or not isinstance(raw_tenant_id, str):
             raise ValueError("JWT identifiers must be strings")
         if isinstance(raw_version, bool) or not isinstance(raw_version, int) or raw_version < 1:
             raise ValueError("JWT token_version must be a positive integer")
         if isinstance(raw_expiry, bool) or not isinstance(raw_expiry, int | float):
             raise ValueError("JWT exp must be a numeric date")
+        if raw_session_id is not None and not isinstance(raw_session_id, str):
+            raise ValueError("JWT sid must be a string")
         return AccessTokenClaims(
             user_id=uuid.UUID(raw_subject),
             tenant_id=uuid.UUID(raw_tenant_id),
             token_version=raw_version,
             expires_at=datetime.fromtimestamp(raw_expiry, tz=UTC),
+            session_id=uuid.UUID(raw_session_id) if raw_session_id is not None else None,
         )
     except (jwt.InvalidTokenError, KeyError, TypeError, ValueError) as exc:
         raise ApiError(
@@ -512,6 +521,18 @@ def get_current_principal(
         or tenant_status != TenantStatus.ACTIVE
     ):
         raise _invalid_access_token()
+    if claims.session_id is not None:
+        auth_session = db.get(AuthSession, claims.session_id)
+        if (
+            auth_session is None
+            or auth_session.tenant_id != claims.tenant_id
+            or auth_session.user_id != claims.user_id
+            or auth_session.token_version != claims.token_version
+            or auth_session.revoked_at is not None
+            or auth_session.rotated_at is not None
+            or auth_session.expires_at <= datetime.now(UTC)
+        ):
+            raise _invalid_access_token()
 
     legacy_grants = tuple(
         RoleScope(role=grant.role, store_id=grant.store_id)
@@ -581,6 +602,18 @@ def get_current_principal(
         )
     if not canonical_roles:
         raise _invalid_access_token()
+    pin_session_to_store_scope(
+        db,
+        assigned_store_ids,
+        tenant_wide=bool(
+            set(canonical_roles).intersection(
+                {
+                    CanonicalIdentityRole.TENANT_ADMIN,
+                    CanonicalIdentityRole.CORPORATE_USER,
+                }
+            )
+        ),
+    )
     return Principal(
         user_id=user.id,
         tenant_id=user.tenant_id,
@@ -589,6 +622,7 @@ def get_current_principal(
         role_scopes=scopes,
         canonical_roles=canonical_roles,
         assigned_store_ids=assigned_store_ids,
+        session_id=claims.session_id,
     )
 
 

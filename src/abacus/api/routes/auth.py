@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response, status
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
 from abacus.api.errors import ApiError
@@ -8,6 +8,7 @@ from abacus.schemas.identity import (
     AccessTokenRead,
     CanonicalPrincipalRead,
     LoginRequest,
+    RefreshTokenRequest,
 )
 from abacus.security import (
     CurrentPrincipal,
@@ -15,7 +16,12 @@ from abacus.security import (
     LoginThrottleDependency,
     create_access_token,
 )
-from abacus.services.identity import authenticate_user
+from abacus.services.identity import (
+    authenticate_user,
+    create_auth_session,
+    revoke_auth_session,
+    rotate_auth_session,
+)
 
 router = APIRouter(prefix="/v1", tags=["4. Identity and Access"])
 
@@ -55,6 +61,8 @@ def login_endpoint(
             password=request.password.get_secret_value(),
         )
         lifetime = timedelta(minutes=settings.access_token_minutes)
+        refresh_lifetime = timedelta(days=settings.refresh_token_days)
+        session_token = create_auth_session(db, user, lifetime=refresh_lifetime)
         token, _ = create_access_token(
             user_id=user.id,
             tenant_id=user.tenant_id,
@@ -63,10 +71,13 @@ def login_endpoint(
             issuer=settings.jwt_issuer,
             audience=settings.jwt_audience,
             lifetime=lifetime,
+            session_id=session_token.session.id,
         )
         response = AccessTokenRead(
             access_token=token,
             expires_in=int(lifetime.total_seconds()),
+            refresh_token=session_token.refresh_token,
+            refresh_expires_in=int(refresh_lifetime.total_seconds()),
         )
     except ApiError as exc:
         login_throttle.finish_attempt(
@@ -90,6 +101,55 @@ def login_endpoint(
         outcome=LoginAttemptOutcome.SUCCESS,
     )
     return response
+
+
+@router.post(
+    "/auth/refresh",
+    response_model=AccessTokenRead,
+    operation_id="refreshAccessToken",
+)
+def refresh_endpoint(
+    request: RefreshTokenRequest,
+    db: DatabaseSession,
+    settings: SettingsDependency,
+) -> AccessTokenRead:
+    access_lifetime = timedelta(minutes=settings.access_token_minutes)
+    refresh_lifetime = timedelta(days=settings.refresh_token_days)
+    user, session_token = rotate_auth_session(
+        db,
+        tenant_code=request.tenant_code,
+        raw_refresh_token=request.refresh_token.get_secret_value(),
+        lifetime=refresh_lifetime,
+    )
+    access_token, _ = create_access_token(
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        token_version=user.token_version,
+        secret=settings.jwt_secret,
+        issuer=settings.jwt_issuer,
+        audience=settings.jwt_audience,
+        lifetime=access_lifetime,
+        session_id=session_token.session.id,
+    )
+    return AccessTokenRead(
+        access_token=access_token,
+        expires_in=int(access_lifetime.total_seconds()),
+        refresh_token=session_token.refresh_token,
+        refresh_expires_in=int(refresh_lifetime.total_seconds()),
+    )
+
+
+@router.post(
+    "/auth/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    operation_id="logout",
+)
+def logout_endpoint(
+    db: DatabaseSession,
+    principal: CurrentPrincipal,
+) -> Response:
+    revoke_auth_session(db, principal)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get(

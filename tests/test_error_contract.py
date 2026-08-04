@@ -29,6 +29,8 @@ EXPECTED_PROBLEM_STATUSES = {
     "getBusinessEvent": {"401", "403", "404", "422", "500"},
     "getCurrentUser": {"401", "500"},
     "login": {"401", "422", "429", "500"},
+    "refreshAccessToken": {"401", "422", "500"},
+    "logout": {"401", "500"},
     "createUser": {"401", "403", "409", "422", "500"},
     "listUsers": {"401", "403", "422", "500"},
     "listIdentityAuditRecords": {"401", "403", "422", "500"},
@@ -71,9 +73,10 @@ def test_openapi_documents_runtime_error_contract() -> None:
     assert len(operations) == len(EXPECTED_PROBLEM_STATUSES)
     assert all("500" in operation["responses"] for operation in operations)
     secured = [operation for operation in operations if operation.get("security")]
-    assert len(secured) == 40
+    assert len(secured) == 41
     assert all("401" in operation["responses"] for operation in secured)
     assert "401" in schema["paths"]["/v1/auth/login"]["post"]["responses"]
+    assert "401" in schema["paths"]["/v1/auth/refresh"]["post"]["responses"]
 
     inventory = schema["paths"]["/v1/stores/{store_id}/inventory"]["get"]
     assert "`inventory:read`" in inventory["responses"]["403"]["description"]

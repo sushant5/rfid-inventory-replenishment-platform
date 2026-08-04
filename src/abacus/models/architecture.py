@@ -988,11 +988,23 @@ class ReplenishmentTaskStatus(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+class ReplenishmentVerificationStatus(StrEnum):
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    PENDING = "PENDING"
+    VERIFIED = "VERIFIED"
+    UNVERIFIED = "UNVERIFIED"
+
+
 class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "replenishment_tasks"
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_replenishment_tasks_positive_quantity"),
         CheckConstraint("version >= 1", name="ck_replenishment_tasks_positive_version"),
+        CheckConstraint(
+            "verified_quantity >= 0 AND verified_quantity <= quantity",
+            name="ck_replenishment_tasks_verified_quantity",
+        ),
+        UniqueConstraint("tenant_id", "id", name="uq_replenishment_tasks_tenant_id"),
         ForeignKeyConstraint(
             ["tenant_id", "store_id"],
             ["stores.tenant_id", "stores.id"],
@@ -1063,6 +1075,10 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         default=ReplenishmentTaskStatus.OPEN,
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    verified_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    verification_deadline: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     claimed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -1072,3 +1088,45 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ReplenishmentTaskEvidence(UUIDPrimaryKeyMixin, Base):
+    """One stable backroom-to-floor RFID transition attributed to a task."""
+
+    __tablename__ = "replenishment_task_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "transition_id",
+            name="uq_replenishment_task_evidence_transition",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "task_id"],
+            ["replenishment_tasks.tenant_id", "replenishment_tasks.id"],
+            name="fk_replenishment_task_evidence_tenant_task",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "transition_id"],
+            ["inventory_transition_outbox.tenant_id", "inventory_transition_outbox.transition_id"],
+            name="fk_replenishment_task_evidence_tenant_transition",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ix_replenishment_task_evidence_task_observed",
+            "tenant_id",
+            "task_id",
+            "observed_at",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    transition_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    epc: Mapped[str] = mapped_column(String(128), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

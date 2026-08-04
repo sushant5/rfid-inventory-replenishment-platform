@@ -4,7 +4,11 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, status
 
 from abacus.api.dependencies import DatabaseSession, SettingsDependency
-from abacus.models.architecture import PolicyVersionStatus, ReplenishmentTaskStatus
+from abacus.models.architecture import (
+    PolicyVersionStatus,
+    ReplenishmentTask,
+    ReplenishmentTaskStatus,
+)
 from abacus.schemas.replenishment import (
     PolicyBundlePage,
     PolicyBundleRead,
@@ -31,6 +35,7 @@ from abacus.services.replenishment import (
     list_store_tasks,
     patch_policy_version,
     patch_replenishment_task,
+    replenishment_verification_status,
 )
 
 router = APIRouter(prefix="/v1", tags=["5. Replenishment"])
@@ -62,6 +67,13 @@ def _bundle_read(bundle: PolicyBundle) -> PolicyBundleRead:
         policy=PolicyDefinitionRead.model_validate(bundle.policy),
         version=PolicyVersionRead.model_validate(bundle.version),
         rules=[PolicyRuleRead.model_validate(rule) for rule in bundle.rules],
+    )
+
+
+def _task_read(task: ReplenishmentTask) -> ReplenishmentTaskRead:
+    response = ReplenishmentTaskRead.model_validate(task)
+    return response.model_copy(
+        update={"verification_status": replenishment_verification_status(task)}
     )
 
 
@@ -194,8 +206,8 @@ def evaluate_replenishment_endpoint(
         suppressed_low_confidence=result.suppressed_low_confidence,
         deferred_count=result.deferred_count,
         deferred_quantity=result.deferred_quantity,
-        tasks=[ReplenishmentTaskRead.model_validate(task) for task in result.tasks],
-        updated_tasks=[ReplenishmentTaskRead.model_validate(task) for task in result.updated_tasks],
+        tasks=[_task_read(task) for task in result.tasks],
+        updated_tasks=[_task_read(task) for task in result.updated_tasks],
     )
 
 
@@ -221,7 +233,7 @@ def list_store_tasks_endpoint(
         offset=offset,
     )
     return ReplenishmentTaskPage(
-        items=[ReplenishmentTaskRead.model_validate(task) for task in tasks],
+        items=[_task_read(task) for task in tasks],
         total=total,
         limit=limit,
         offset=offset,
@@ -237,8 +249,15 @@ def patch_replenishment_task_endpoint(
     task_id: uuid.UUID,
     request: ReplenishmentTaskPatch,
     db: DatabaseSession,
+    settings: SettingsDependency,
     principal: CanExecuteReplenishment,
 ) -> ReplenishmentTaskRead:
-    return ReplenishmentTaskRead.model_validate(
-        patch_replenishment_task(db, principal, task_id, request)
+    return _task_read(
+        patch_replenishment_task(
+            db,
+            principal,
+            task_id,
+            request,
+            verification_window_seconds=settings.replenishment_verification_window_seconds,
+        )
     )

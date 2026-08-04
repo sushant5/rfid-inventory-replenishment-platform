@@ -5,7 +5,11 @@ from datetime import datetime
 
 from pydantic import Field, field_validator, model_validator
 
-from abacus.models.architecture import PolicyVersionStatus, ReplenishmentTaskStatus
+from abacus.models.architecture import (
+    PolicyVersionStatus,
+    ReplenishmentTaskStatus,
+    ReplenishmentVerificationStatus,
+)
 from abacus.schemas.common import ApiModel
 
 
@@ -142,6 +146,11 @@ class ReplenishmentTaskRead(ApiModel):
     policy_rule_id: uuid.UUID
     status: ReplenishmentTaskStatus
     quantity: int
+    verified_quantity: int
+    verification_status: ReplenishmentVerificationStatus = (
+        ReplenishmentVerificationStatus.NOT_APPLICABLE
+    )
+    verification_deadline: datetime | None
     version: int
     claimed_by_user_id: uuid.UUID | None
     claimed_at: datetime | None

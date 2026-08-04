@@ -1,7 +1,7 @@
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import case, delete, exists, func, or_, select, update
@@ -23,6 +23,7 @@ from abacus.models.architecture import (
     ProductVariant,
     ReplenishmentTask,
     ReplenishmentTaskStatus,
+    ReplenishmentVerificationStatus,
     StoreConnectivity,
 )
 from abacus.models.catalog import Sku
@@ -47,6 +48,23 @@ class PolicyBundle:
     policy: PolicyDefinition
     version: PolicyVersion
     rules: tuple[PolicyRule, ...]
+
+
+def replenishment_verification_status(
+    task: ReplenishmentTask,
+    *,
+    evaluated_at: datetime | None = None,
+) -> ReplenishmentVerificationStatus:
+    """Derive verification without mutating completed tasks as time advances."""
+
+    if task.status is not ReplenishmentTaskStatus.COMPLETED:
+        return ReplenishmentVerificationStatus.NOT_APPLICABLE
+    if task.verified_quantity >= task.quantity:
+        return ReplenishmentVerificationStatus.VERIFIED
+    now = evaluated_at or datetime.now(UTC)
+    if task.verification_deadline is not None and now >= task.verification_deadline:
+        return ReplenishmentVerificationStatus.UNVERIFIED
+    return ReplenishmentVerificationStatus.PENDING
 
 
 @dataclass(frozen=True, slots=True)
@@ -1118,6 +1136,8 @@ def patch_replenishment_task(
     principal: Principal,
     task_id: uuid.UUID,
     request: ReplenishmentTaskPatch,
+    *,
+    verification_window_seconds: int = 900,
 ) -> ReplenishmentTask:
     task = db.scalar(
         select(ReplenishmentTask).where(
@@ -1186,7 +1206,10 @@ def patch_replenishment_task(
     elif request.status == ReplenishmentTaskStatus.IN_PROGRESS:
         values["started_at"] = now
     elif request.status == ReplenishmentTaskStatus.COMPLETED:
-        values["completed_at"] = now
+        values.update(
+            completed_at=now,
+            verification_deadline=now + timedelta(seconds=verification_window_seconds),
+        )
     elif request.status == ReplenishmentTaskStatus.EXPIRED:
         values["expires_at"] = now
     if "note" in request.model_fields_set:

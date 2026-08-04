@@ -7,13 +7,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import delete, func, literal, or_, select, text, update
+from sqlalchemy import case, delete, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.selectable import Subquery
 
 from abacus.config import Settings
-from abacus.enums import DeviceStatus
+from abacus.enums import DeviceStatus, ZoneKind
 from abacus.events.inventory import InventoryDeltaEvent
 from abacus.events.rfid import RfidObservationEvent
 from abacus.models.architecture import (
@@ -24,6 +24,9 @@ from abacus.models.architecture import (
     InventoryTransitionOutbox,
     ItemPresenceStatus,
     ObservationBatchStatus,
+    ReplenishmentTask,
+    ReplenishmentTaskEvidence,
+    ReplenishmentTaskStatus,
     RfidEventProcessingStatus,
     RfidObservationBatch,
     RfidObservationBatchEvent,
@@ -32,7 +35,7 @@ from abacus.models.architecture import (
     StoreConnectivity,
 )
 from abacus.models.catalog import EpcBinding
-from abacus.models.tenancy import Device, DeviceAssignment
+from abacus.models.tenancy import Device, DeviceAssignment, Zone
 from abacus.services.connectivity import lock_store_connectivity_for_receipt
 
 
@@ -492,6 +495,87 @@ def _delta_payload(
     ).model_dump(mode="json")
 
 
+def _attribute_replenishment_move(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    transition_id: uuid.UUID,
+    epc: str,
+    sku_id: uuid.UUID,
+    store_id: uuid.UUID,
+    previous_zone_id: uuid.UUID,
+    next_zone_id: uuid.UUID,
+    observed_at: datetime,
+) -> None:
+    """Attach one confirmed backroom-to-floor move to at most one task."""
+
+    zone_kinds: dict[uuid.UUID, ZoneKind] = {
+        zone_id: kind
+        for zone_id, kind in db.execute(
+            select(Zone.id, Zone.kind).where(
+                Zone.tenant_id == tenant_id,
+                Zone.store_id == store_id,
+                Zone.id.in_({previous_zone_id, next_zone_id}),
+            )
+        ).all()
+    }
+    if (
+        zone_kinds.get(previous_zone_id) is not ZoneKind.BACKROOM
+        or zone_kinds.get(next_zone_id) is not ZoneKind.SALES_FLOOR
+    ):
+        return
+
+    task = db.scalar(
+        select(ReplenishmentTask)
+        .where(
+            ReplenishmentTask.tenant_id == tenant_id,
+            ReplenishmentTask.store_id == store_id,
+            ReplenishmentTask.sku_id == sku_id,
+            ReplenishmentTask.status.in_(
+                {
+                    ReplenishmentTaskStatus.IN_PROGRESS,
+                    ReplenishmentTaskStatus.COMPLETED,
+                }
+            ),
+            ReplenishmentTask.started_at.is_not(None),
+            ReplenishmentTask.started_at <= observed_at,
+            ReplenishmentTask.verified_quantity < ReplenishmentTask.quantity,
+            or_(
+                ReplenishmentTask.status == ReplenishmentTaskStatus.IN_PROGRESS,
+                (
+                    (ReplenishmentTask.status == ReplenishmentTaskStatus.COMPLETED)
+                    & ReplenishmentTask.verification_deadline.is_not(None)
+                    & (ReplenishmentTask.verification_deadline >= observed_at)
+                ),
+            ),
+        )
+        .order_by(
+            case(
+                (ReplenishmentTask.status == ReplenishmentTaskStatus.IN_PROGRESS, 0),
+                else_=1,
+            ),
+            ReplenishmentTask.started_at.desc(),
+            ReplenishmentTask.id.desc(),
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    if task is None:
+        return
+
+    db.add(
+        ReplenishmentTaskEvidence(
+            tenant_id=tenant_id,
+            task_id=task.id,
+            transition_id=transition_id,
+            epc=epc,
+            observed_at=observed_at,
+        )
+    )
+    task.verified_quantity = min(task.quantity, task.verified_quantity + 1)
+    task.version += 1
+
+
 def _apply_connectivity_observation(
     connectivity: StoreConnectivity,
     event: RfidObservationEvent,
@@ -842,6 +926,9 @@ def process_observation(
     transition_id = deterministic_transition_id(event.tenant_id, event.epc, next_version)
     watermark_observed_at = max(event.observed_at, decision.observed_at)
     watermark_received_at = max(event.received_at, decision.received_at)
+    previous_store_id = state.store_id if state is not None else None
+    previous_zone_id = state.zone_id if state is not None else None
+    previous_sku_id = state.sku_id if state is not None else None
     deltas: list[dict[str, object]] = []
     if state is not None and state.store_id is not None and state.zone_id is not None:
         deltas.append(
@@ -901,6 +988,23 @@ def process_observation(
             publish_attempts=0,
         )
     )
+    if (
+        previous_store_id == decision.store_id
+        and previous_zone_id is not None
+        and previous_sku_id == binding.sku_id
+    ):
+        db.flush()
+        _attribute_replenishment_move(
+            db,
+            tenant_id=event.tenant_id,
+            transition_id=transition_id,
+            epc=event.epc,
+            sku_id=binding.sku_id,
+            store_id=decision.store_id,
+            previous_zone_id=previous_zone_id,
+            next_zone_id=decision.zone_id,
+            observed_at=decision.observed_at,
+        )
     _advance_batch(db, event, rejected=False, disposition="PROCESSED")
     return ProcessingResult("PROCESSED", state_changed=True)
 
