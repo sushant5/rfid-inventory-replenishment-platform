@@ -210,8 +210,7 @@ def test_root_discovers_the_reviewer_endpoints() -> None:
             "GET /v1/rfid/quarantine",
         ],
         "private_credentials": (
-            "Administrative, device, platform, and infrastructure credentials are not "
-            "published."
+            "Administrative, device, platform, and infrastructure credentials are not published."
         ),
         "liveness": "/health/live",
         "readiness": "/health/ready",
