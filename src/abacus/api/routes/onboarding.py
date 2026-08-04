@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, status
+from fastapi import APIRouter, Depends, Header, Query, status
 from sqlalchemy import or_, select
 
 from abacus.api.dependencies import DatabaseSession, PlatformAccess
@@ -19,6 +19,7 @@ from abacus.schemas.tenancy import (
     StoreDeviceCreate,
     StoreDeviceMappingRead,
     StoreDeviceRegistrationRead,
+    StorePage,
     StoreRead,
     TenantCreate,
     TenantRead,
@@ -33,6 +34,7 @@ from abacus.services.onboarding import (
     list_device_assignments,
     list_devices,
     list_stores,
+    list_visible_stores,
     onboard_stores,
     register_store_device,
     rotate_device_credential,
@@ -44,6 +46,10 @@ canonical_router = APIRouter(prefix="/v1", tags=["1. Onboarding"])
 CanConfigureTenant = Annotated[
     Principal,
     Depends(require_permission(Permission.TENANT_CONFIGURE)),
+]
+CanReadInventory = Annotated[
+    Principal,
+    Depends(require_permission(Permission.INVENTORY_READ)),
 ]
 
 
@@ -187,6 +193,31 @@ def rotate_device_credential_canonical_endpoint(
 ) -> DeviceTokenRead:
     api_key = rotate_device_credential(db, principal.tenant_id, device_id)
     return DeviceTokenRead(device_id=device_id, device_token=api_key)
+
+
+@canonical_router.get(
+    "/stores",
+    response_model=StorePage,
+    operation_id="listStores",
+)
+def list_visible_stores_endpoint(
+    db: DatabaseSession,
+    principal: CanReadInventory,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> StorePage:
+    stores, total = list_visible_stores(
+        db,
+        principal,
+        limit=limit,
+        offset=offset,
+    )
+    return StorePage(
+        items=[StoreRead.model_validate(store) for store in stores],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get(

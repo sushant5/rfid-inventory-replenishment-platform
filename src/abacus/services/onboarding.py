@@ -406,6 +406,35 @@ def list_stores(db: Session, tenant_id: uuid.UUID) -> list[Store]:
     )
 
 
+def list_visible_stores(
+    db: Session,
+    principal: Principal,
+    *,
+    limit: int,
+    offset: int,
+) -> tuple[list[Store], int]:
+    """List stores authorized for inventory access inside the JWT tenant."""
+
+    filters = [Store.tenant_id == principal.tenant_id]
+    if not principal.has_tenant_permission(Permission.INVENTORY_READ):
+        store_ids = principal.store_ids_for_permission(Permission.INVENTORY_READ)
+        if not store_ids:
+            return [], 0
+        filters.append(Store.id.in_(store_ids))
+
+    total = db.scalar(select(func.count(Store.id)).where(*filters)) or 0
+    stores = list(
+        db.scalars(
+            select(Store)
+            .where(*filters)
+            .order_by(Store.code.asc(), Store.id.asc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+    )
+    return stores, total
+
+
 def list_devices(db: Session, tenant_id: uuid.UUID) -> list[Device]:
     if isinstance(db, TenantSession):
         pin_session_to_tenant(db, tenant_id)

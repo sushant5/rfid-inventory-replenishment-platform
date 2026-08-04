@@ -189,6 +189,13 @@ class StoreRead(ApiModel):
     updated_at: datetime
 
 
+class StorePage(ApiModel):
+    items: list[StoreRead]
+    total: int
+    limit: int
+    offset: int
+
+
 class ZoneRead(ApiModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
