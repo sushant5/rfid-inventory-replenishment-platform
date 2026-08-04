@@ -30,9 +30,21 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
             return HttpResult(200, {"email": "demo-reader@orange.example"})
         if url.endswith("/v1/stores?limit=5"):
             return HttpResult(200, {"items": [{"id": "store-1"}], "total": 1})
+        if url.endswith("/v1/stores/store-1/zones"):
+            return HttpResult(200, [{"id": "zone-1"}])
+        if url.endswith("/v1/stores/store-1/devices"):
+            return HttpResult(200, [{"device": {"id": "device-1"}}])
         if url.endswith("/v1/skus?limit=5"):
             return HttpResult(200, {"items": [{"id": "sku-1"}], "total": 1})
-        if "/inventory?limit=5" in url or "/replenishment-tasks?limit=5" in url:
+        if any(
+            suffix in url
+            for suffix in (
+                "/inventory?limit=5",
+                "/replenishment-policies?limit=5",
+                "/replenishment-tasks?limit=5",
+                "/rfid/quarantine?limit=5",
+            )
+        ):
             return HttpResult(200, {"items": [], "total": 0})
         if url.endswith("/v1/replenishment/evaluations"):
             assert payload == {"store_id": "store-1", "sku_ids": []}
@@ -43,13 +55,21 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
         "login",
         "current user",
         "stores",
+        "zones",
+        "devices",
         "SKUs",
         "inventory",
+        "policies",
         "tasks",
+        "quarantine",
         "write denied",
     ]
     assert [method for method, _, _ in requests] == [
         "POST",
+        "GET",
+        "GET",
+        "GET",
+        "GET",
         "GET",
         "GET",
         "GET",

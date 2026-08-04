@@ -141,7 +141,7 @@ def register_store_device_endpoint(
 def list_store_devices_endpoint(
     store_id: uuid.UUID,
     db: DatabaseSession,
-    principal: CanConfigureTenant,
+    principal: CanReadInventory,
 ) -> list[StoreDeviceMappingRead]:
     store_exists = db.scalar(
         select(Store.id).where(
@@ -151,7 +151,7 @@ def list_store_devices_endpoint(
     )
     if store_exists is None:
         raise ApiError(404, "Store not found", "The requested store does not exist.")
-    if not principal.can_access_store(Permission.TENANT_CONFIGURE, store_id):
+    if not principal.can_access_store(Permission.INVENTORY_READ, store_id):
         raise ApiError(403, "Forbidden", "The store is outside the current user's scope.")
     effective_at = datetime.now(UTC)
     mappings = db.execute(
@@ -246,7 +246,7 @@ def list_tenant_stores_endpoint(
 def list_store_zones_endpoint(
     store_id: uuid.UUID,
     db: DatabaseSession,
-    principal: CanConfigureTenant,
+    principal: CanReadInventory,
 ) -> list[ZoneRead]:
     store_exists = db.scalar(
         select(Store.id).where(
@@ -256,6 +256,8 @@ def list_store_zones_endpoint(
     )
     if store_exists is None:
         raise ApiError(404, "Store not found", "The requested store does not exist.")
+    if not principal.can_access_store(Permission.INVENTORY_READ, store_id):
+        raise ApiError(403, "Forbidden", "The store is outside the current user's scope.")
     zones = db.scalars(
         select(Zone)
         .where(

@@ -95,6 +95,14 @@ def require_page(result: HttpResult, *, operation: str) -> list[object]:
     return items
 
 
+def require_list(result: HttpResult, *, operation: str) -> list[object]:
+    if result.status_code != 200:
+        raise RuntimeError(f"{operation} returned HTTP {result.status_code}")
+    if not isinstance(result.body, list):
+        raise RuntimeError(f"{operation} did not return a JSON list")
+    return result.body
+
+
 def run_checks(
     base_url: str,
     *,
@@ -131,6 +139,15 @@ def run_checks(
         raise RuntimeError("store discovery returned no usable store")
     store_id = stores[0]["id"]
 
+    require_list(
+        transport("GET", f"{root}/v1/stores/{store_id}/zones", headers, None, timeout),
+        operation="zones",
+    )
+    require_list(
+        transport("GET", f"{root}/v1/stores/{store_id}/devices", headers, None, timeout),
+        operation="devices",
+    )
+
     skus = require_page(
         transport("GET", f"{root}/v1/skus?limit=5", headers, None, timeout),
         operation="SKU discovery",
@@ -151,12 +168,32 @@ def run_checks(
     require_page(
         transport(
             "GET",
+            f"{root}/v1/replenishment-policies?limit=5",
+            headers,
+            None,
+            timeout,
+        ),
+        operation="replenishment policies",
+    )
+    require_page(
+        transport(
+            "GET",
             f"{root}/v1/stores/{store_id}/replenishment-tasks?limit=5",
             headers,
             None,
             timeout,
         ),
         operation="replenishment tasks",
+    )
+    require_page(
+        transport(
+            "GET",
+            f"{root}/v1/rfid/quarantine?limit=5",
+            headers,
+            None,
+            timeout,
+        ),
+        operation="RFID quarantine",
     )
 
     denied = transport(
@@ -171,7 +208,19 @@ def run_checks(
             f"read-only mutation check returned HTTP {denied.status_code}, expected 403"
         )
 
-    return ["login", "current user", "stores", "SKUs", "inventory", "tasks", "write denied"]
+    return [
+        "login",
+        "current user",
+        "stores",
+        "zones",
+        "devices",
+        "SKUs",
+        "inventory",
+        "policies",
+        "tasks",
+        "quarantine",
+        "write denied",
+    ]
 
 
 def build_parser() -> argparse.ArgumentParser:

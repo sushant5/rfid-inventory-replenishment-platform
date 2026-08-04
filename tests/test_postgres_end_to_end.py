@@ -321,7 +321,7 @@ def test_postgres_end_to_end(
     assert restored_ready["status"] == "ok"
     version = _expect(client.get("/version"), 200)
     assert isinstance(version, dict)
-    assert version["version"] == "0.6.0"
+    assert version["version"] == "0.6.1"
     assert (
         client.get(
             "/v1/platform/tenants/00000000-0000-0000-0000-000000000000/stores",

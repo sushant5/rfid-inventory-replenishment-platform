@@ -124,7 +124,7 @@ def test_store_device_discovery_returns_current_assignment_mapping() -> None:
     store_id = uuid.uuid4()
     zone_id = uuid.uuid4()
     device_id = uuid.uuid4()
-    principal = _principal(tenant_id, CanonicalIdentityRole.TENANT_ADMIN)
+    principal = _principal(tenant_id, CanonicalIdentityRole.CORPORATE_USER)
     device = Device(
         id=device_id,
         tenant_id=tenant_id,
@@ -156,7 +156,7 @@ def test_store_device_discovery_returns_current_assignment_mapping() -> None:
 
 def test_store_zone_discovery_rejects_unknown_store() -> None:
     tenant_id = uuid.uuid4()
-    principal = _principal(tenant_id, CanonicalIdentityRole.TENANT_ADMIN)
+    principal = _principal(tenant_id, CanonicalIdentityRole.CORPORATE_USER)
     db = Mock(spec=Session)
     db.scalar.return_value = None
 
@@ -165,3 +165,26 @@ def test_store_zone_discovery_rejects_unknown_store() -> None:
 
     assert caught.value.status_code == 404
     assert caught.value.title == "Store not found"
+
+
+def test_store_zone_discovery_rejects_store_outside_user_scope() -> None:
+    tenant_id = uuid.uuid4()
+    store_id = uuid.uuid4()
+    assigned_store_id = uuid.uuid4()
+    principal = Principal(
+        user_id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        email="associate@orange.example",
+        display_name="Store Associate",
+        role_scopes=(RoleScope(CanonicalIdentityRole.STORE_ASSOCIATE, assigned_store_id),),
+        canonical_roles=(CanonicalIdentityRole.STORE_ASSOCIATE,),
+        assigned_store_ids=(assigned_store_id,),
+    )
+    db = Mock(spec=Session)
+    db.scalar.return_value = store_id
+
+    with pytest.raises(ApiError) as caught:
+        list_store_zones_endpoint(store_id, db, principal)
+
+    assert caught.value.status_code == 403
+    assert caught.value.title == "Forbidden"

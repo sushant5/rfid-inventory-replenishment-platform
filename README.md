@@ -26,10 +26,10 @@ Public reviewer login:
 
 In Swagger, run `POST /v1/auth/login`, copy the returned `access_token`, select
 **Authorize**, and paste it into `HTTPBearer`. Then call `GET /v1/me`, `GET /v1/stores`,
-`GET /v1/skus`, `GET /v1/stores/{store_id}/inventory`, and
-`GET /v1/stores/{store_id}/replenishment-tasks`. Copy a `store_id` from the store page
-for the last two calls. A mutation such as `POST /v1/replenishment/evaluations` returns
-`403 Forbidden` for this identity.
+`GET /v1/stores/{store_id}/zones`, `GET /v1/stores/{store_id}/devices`, `GET /v1/skus`,
+inventory, policies, tasks, and RFID quarantine. Copy a `store_id` from the store page
+for store-scoped calls. A mutation such as `POST /v1/replenishment/evaluations`
+returns `403 Forbidden` for this identity.
 
 The same flow with curl:
 
@@ -45,14 +45,18 @@ curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/stores?limit=5"
 curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/skus?limit=5"
 
 STORE_ID=<copy-an-id-from-the-store-response>
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/stores/$STORE_ID/zones"
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/stores/$STORE_ID/devices"
 curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/stores/$STORE_ID/inventory?limit=5"
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/replenishment-policies?limit=5"
 curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/stores/$STORE_ID/replenishment-tasks?limit=5"
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/rfid/quarantine?limit=5"
 curl -i -X POST "$BASE/v1/replenishment/evaluations" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "{\"store_id\":\"$STORE_ID\",\"sku_ids\":[]}"  # expected: 403
 ```
 
-Or run all seven read-only checks with Python 3 and no project installation:
+Or run the full public read-path check with Python 3 and no project installation:
 
 ```bash
 python scripts/public_demo_smoke.py

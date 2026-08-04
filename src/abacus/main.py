@@ -52,9 +52,10 @@ Paste the returned `access_token` into **Authorize** using `HTTPBearer`, then ca
 
 1. `GET /v1/me`
 2. `GET /v1/stores`
-3. `GET /v1/skus`
-4. `GET /v1/stores/{{store_id}}/inventory`
-5. `GET /v1/stores/{{store_id}}/replenishment-tasks`
+3. `GET /v1/stores/{{store_id}}/zones` and `/devices`
+4. `GET /v1/skus`
+5. `GET /v1/stores/{{store_id}}/inventory`
+6. `GET /v1/replenishment-policies` and the store's replenishment tasks
 
 The public identity is tenant-scoped and read-only. A write operation such as
 `POST /v1/replenishment/evaluations` returns `403 Forbidden`.
@@ -145,9 +146,13 @@ def create_app() -> FastAPI:
                 "POST /v1/auth/login",
                 "GET /v1/me",
                 "GET /v1/stores",
+                "GET /v1/stores/{store_id}/zones",
+                "GET /v1/stores/{store_id}/devices",
                 "GET /v1/skus",
                 "GET /v1/stores/{store_id}/inventory",
+                "GET /v1/replenishment-policies",
                 "GET /v1/stores/{store_id}/replenishment-tasks",
+                "GET /v1/rfid/quarantine",
             ],
             "private_credentials": "Platform, tenant-admin, and device credentials are private.",
             "liveness": "/health/live",

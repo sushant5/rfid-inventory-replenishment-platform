@@ -1,4 +1,4 @@
 """Abacus RFID inventory and replenishment platform."""
 
 API_TITLE = "Abacus RFID Platform"
-__version__ = "0.6.0"
+__version__ = "0.6.1"

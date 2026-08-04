@@ -2,14 +2,37 @@ import json
 from pathlib import Path
 
 from scripts.generate_store_batch import build_store_batch
+from scripts.public_demo_smoke import DEMO_EMAIL, DEMO_PASSWORD, DEMO_TENANT
 
 from abacus import API_TITLE, __version__
-from abacus.main import create_app
+from abacus.main import (
+    PUBLIC_DEMO_EMAIL,
+    PUBLIC_DEMO_PASSWORD,
+    PUBLIC_DEMO_TENANT,
+    create_app,
+)
 from abacus.schemas.architecture import CanonicalObservationBatchCreate
 from abacus.schemas.canonical_replenishment import PolicyCreate
 from abacus.schemas.tenancy import BulkStoreOnboardingRequest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_public_demo_credentials_remain_aligned_across_delivery_surfaces() -> None:
+    assert (PUBLIC_DEMO_TENANT, PUBLIC_DEMO_EMAIL, PUBLIC_DEMO_PASSWORD) == (
+        DEMO_TENANT,
+        DEMO_EMAIL,
+        DEMO_PASSWORD,
+    )
+    for relative_path in (
+        ".env.example",
+        "README.md",
+        "docker-compose.yml",
+        "render.yaml",
+    ):
+        contents = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert PUBLIC_DEMO_EMAIL in contents
+        assert PUBLIC_DEMO_PASSWORD in contents
 
 
 def test_assignment_sized_store_fixture_is_valid_and_deterministic() -> None:
@@ -39,7 +62,7 @@ def test_openapi_contains_the_submission_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.6.0"
+    assert __version__ == "0.6.1"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",
