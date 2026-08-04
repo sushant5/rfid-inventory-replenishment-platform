@@ -16,6 +16,19 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
     ) -> HttpResult:
         requests.append((method, url, payload))
         assert timeout == 3.0
+        if url == "https://abacus.example.test/":
+            assert method == "GET"
+            assert not headers
+            return HttpResult(
+                200,
+                {
+                    "demo_login": {
+                        "tenant_code": "orange",
+                        "email": "demo-reader@orange.example",
+                        "password": "Orange-Demo-ReadOnly-2026!",
+                    }
+                },
+            )
         if url.endswith("/v1/auth/login"):
             assert not headers
             assert payload == {
@@ -31,9 +44,16 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
         if url.endswith("/v1/stores?limit=5"):
             return HttpResult(200, {"items": [{"id": "store-1"}], "total": 1})
         if url.endswith("/v1/stores/store-1/zones"):
-            return HttpResult(200, [{"id": "zone-1"}])
+            if method == "GET":
+                return HttpResult(200, [{"id": "zone-1", "code": "floor"}])
+            return HttpResult(403, {"status": 403})
         if url.endswith("/v1/stores/store-1/devices"):
-            return HttpResult(200, [{"device": {"id": "device-1"}}])
+            if method == "GET":
+                return HttpResult(
+                    200,
+                    [{"device": {"id": "device-1", "serial_number": "DEMO-DEVICE-1"}}],
+                )
+            return HttpResult(403, {"status": 403})
         if url.endswith("/v1/skus?limit=5"):
             return HttpResult(200, {"items": [{"id": "sku-1"}], "total": 1})
         if any(
@@ -46,12 +66,12 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
             )
         ):
             return HttpResult(200, {"items": [], "total": 0})
-        if url.endswith("/v1/replenishment/evaluations"):
-            assert payload == {"store_id": "store-1", "sku_ids": []}
+        if method in {"POST", "PATCH"}:
             return HttpResult(403, {"status": 403})
         raise AssertionError(f"unexpected request: {method} {url}")
 
     assert run_checks("https://abacus.example.test/", timeout=3.0, transport=transport) == [
+        "discovery",
         "login",
         "current user",
         "stores",
@@ -62,20 +82,26 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
         "policies",
         "tasks",
         "quarantine",
-        "write denied",
+        "seven write categories denied",
     ]
-    assert [method for method, _, _ in requests] == [
+    mutation_requests = requests[-7:]
+    assert [method for method, _, _ in mutation_requests] == [
         "POST",
-        "GET",
-        "GET",
-        "GET",
-        "GET",
-        "GET",
-        "GET",
-        "GET",
-        "GET",
-        "GET",
         "POST",
+        "POST",
+        "POST",
+        "POST",
+        "POST",
+        "PATCH",
+    ]
+    assert [url.rsplit("/v1/", 1)[1] for _, url, _ in mutation_requests] == [
+        "users",
+        "stores/store-1/zones",
+        "stores/store-1/devices",
+        "replenishment-policy-versions/00000000-0000-0000-0000-000000000000/activate",
+        "replenishment/evaluations",
+        "devices/00000000-0000-0000-0000-000000000000/credentials:rotate",
+        "replenishment-tasks/00000000-0000-0000-0000-000000000000",
     ]
 
 

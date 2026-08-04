@@ -27,6 +27,7 @@ os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("JWT_SECRET", "postgres-integration-test-jwt-secret-000000000000")
 os.environ.setdefault("PLATFORM_API_KEY", "postgres-integration-platform-key")
 os.environ.setdefault("LOGIN_THROTTLE_ENABLED", "false")
+os.environ.setdefault("BOOTSTRAP_PUBLIC_REVIEWER_ENABLED", "true")
 
 
 def _validated_test_database_url() -> str:

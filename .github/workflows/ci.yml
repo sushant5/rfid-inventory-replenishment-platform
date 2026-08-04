@@ -59,6 +59,7 @@ jobs:
           scripts/run_architecture_demo.py
           scripts/rfid_simulator.py
           scripts/smoke_test.py
+          scripts/public_demo_smoke.py
           scripts/generate_store_batch.py
       - name: Migrate clean database
         run: alembic upgrade head

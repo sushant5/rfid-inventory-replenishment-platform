@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 DEMO_TENANT = "orange"
 DEMO_EMAIL = "demo-reader@orange.example"
 DEMO_PASSWORD = "Orange-Demo-ReadOnly-2026!"  # noqa: S105 - public demo credential
+ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 
 type JsonValue = dict[str, object] | list[object]
 
@@ -103,6 +104,31 @@ def require_list(result: HttpResult, *, operation: str) -> list[object]:
     return result.body
 
 
+def discover_public_login(result: HttpResult) -> tuple[str, str, str]:
+    discovery = require_object(result, operation="service discovery")
+    login = discovery.get("demo_login")
+    if not isinstance(login, dict):
+        raise RuntimeError("service discovery did not publish a demo login")
+    tenant = login.get("tenant_code")
+    email = login.get("email")
+    password = login.get("password")
+    if (
+        not isinstance(tenant, str)
+        or not tenant
+        or not isinstance(email, str)
+        or not email
+        or not isinstance(password, str)
+        or not password
+    ):
+        raise RuntimeError("service discovery published an incomplete demo login")
+    return tenant, email, password
+
+
+def require_forbidden(result: HttpResult, *, operation: str) -> None:
+    if result.status_code != 403:
+        raise RuntimeError(f"{operation} returned HTTP {result.status_code}, expected 403")
+
+
 def run_checks(
     base_url: str,
     *,
@@ -110,12 +136,15 @@ def run_checks(
     transport: Transport = request_json,
 ) -> list[str]:
     root = validate_base_url(base_url)
+    demo_tenant, demo_email, demo_password = discover_public_login(
+        transport("GET", f"{root}/", {}, None, timeout)
+    )
     login = require_object(
         transport(
             "POST",
             f"{root}/v1/auth/login",
             {},
-            {"tenant_code": DEMO_TENANT, "email": DEMO_EMAIL, "password": DEMO_PASSWORD},
+            {"tenant_code": demo_tenant, "email": demo_email, "password": demo_password},
             timeout,
         ),
         operation="login",
@@ -128,7 +157,7 @@ def run_checks(
     me = require_object(
         transport("GET", f"{root}/v1/me", headers, None, timeout), operation="current user"
     )
-    if me.get("email") != DEMO_EMAIL:
+    if me.get("email") != demo_email:
         raise RuntimeError("current-user response did not identify the public reviewer")
 
     stores = require_page(
@@ -139,14 +168,27 @@ def run_checks(
         raise RuntimeError("store discovery returned no usable store")
     store_id = stores[0]["id"]
 
-    require_list(
+    zones = require_list(
         transport("GET", f"{root}/v1/stores/{store_id}/zones", headers, None, timeout),
         operation="zones",
     )
-    require_list(
+    if not zones or not isinstance(zones[0], dict):
+        raise RuntimeError("zone discovery returned no seeded zone")
+    zone_id = zones[0].get("id")
+    zone_code = zones[0].get("code")
+    if not isinstance(zone_id, str) or not isinstance(zone_code, str):
+        raise RuntimeError("zone discovery returned an unusable zone")
+
+    devices = require_list(
         transport("GET", f"{root}/v1/stores/{store_id}/devices", headers, None, timeout),
         operation="devices",
     )
+    if not devices or not isinstance(devices[0], dict):
+        raise RuntimeError("device discovery returned no seeded device")
+    device = devices[0].get("device")
+    if not isinstance(device, dict) or not isinstance(device.get("serial_number"), str):
+        raise RuntimeError("device discovery returned an unusable device")
+    device_serial = device["serial_number"]
 
     skus = require_page(
         transport("GET", f"{root}/v1/skus?limit=5", headers, None, timeout),
@@ -196,19 +238,68 @@ def run_checks(
         operation="RFID quarantine",
     )
 
-    denied = transport(
-        "POST",
-        f"{root}/v1/replenishment/evaluations",
-        headers,
-        {"store_id": store_id, "sku_ids": []},
-        timeout,
+    mutation_checks: tuple[tuple[str, str, str, dict[str, object] | None], ...] = (
+        (
+            "user creation",
+            "POST",
+            "/v1/users",
+            {
+                "email": demo_email,
+                "display_name": "Public API Reviewer",
+                "password": demo_password,
+                "roles": ["CORPORATE_USER"],
+                "store_ids": [],
+            },
+        ),
+        (
+            "zone creation",
+            "POST",
+            f"/v1/stores/{store_id}/zones",
+            {"code": zone_code, "name": "Existing Demo Zone", "kind": "OTHER"},
+        ),
+        (
+            "device registration",
+            "POST",
+            f"/v1/stores/{store_id}/devices",
+            {
+                "serial_number": device_serial,
+                "display_name": "Existing Demo Device",
+                "zone_id": zone_id,
+            },
+        ),
+        (
+            "policy activation",
+            "POST",
+            f"/v1/replenishment-policy-versions/{ZERO_UUID}/activate",
+            None,
+        ),
+        (
+            "replenishment evaluation",
+            "POST",
+            "/v1/replenishment/evaluations",
+            {"store_id": ZERO_UUID, "sku_ids": []},
+        ),
+        (
+            "device credential rotation",
+            "POST",
+            f"/v1/devices/{ZERO_UUID}/credentials:rotate",
+            None,
+        ),
+        (
+            "task mutation",
+            "PATCH",
+            f"/v1/replenishment-tasks/{ZERO_UUID}",
+            {"status": "CLAIMED", "version": 1},
+        ),
     )
-    if denied.status_code != 403:
-        raise RuntimeError(
-            f"read-only mutation check returned HTTP {denied.status_code}, expected 403"
+    for operation, method, path, payload in mutation_checks:
+        require_forbidden(
+            transport(method, f"{root}{path}", headers, payload, timeout),
+            operation=operation,
         )
 
     return [
+        "discovery",
         "login",
         "current user",
         "stores",
@@ -219,7 +310,7 @@ def run_checks(
         "policies",
         "tasks",
         "quarantine",
-        "write denied",
+        "seven write categories denied",
     ]
 
 

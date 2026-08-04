@@ -31,7 +31,8 @@ inventory, policies, tasks, and RFID quarantine. Copy a `store_id` from the stor
 for store-scoped calls. A mutation such as `POST /v1/replenishment/evaluations`
 returns `403 Forbidden` for this identity.
 
-The same flow with curl:
+`GET /` is the authoritative source for the currently configured public login. The
+same flow with curl:
 
 ```bash
 BASE=https://abacus-take-home-api.onrender.com
@@ -56,7 +57,8 @@ curl -i -X POST "$BASE/v1/replenishment/evaluations" \
   -d "{\"store_id\":\"$STORE_ID\",\"sku_ids\":[]}"  # expected: 403
 ```
 
-Or run the full public read-path check with Python 3 and no project installation:
+Or run the full public read-path check with Python 3.12 and no project installation;
+the script discovers the current public login from `GET /`:
 
 ```bash
 python scripts/public_demo_smoke.py
@@ -66,6 +68,10 @@ The platform key, tenant-admin login, and device credentials stay private. They 
 tenant provisioning, catalog mutation, identity administration, or RFID ingestion and
 are not needed to inspect the hosted API. The repository owner can run the full
 write-path walkthrough with those credentials through `scripts/run_architecture_demo.py`.
+
+The hosted database is preseeded. Startup intentionally reconciles identities but does
+not recreate mutable stores, catalog, or inventory; after attaching a fresh database,
+run the private architecture demo once. Locally, `make demo` performs that step.
 
 ## Reviewer quick start
 

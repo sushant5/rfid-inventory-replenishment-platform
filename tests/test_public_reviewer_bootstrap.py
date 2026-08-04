@@ -138,12 +138,57 @@ def test_public_reviewer_is_exact_and_unchanged_bootstrap_is_write_free(
         "replenishment:read",
     ]
     assert api_client.get("/v1/stores", headers=headers).status_code == 200
-    denied = api_client.post(
-        "/v1/replenishment/evaluations",
-        headers=headers,
-        json={"store_id": str(uuid.uuid4()), "sku_ids": []},
+    zero_uuid = "00000000-0000-0000-0000-000000000000"
+    denied_mutations = (
+        (
+            "POST",
+            "/v1/users",
+            {
+                "email": email,
+                "display_name": "Public API Reviewer",
+                "password": password,
+                "roles": ["CORPORATE_USER"],
+                "store_ids": [],
+            },
+        ),
+        (
+            "POST",
+            f"/v1/stores/{zero_uuid}/zones",
+            {"code": "blocked-zone", "name": "Blocked Zone", "kind": "OTHER"},
+        ),
+        (
+            "POST",
+            f"/v1/stores/{zero_uuid}/devices",
+            {
+                "serial_number": "BLOCKED-DEVICE",
+                "display_name": "Blocked Device",
+                "zone_id": zero_uuid,
+            },
+        ),
+        (
+            "POST",
+            f"/v1/replenishment-policy-versions/{zero_uuid}/activate",
+            None,
+        ),
+        (
+            "POST",
+            "/v1/replenishment/evaluations",
+            {"store_id": zero_uuid, "sku_ids": []},
+        ),
+        (
+            "POST",
+            f"/v1/devices/{zero_uuid}/credentials:rotate",
+            None,
+        ),
+        (
+            "PATCH",
+            f"/v1/replenishment-tasks/{zero_uuid}",
+            {"status": "CLAIMED", "version": 1},
+        ),
     )
-    assert denied.status_code == 403
+    for method, path, payload in denied_mutations:
+        response = api_client.request(method, path, headers=headers, json=payload)
+        assert response.status_code == 403, (method, path, response.text)
 
 
 def test_public_reviewer_bootstrap_removes_non_admin_access_escalation(
