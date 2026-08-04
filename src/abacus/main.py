@@ -17,6 +17,10 @@ from abacus.logging import configure_logging
 configure_logging()
 logger = structlog.get_logger(__name__)
 
+PUBLIC_DEMO_TENANT = "orange"
+PUBLIC_DEMO_EMAIL = "demo-reader@orange.example"
+PUBLIC_DEMO_PASSWORD = "Orange-Demo-ReadOnly-2026!"  # noqa: S105 - public demo credential
+
 OPENAPI_TAGS = [
     {"name": "1. Onboarding", "description": "Tenant, store, zone, and device setup."},
     {"name": "2. Product catalog", "description": "Asynchronous catalog import and SKU lookup."},
@@ -29,19 +33,34 @@ OPENAPI_TAGS = [
     {"name": "Operations", "description": "Service health and release metadata."},
 ]
 
-OPENAPI_DESCRIPTION = """
+OPENAPI_DESCRIPTION = f"""
 Multi-tenant RFID inventory and replenishment API.
 
-### Reviewer path
+### Public read-only reviewer
 
-1. Use the separately supplied Orange demo credentials with `POST /v1/auth/login`.
-2. Paste the returned access token into the `HTTPBearer` authorization scheme.
-3. Call `GET /v1/me`, then `GET /v1/stores` to discover the stores in that user's scope.
-4. Inspect catalog, inventory, policies, and replenishment tasks for one returned store.
+Sign in through `POST /v1/auth/login` with:
+
+```json
+{{
+  "tenant_code": "{PUBLIC_DEMO_TENANT}",
+  "email": "{PUBLIC_DEMO_EMAIL}",
+  "password": "{PUBLIC_DEMO_PASSWORD}"
+}}
+```
+
+Paste the returned `access_token` into **Authorize** using `HTTPBearer`, then call:
+
+1. `GET /v1/me`
+2. `GET /v1/stores`
+3. `GET /v1/skus`
+4. `GET /v1/stores/{{store_id}}/inventory`
+5. `GET /v1/stores/{{store_id}}/replenishment-tasks`
+
+The public identity is tenant-scoped and read-only. A write operation such as
+`POST /v1/replenishment/evaluations` returns `403 Forbidden`.
 
 RFID ingestion uses a separate `DeviceToken`; tenant provisioning and bulk imports use
-a `PlatformApiKey`. These privileged write credentials remain private and are not
-published in the repository or service-discovery response.
+a `PlatformApiKey`. Platform, tenant-admin, and device credentials remain private.
 
 PostgreSQL RLS is the tenant-isolation boundary. Store-level permissions are resolved
 from PostgreSQL on every request and enforced explicitly by the application.
@@ -106,7 +125,7 @@ def create_app() -> FastAPI:
     install_openapi_error_contract(application)
 
     @application.get("/", include_in_schema=False)
-    def service_discovery() -> dict[str, str]:
+    def service_discovery() -> dict[str, object]:
         """Give a reviewer useful entry points when opening the hosted base URL."""
 
         return {
@@ -116,8 +135,21 @@ def create_app() -> FastAPI:
             "openapi": "/openapi.json",
             "login": "/v1/auth/login",
             "stores": "/v1/stores",
-            "reviewer_path": "login -> me -> stores -> catalog/inventory/policies/tasks",
-            "credentials": "Reviewer login is supplied separately; privileged keys remain private.",
+            "demo_login": {
+                "tenant_code": PUBLIC_DEMO_TENANT,
+                "email": PUBLIC_DEMO_EMAIL,
+                "password": PUBLIC_DEMO_PASSWORD,
+            },
+            "demo_access": "Read-only Orange tenant access; mutation requests return 403.",
+            "reviewer_path": [
+                "POST /v1/auth/login",
+                "GET /v1/me",
+                "GET /v1/stores",
+                "GET /v1/skus",
+                "GET /v1/stores/{store_id}/inventory",
+                "GET /v1/stores/{store_id}/replenishment-tasks",
+            ],
+            "private_credentials": "Platform, tenant-admin, and device credentials are private.",
             "liveness": "/health/live",
             "readiness": "/health/ready",
         }

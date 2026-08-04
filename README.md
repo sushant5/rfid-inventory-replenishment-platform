@@ -15,30 +15,53 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.6.0` on Render with PostgreSQL 16. Render may need
-about a minute to wake the free web service after inactivity. Reviewer credentials
-are provided separately and are intentionally not stored in this public repository.
+The hosted demo runs release `0.6.1` on Render with PostgreSQL 16. Render may need
+about a minute to wake the free web service after inactivity.
 
-Authenticated hosted walkthrough: load `PLATFORM_API_KEY`, `BOOTSTRAP_ADMIN_EMAIL`,
-and `BOOTSTRAP_ADMIN_PASSWORD` into the current environment from the private reviewer
-credential bundle, then run:
+Public reviewer login:
+
+| Tenant | Email | Password | Access |
+|---|---|---|---|
+| `orange` | `demo-reader@orange.example` | `Orange-Demo-ReadOnly-2026!` | Tenant-scoped, read-only |
+
+In Swagger, run `POST /v1/auth/login`, copy the returned `access_token`, select
+**Authorize**, and paste it into `HTTPBearer`. Then call `GET /v1/me`, `GET /v1/stores`,
+`GET /v1/skus`, `GET /v1/stores/{store_id}/inventory`, and
+`GET /v1/stores/{store_id}/replenishment-tasks`. Copy a `store_id` from the store page
+for the last two calls. A mutation such as `POST /v1/replenishment/evaluations` returns
+`403 Forbidden` for this identity.
+
+The same flow with curl:
 
 ```bash
-python scripts/run_architecture_demo.py --base-url https://abacus-take-home-api.onrender.com
+BASE=https://abacus-take-home-api.onrender.com
+TOKEN=$(curl -sS -X POST "$BASE/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant_code":"orange","email":"demo-reader@orange.example","password":"Orange-Demo-ReadOnly-2026!"}' \
+  | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/me"
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/stores?limit=5"
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/skus?limit=5"
+
+STORE_ID=<copy-an-id-from-the-store-response>
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/stores/$STORE_ID/inventory?limit=5"
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/v1/stores/$STORE_ID/replenishment-tasks?limit=5"
+curl -i -X POST "$BASE/v1/replenishment/evaluations" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"store_id\":\"$STORE_ID\",\"sku_ids\":[]}"  # expected: 403
 ```
 
-The command intentionally keeps secrets out of command-line arguments and process
-listings. Its readiness probe retries for two minutes, so a sleeping free Render
-instance can wake before the workflow begins.
+Or run all seven read-only checks with Python 3 and no project installation:
 
-For Swagger, call `POST /v1/auth/login` with tenant code `orange`, then paste the
-returned access token into `HTTPBearer` under **Authorize**. The separately supplied
-platform key goes into `PlatformApiKey`; it is required for tenant, store-import, and
-catalog-import operations. Keeping these credentials outside GitHub prevents arbitrary
-visitors from mutating or exhausting the shared reviewer database.
+```bash
+python scripts/public_demo_smoke.py
+```
 
-After login, call `GET /v1/me` and `GET /v1/stores` to discover the authenticated
-user's role and visible store IDs before opening inventory, policies, and tasks.
+The platform key, tenant-admin login, and device credentials stay private. They permit
+tenant provisioning, catalog mutation, identity administration, or RFID ingestion and
+are not needed to inspect the hosted API. The repository owner can run the full
+write-path walkthrough with those credentials through `scripts/run_architecture_demo.py`.
 
 ## Reviewer quick start
 
@@ -78,7 +101,8 @@ credentials in `docker-compose.yml` are deliberately marked local-only.
 ```mermaid
 flowchart LR
     Gateway[RFID gateway] -->|device token| API[FastAPI]
-    Reviewer[Reviewer / Swagger] -->|JWT / platform key| API
+    Reviewer[Reviewer / Swagger] -->|read-only JWT| API
+    Operator[Repository owner] -->|private platform and device credentials| API
     API --> PG[(PostgreSQL + RLS)]
     API -->|durable event inbox| PG
     PG --> CW[Catalog worker]
@@ -139,7 +163,7 @@ streaming and S3 source-file retention are production extensions, not demo depen
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.6.0`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.6.1`).
 
 The visible contract includes all required endpoints:
 
@@ -257,7 +281,7 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.6.0 --expected-build-sha <release-sha> --expected-schema-revision a1d4e7b9c203
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.6.1 --expected-build-sha <release-sha> --expected-schema-revision a1d4e7b9c203
 ```
 
 ## Hosting

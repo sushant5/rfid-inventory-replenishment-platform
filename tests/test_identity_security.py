@@ -5,6 +5,7 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from abacus import __version__
 from abacus.api.errors import ApiError
 from abacus.main import create_app
 from abacus.security import (
@@ -147,13 +148,39 @@ def test_root_discovers_the_reviewer_endpoints() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "service": "Abacus RFID Platform",
-        "version": "0.6.0",
+        "version": __version__,
         "docs": "/docs",
         "openapi": "/openapi.json",
         "login": "/v1/auth/login",
         "stores": "/v1/stores",
-        "reviewer_path": "login -> me -> stores -> catalog/inventory/policies/tasks",
-        "credentials": "Reviewer login is supplied separately; privileged keys remain private.",
+        "demo_login": {
+            "tenant_code": "orange",
+            "email": "demo-reader@orange.example",
+            "password": "Orange-Demo-ReadOnly-2026!",
+        },
+        "demo_access": "Read-only Orange tenant access; mutation requests return 403.",
+        "reviewer_path": [
+            "POST /v1/auth/login",
+            "GET /v1/me",
+            "GET /v1/stores",
+            "GET /v1/skus",
+            "GET /v1/stores/{store_id}/inventory",
+            "GET /v1/stores/{store_id}/replenishment-tasks",
+        ],
+        "private_credentials": "Platform, tenant-admin, and device credentials are private.",
         "liveness": "/health/live",
         "readiness": "/health/ready",
     }
+
+
+def test_openapi_publishes_the_read_only_reviewer_path() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    description = response.json()["info"]["description"]
+    assert "demo-reader@orange.example" in description
+    assert "Orange-Demo-ReadOnly-2026!" in description
+    assert "GET /v1/stores/{store_id}/inventory" in description
+    assert "returns `403 Forbidden`" in description
+    assert "Platform, tenant-admin, and device credentials remain private" in description
