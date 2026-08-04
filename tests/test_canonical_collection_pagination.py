@@ -155,8 +155,8 @@ def test_inventory_and_task_pages_have_stable_order_totals_and_store_authorizati
             tenant_id=tenant_id,
             policy_id=policy_id,
             version_number=1,
-            status=PolicyVersionStatus.ACTIVE,
-            activated_at=now,
+            status=PolicyVersionStatus.DRAFT,
+            activated_at=None,
         )
         rule = PolicyRule(
             id=rule_id,
@@ -178,6 +178,9 @@ def test_inventory_and_task_pages_have_stable_order_totals_and_store_authorizati
         db.add_all([sku, *zones, version])
         db.flush()
         db.add(rule)
+        db.flush()
+        version.status = PolicyVersionStatus.ACTIVE
+        version.activated_at = now
         db.flush()
         db.add_all(
             [
