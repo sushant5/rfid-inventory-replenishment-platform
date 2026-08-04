@@ -53,7 +53,7 @@ def _validated_test_app_database_url() -> str:
     return TEST_APP_DATABASE_URL
 
 
-def _reset_public_schema(engine: Engine) -> None:
+def _reset_test_schemas(engine: Engine) -> None:
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         actual_database = str(connection.scalar(text("SELECT current_database()")) or "")
         if "test" not in actual_database.lower():
@@ -61,6 +61,10 @@ def _reset_public_schema(engine: Engine) -> None:
                 "Refusing to reset PostgreSQL schema: connected database name "
                 f"{actual_database!r} does not contain 'test'."
             )
+        # Migration round-trip checks intentionally leave retired compatibility
+        # tables outside public. A test session must start from a clean database,
+        # while the production migration keeps its fail-closed CREATE SCHEMA.
+        connection.execute(text("DROP SCHEMA IF EXISTS retired_compatibility CASCADE"))
         connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
         connection.execute(text("CREATE SCHEMA public"))
 
@@ -69,7 +73,7 @@ def _reset_public_schema(engine: Engine) -> None:
 def postgres_engine() -> Generator[Engine]:
     database_url = _validated_test_database_url()
     engine = create_engine(database_url, pool_pre_ping=True)
-    _reset_public_schema(engine)
+    _reset_test_schemas(engine)
 
     project_root = Path(__file__).resolve().parents[1]
     alembic_config = Config(str(project_root / "alembic.ini"))
