@@ -767,12 +767,16 @@ def run(args: argparse.Namespace) -> None:
         if str(candidate["id"]) == str(task["id"])
     )
 
+    authoritative_event_time = max(
+        datetime.now(UTC) + timedelta(seconds=1),
+        verification_time + timedelta(seconds=5),
+    )
     authoritative_event = {
         "source_system": "ORANGE_POS",
         "external_event_id": f"sale-{run_id}",
         "event_type": "SALE",
         "epc": EPCS[0],
-        "occurred_at": (base_time + timedelta(seconds=30)).isoformat(),
+        "occurred_at": authoritative_event_time.isoformat(),
         "note": "Hosted demo authoritative sale",
     }
     _, business_event_value = client.request(
@@ -837,7 +841,7 @@ def run(args: argparse.Namespace) -> None:
             observation(
                 str(uuid.uuid4()),
                 EPCS[0],
-                base_time + timedelta(seconds=31 + index),
+                authoritative_event_time + timedelta(seconds=1 + index),
                 -35,
             )
             for index in range(3)

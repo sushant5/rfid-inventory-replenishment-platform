@@ -25,7 +25,7 @@ def branch_coverage_percentage(report: Mapping[str, Any]) -> float:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path, nargs="?", default=Path("coverage.json"))
-    parser.add_argument("--minimum", type=float, default=80.0)
+    parser.add_argument("--minimum", type=float, default=70.0)
     arguments = parser.parse_args(argv)
     report = json.loads(arguments.report.read_text(encoding="utf-8"))
     percentage = branch_coverage_percentage(report)

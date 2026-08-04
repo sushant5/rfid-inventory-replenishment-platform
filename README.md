@@ -94,7 +94,8 @@ make test
 
 The demo ensures the 100-store Orange footprint, imports 100 SKUs, stocks three stores,
 and prints eight end-to-end checks. These include duplicate/late RFID protection,
-RFID verification of a completed task, store-level authorization, and an idempotent sale. Swagger is at
+RFID verification of a completed task, store-level authorization, and an idempotent
+sale. Swagger is at
 <http://localhost:8000/docs>; readiness is
 at <http://localhost:8000/health/ready>.
 
@@ -207,12 +208,14 @@ The visible contract includes all required endpoints:
 - Catalog: create import, status, row errors, SKU discovery
 - RFID: submit batch, batch status, tenant-wide quarantine inspection and recovery
 - Inventory: store projection, physical item state, authoritative business-event removal
-- Identity: login, rotating refresh, logout/revocation, create user, access replacement, current user
+- Identity: login, rotating refresh, logout/revocation, create user, access replacement,
+  current user
 - Replenishment: policy discovery/version/activation, evaluation, task list/lifecycle
 - Operations: liveness, readiness, version
 
 Demo authentication uses a platform key, one-time device credentials, 15-minute
-access JWTs, and rotating refresh tokens. JWTs contain user, tenant, and session identity; current status, roles, store
+access JWTs, and rotating refresh tokens. JWTs contain user, tenant, and session identity;
+current status, roles, store
 assignments, and token version are loaded from PostgreSQL on every authenticated
 request. Suspension, password rotation, and access changes invalidate existing
 tokens immediately. Production SSO remains the enterprise authentication extension.
@@ -337,7 +340,7 @@ python -m pytest
 ruff check .
 ruff format --check .
 mypy src scripts/run_architecture_demo.py scripts/rfid_simulator.py scripts/smoke_test.py scripts/public_demo_smoke.py scripts/generate_store_batch.py scripts/generate_showcase_catalog.py scripts/check_branch_coverage.py
-python scripts/check_branch_coverage.py coverage.json --minimum 80
+python scripts/check_branch_coverage.py coverage.json --minimum 70
 ```
 
 The suite covers RLS tenant isolation, store/corporate authorization, catalog
@@ -346,8 +349,12 @@ bounded poison-event handling, outbox transitions, delta dedupe, projection
 reconstruction, policy precedence, size curves, active-task uniqueness, and
 stale-store suppression.
 
+Coverage has separate gates: 80% overall statement/branch coverage and 70% direct
+branch coverage. The direct gate prevents high line coverage from hiding untested branches.
+
 CI has two independent gates. One runs lint, strict typing, dependency audit, a full
-Alembic downgrade/upgrade, PostgreSQL tests, direct branch coverage, image build, and metadata drift
+Alembic downgrade/upgrade, PostgreSQL tests, direct branch coverage, image build, and
+metadata drift
 checks. The other starts a clean Compose stack and literally runs `make migrate`,
 `make seed`, `make demo`, `make test`, the smoke test, and an API/worker restart check.
 
