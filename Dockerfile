@@ -26,8 +26,9 @@ FROM base AS test
 USER root
 COPY tests ./tests
 RUN pip install --no-cache-dir ".[dev]"
+ENV COVERAGE_FILE=/tmp/.coverage
 USER abacus
 
-CMD ["pytest"]
+CMD ["python", "-m", "pytest", "-o", "cache_dir=/tmp/pytest-cache"]
 
 FROM base AS runtime
