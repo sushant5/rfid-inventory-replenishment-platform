@@ -249,7 +249,7 @@ def run_checks(
         )
         if inventory:
             stocked_stores += 1
-    if stocked_stores < 3:
+    if stocked_stores < 5:
         raise RuntimeError(f"only {stocked_stores} of the first five stores contain inventory")
     require_page(
         transport(
@@ -369,7 +369,7 @@ def run_checks(
         "zones",
         "devices",
         "SKUs",
-        "inventory in three stores",
+        "inventory in five stores",
         "policies",
         "tasks",
         "quarantine",

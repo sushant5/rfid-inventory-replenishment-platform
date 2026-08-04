@@ -25,17 +25,17 @@ def test_showcase_catalog_is_deterministic_and_reviewer_sized() -> None:
 
     assert build_showcase_catalog() == content
     assert len({row["sku"] for row in rows}) == 100
-    assert len({row["epc"] for row in rows}) == 208
+    assert len({row["epc"] for row in rows}) == 214
     assert {row["epc"] for row in rows if row["sku"] == "SKU-TRAIL-BLUE-M"} == set(PRIMARY_EPCS)
     assert all(json.loads(row["style_attributes"])["category"] for row in rows)
     assert len({row["upc"] for row in rows}) == 100
     assert len(epcs_for_sku(2)) == len(epcs_for_sku(3)) == 4
-    assert len(epcs_for_sku(4)) == 4
+    assert all(len(epcs_for_sku(number)) == 4 for number in range(2, 8))
     assert sku_for_number(4) == "SKU-DEMO-004-L"
     assert upc_for_sku(1) == "036000291452"
     parsed = parse_catalog_csv(content)
     assert parsed.issues == []
-    assert len(parsed.rows) == 208
+    assert len(parsed.rows) == 214
     assert all(row.normalized is not None and row.issues == [] for row in parsed.rows)
 
 

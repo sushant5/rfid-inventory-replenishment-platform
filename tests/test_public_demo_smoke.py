@@ -75,10 +75,9 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
         if url.endswith("/v1/skus?limit=5"):
             return HttpResult(200, {"items": [{"id": "sku-1"}], "total": 100})
         if "/inventory?limit=5" in url:
-            store_number = int(url.split("/stores/store-", 1)[1].split("/", 1)[0])
             return HttpResult(
                 200,
-                {"items": [{"quantity": 4}] if store_number <= 3 else [], "total": 1},
+                {"items": [{"quantity": 4}], "total": 1},
             )
         if any(
             suffix in url
@@ -104,7 +103,7 @@ def test_public_demo_smoke_exercises_reads_and_proves_writes_are_denied() -> Non
         "zones",
         "devices",
         "SKUs",
-        "inventory in three stores",
+        "inventory in five stores",
         "policies",
         "tasks",
         "quarantine",
