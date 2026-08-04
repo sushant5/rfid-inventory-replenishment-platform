@@ -356,10 +356,11 @@ def test_inventory_api_reads_bucket_metadata_from_current_item_state(
             _tenant_admin(durable_pipeline),
         )
 
-        assert len(inventory) == 1
-        assert inventory[0].quantity == 1
-        assert inventory[0].as_of == authoritative_as_of
-        assert inventory[0].confidence == 0.2
+        assert inventory.total == 1
+        assert len(inventory.items) == 1
+        assert inventory.items[0].quantity == 1
+        assert inventory.items[0].as_of == authoritative_as_of
+        assert inventory.items[0].confidence == 0.2
         # The projection remains deliberately unchanged: quantity is projected, while
         # read-time metadata comes from authoritative item state.
         db.refresh(projection)
@@ -404,8 +405,8 @@ def test_item_and_bucket_confidence_age_while_store_remains_live(
             _tenant_admin(durable_pipeline),
         )
 
-        assert inventory[0].freshness_status == FreshnessStatus.LIVE
-        assert inventory[0].confidence == pytest.approx(0.5, abs=0.001)
+        assert inventory.items[0].freshness_status == FreshnessStatus.LIVE
+        assert inventory.items[0].confidence == pytest.approx(0.5, abs=0.001)
         assert item.freshness_status == FreshnessStatus.LIVE
         assert item.confidence == pytest.approx(0.5, abs=0.001)
 
@@ -418,7 +419,7 @@ def test_item_and_bucket_confidence_age_while_store_remains_live(
             settings,
             _tenant_admin(durable_pipeline),
         )
-        assert rebuilt_inventory[0].confidence == pytest.approx(0.5, abs=0.001)
+        assert rebuilt_inventory.items[0].confidence == pytest.approx(0.5, abs=0.001)
 
 
 def test_replenishment_suppresses_old_item_evidence_while_store_remains_live(

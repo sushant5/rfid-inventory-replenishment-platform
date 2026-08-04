@@ -24,6 +24,7 @@ from abacus.models.catalog import Sku
 from abacus.models.tenancy import Store, Zone
 from abacus.schemas.architecture import (
     CanonicalObservationBatchCreate,
+    InventoryProjectionPage,
     InventoryProjectionRead,
     ItemStateRead,
     ObservationBatchAccepted,
@@ -188,7 +189,7 @@ def list_rfid_quarantine_endpoint(
 
 @canonical_router.get(
     "/stores/{store_id}/inventory",
-    response_model=list[InventoryProjectionRead],
+    response_model=InventoryProjectionPage,
     operation_id="getStoreInventory",
 )
 def get_store_inventory_endpoint(
@@ -198,7 +199,9 @@ def get_store_inventory_endpoint(
     principal: CanReadInventory,
     sku_id: uuid.UUID | None = None,
     zone_id: uuid.UUID | None = None,
-) -> list[InventoryProjectionRead]:
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> InventoryProjectionPage:
     store_exists = db.scalar(
         select(Store.id).where(
             Store.id == store_id,
@@ -217,6 +220,14 @@ def get_store_inventory_endpoint(
         predicates.append(InventoryProjection.sku_id == sku_id)
     if zone_id is not None:
         predicates.append(InventoryProjection.zone_id == zone_id)
+    total = (
+        db.scalar(
+            select(func.count())
+            .select_from(InventoryProjection)
+            .where(*predicates)
+        )
+        or 0
+    )
     evaluated_at = datetime.now(UTC)
     current_metadata = current_inventory_bucket_metadata(
         tenant_id=principal.tenant_id,
@@ -244,36 +255,43 @@ def get_store_inventory_endpoint(
             & (current_metadata.c.zone_id == InventoryProjection.zone_id),
         )
         .where(*predicates)
-        .order_by(Sku.code, Zone.code)
+        .order_by(Sku.code, Zone.code, InventoryProjection.sku_id, InventoryProjection.zone_id)
+        .limit(limit)
+        .offset(offset)
     ).all()
     connectivity = db.get(StoreConnectivity, (principal.tenant_id, store_id))
     freshness = effective_freshness(connectivity, settings, now=evaluated_at)
-    return [
-        InventoryProjectionRead(
-            sku_id=projection.sku_id,
-            sku=sku.code,
-            zone_id=projection.zone_id,
-            zone=zone.code,
-            quantity=projection.quantity,
-            as_of=current_as_of or projection.as_of,
-            oldest_item_observed_at=current_oldest_observed_at or projection.as_of,
-            confidence=effective_bucket_confidence(
-                projected_quantity=projection.quantity,
-                current_item_count=current_item_count,
-                current_confidence=current_confidence,
-            ),
-            freshness_status=freshness,
-        )
-        for (
-            projection,
-            sku,
-            zone,
-            current_item_count,
-            current_as_of,
-            current_oldest_observed_at,
-            current_confidence,
-        ) in rows
-    ]
+    return InventoryProjectionPage(
+        items=[
+            InventoryProjectionRead(
+                sku_id=projection.sku_id,
+                sku=sku.code,
+                zone_id=projection.zone_id,
+                zone=zone.code,
+                quantity=projection.quantity,
+                as_of=current_as_of or projection.as_of,
+                oldest_item_observed_at=current_oldest_observed_at or projection.as_of,
+                confidence=effective_bucket_confidence(
+                    projected_quantity=projection.quantity,
+                    current_item_count=current_item_count,
+                    current_confidence=current_confidence,
+                ),
+                freshness_status=freshness,
+            )
+            for (
+                projection,
+                sku,
+                zone,
+                current_item_count,
+                current_as_of,
+                current_oldest_observed_at,
+                current_confidence,
+            ) in rows
+        ],
+        total=int(total),
+        limit=limit,
+        offset=offset,
+    )
 
 
 @canonical_router.get(

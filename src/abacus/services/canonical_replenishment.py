@@ -1020,7 +1020,8 @@ def list_store_tasks(
     *,
     status: CanonicalTaskStatus | None,
     limit: int,
-) -> list[CanonicalReplenishmentTask]:
+    offset: int,
+) -> tuple[list[CanonicalReplenishmentTask], int]:
     store_exists = db.scalar(
         select(Store.id).where(
             Store.tenant_id == principal.tenant_id,
@@ -1030,20 +1031,33 @@ def list_store_tasks(
     if store_exists is None:
         raise ApiError(404, "Store not found", "The requested store does not exist.")
     _ensure_store_scope(principal, Permission.REPLENISHMENT_READ, store_id)
-    query = select(CanonicalReplenishmentTask).where(
+    predicates = [
         CanonicalReplenishmentTask.tenant_id == principal.tenant_id,
         CanonicalReplenishmentTask.store_id == store_id,
-    )
+    ]
     if status is not None:
-        query = query.where(CanonicalReplenishmentTask.status == status)
-    return list(
+        predicates.append(CanonicalReplenishmentTask.status == status)
+    total = (
+        db.scalar(
+            select(func.count())
+            .select_from(CanonicalReplenishmentTask)
+            .where(*predicates)
+        )
+        or 0
+    )
+    tasks = list(
         db.scalars(
-            query.order_by(
+            select(CanonicalReplenishmentTask)
+            .where(*predicates)
+            .order_by(
                 CanonicalReplenishmentTask.created_at.desc(),
                 CanonicalReplenishmentTask.id.desc(),
-            ).limit(limit)
+            )
+            .limit(limit)
+            .offset(offset)
         ).all()
     )
+    return tasks, int(total)
 
 
 def patch_replenishment_task(

@@ -151,6 +151,13 @@ class ReplenishmentTaskRead(ApiModel):
     updated_at: datetime
 
 
+class ReplenishmentTaskPage(ApiModel):
+    items: list[ReplenishmentTaskRead]
+    total: int
+    limit: int
+    offset: int
+
+
 class ReplenishmentEvaluationRead(ApiModel):
     store_id: uuid.UUID
     created_count: int

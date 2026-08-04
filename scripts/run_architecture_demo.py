@@ -123,6 +123,11 @@ def list_result(value: Any, label: str) -> list[dict[str, Any]]:
     return value
 
 
+def page_items(value: Any, label: str) -> list[dict[str, Any]]:
+    page = object_result(value, label)
+    return list_result(required(page, "items"), f"{label} items")
+
+
 def required(value: dict[str, Any], field: str) -> Any:
     result = value.get(field)
     if result is None:
@@ -441,14 +446,15 @@ def run(args: argparse.Namespace) -> None:
     inventory = poll(
         "inventory projection",
         lambda: {
-            "rows": client.request(
+            "page": client.request(
                 "GET", f"/v1/stores/{store1_id}/inventory", headers=bearer(admin_token)
             )[1]
         },
-        lambda item: sum(row["quantity"] for row in item["rows"]) == 4,
+        lambda item: sum(row["quantity"] for row in page_items(item["page"], "inventory"))
+        == 4,
         timeout=args.poll_timeout,
     )
-    rows = list_result(inventory["rows"], "inventory")
+    rows = page_items(inventory["page"], "inventory")
     quantities = {str(row["zone"]): int(row["quantity"]) for row in rows}
     if quantities != {"backroom": 3, "floor": 1}:
         raise DemoFailure(f"unexpected inventory: {quantities}")
@@ -533,7 +539,7 @@ def run(args: argparse.Namespace) -> None:
         f"/v1/stores/{store1_id}/replenishment-tasks",
         headers=bearer(associate_token),
     )
-    task_list = list_result(task_list_value, "replenishment task list")
+    task_list = page_items(task_list_value, "replenishment task list")
     if not any(str(item["id"]) == str(task["id"]) for item in task_list):
         raise DemoFailure("created replenishment task was not discoverable")
     for next_status in ("CLAIMED", "IN_PROGRESS", "COMPLETED"):

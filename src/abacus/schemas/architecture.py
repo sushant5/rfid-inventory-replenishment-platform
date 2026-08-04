@@ -93,7 +93,12 @@ class InventoryProjectionRead(ApiModel):
     zone_id: uuid.UUID
     zone: str
     quantity: int
-    as_of: datetime
+    as_of: datetime = Field(
+        description=(
+            "Newest item observation contributing to this inventory bucket; use "
+            "oldest_item_observed_at for the conservative age boundary."
+        )
+    )
     oldest_item_observed_at: datetime = Field(
         description="Oldest observation contributing to this inventory bucket."
     )
@@ -101,6 +106,13 @@ class InventoryProjectionRead(ApiModel):
         description="Effective item-location confidence after read-time recency decay."
     )
     freshness_status: FreshnessStatus
+
+
+class InventoryProjectionPage(ApiModel):
+    items: list[InventoryProjectionRead]
+    total: int
+    limit: int
+    offset: int
 
 
 class ItemStateRead(ApiModel):

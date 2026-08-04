@@ -15,6 +15,7 @@ from abacus.schemas.canonical_replenishment import (
     PolicyVersionRead,
     ReplenishmentEvaluationCreate,
     ReplenishmentEvaluationRead,
+    ReplenishmentTaskPage,
     ReplenishmentTaskPatch,
     ReplenishmentTaskRead,
 )
@@ -196,7 +197,7 @@ def evaluate_replenishment_endpoint(
 
 @router.get(
     "/stores/{store_id}/replenishment-tasks",
-    response_model=list[ReplenishmentTaskRead],
+    response_model=ReplenishmentTaskPage,
     operation_id="listReplenishmentTasks",
 )
 def list_store_tasks_endpoint(
@@ -205,17 +206,22 @@ def list_store_tasks_endpoint(
     principal: CanReadReplenishment,
     task_status: Annotated[CanonicalTaskStatus | None, Query(alias="status")] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
-) -> list[ReplenishmentTaskRead]:
-    return [
-        ReplenishmentTaskRead.model_validate(task)
-        for task in list_store_tasks(
-            db,
-            principal,
-            store_id,
-            status=task_status,
-            limit=limit,
-        )
-    ]
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> ReplenishmentTaskPage:
+    tasks, total = list_store_tasks(
+        db,
+        principal,
+        store_id,
+        status=task_status,
+        limit=limit,
+        offset=offset,
+    )
+    return ReplenishmentTaskPage(
+        items=[ReplenishmentTaskRead.model_validate(task) for task in tasks],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.patch(
