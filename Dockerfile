@@ -25,6 +25,7 @@ FROM base AS test
 
 USER root
 COPY tests ./tests
+COPY .env.example docker-compose.yml render.yaml ./
 RUN pip install --no-cache-dir ".[dev]"
 ENV COVERAGE_FILE=/tmp/.coverage
 USER abacus
