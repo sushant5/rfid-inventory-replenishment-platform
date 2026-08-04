@@ -147,10 +147,13 @@ def test_root_discovers_the_reviewer_endpoints() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "service": "Abacus RFID Platform",
-        "version": "0.5.1",
+        "version": "0.6.0",
         "docs": "/docs",
         "openapi": "/openapi.json",
         "login": "/v1/auth/login",
+        "stores": "/v1/stores",
+        "reviewer_path": "login -> me -> stores -> catalog/inventory/policies/tasks",
+        "credentials": "Reviewer login is supplied separately; privileged keys remain private.",
         "liveness": "/health/live",
         "readiness": "/health/ready",
     }

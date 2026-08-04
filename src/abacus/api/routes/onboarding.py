@@ -248,6 +248,14 @@ def list_store_zones_endpoint(
     db: DatabaseSession,
     principal: CanConfigureTenant,
 ) -> list[ZoneRead]:
+    store_exists = db.scalar(
+        select(Store.id).where(
+            Store.id == store_id,
+            Store.tenant_id == principal.tenant_id,
+        )
+    )
+    if store_exists is None:
+        raise ApiError(404, "Store not found", "The requested store does not exist.")
     zones = db.scalars(
         select(Zone)
         .where(

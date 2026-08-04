@@ -29,6 +29,24 @@ OPENAPI_TAGS = [
     {"name": "Operations", "description": "Service health and release metadata."},
 ]
 
+OPENAPI_DESCRIPTION = """
+Multi-tenant RFID inventory and replenishment API.
+
+### Reviewer path
+
+1. Use the separately supplied Orange demo credentials with `POST /v1/auth/login`.
+2. Paste the returned access token into the `HTTPBearer` authorization scheme.
+3. Call `GET /v1/me`, then `GET /v1/stores` to discover the stores in that user's scope.
+4. Inspect catalog, inventory, policies, and replenishment tasks for one returned store.
+
+RFID ingestion uses a separate `DeviceToken`; tenant provisioning and bulk imports use
+a `PlatformApiKey`. These privileged write credentials remain private and are not
+published in the repository or service-discovery response.
+
+PostgreSQL RLS is the tenant-isolation boundary. Store-level permissions are resolved
+from PostgreSQL on every request and enforced explicitly by the application.
+"""
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -45,7 +63,7 @@ def create_app() -> FastAPI:
     application = FastAPI(
         title=settings.app_name,
         version=__version__,
-        description="Multi-tenant RFID inventory and replenishment API.",
+        description=OPENAPI_DESCRIPTION,
         openapi_tags=OPENAPI_TAGS,
         lifespan=lifespan,
     )
@@ -97,6 +115,9 @@ def create_app() -> FastAPI:
             "docs": "/docs",
             "openapi": "/openapi.json",
             "login": "/v1/auth/login",
+            "stores": "/v1/stores",
+            "reviewer_path": "login -> me -> stores -> catalog/inventory/policies/tasks",
+            "credentials": "Reviewer login is supplied separately; privileged keys remain private.",
             "liveness": "/health/live",
             "readiness": "/health/ready",
         }

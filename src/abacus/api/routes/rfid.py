@@ -220,14 +220,7 @@ def get_store_inventory_endpoint(
         predicates.append(InventoryProjection.sku_id == sku_id)
     if zone_id is not None:
         predicates.append(InventoryProjection.zone_id == zone_id)
-    total = (
-        db.scalar(
-            select(func.count())
-            .select_from(InventoryProjection)
-            .where(*predicates)
-        )
-        or 0
-    )
+    total = db.scalar(select(func.count()).select_from(InventoryProjection).where(*predicates)) or 0
     evaluated_at = datetime.now(UTC)
     current_metadata = current_inventory_bucket_metadata(
         tenant_id=principal.tenant_id,

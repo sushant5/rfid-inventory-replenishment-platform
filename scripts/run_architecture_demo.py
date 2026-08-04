@@ -450,8 +450,7 @@ def run(args: argparse.Namespace) -> None:
                 "GET", f"/v1/stores/{store1_id}/inventory", headers=bearer(admin_token)
             )[1]
         },
-        lambda item: sum(row["quantity"] for row in page_items(item["page"], "inventory"))
-        == 4,
+        lambda item: sum(row["quantity"] for row in page_items(item["page"], "inventory")) == 4,
         timeout=args.poll_timeout,
     )
     rows = page_items(inventory["page"], "inventory")

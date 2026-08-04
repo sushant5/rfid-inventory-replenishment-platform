@@ -70,9 +70,7 @@ def test_collection_openapi_contracts_use_bounded_offset_pages() -> None:
             "default": 0,
             "title": "Offset",
         }
-        response_schema = operation["responses"]["200"]["content"]["application/json"][
-            "schema"
-        ]
+        response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
         assert response_schema["$ref"] == f"#/components/schemas/{page_schema}"
         assert set(schema["components"]["schemas"][page_schema]["properties"]) == {
             "items",

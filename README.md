@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.5.1` on Render with PostgreSQL 16. Render may need
+The hosted demo runs release `0.6.0` on Render with PostgreSQL 16. Render may need
 about a minute to wake the free web service after inactivity. Reviewer credentials
 are provided separately and are intentionally not stored in this public repository.
 
@@ -36,6 +36,9 @@ returned access token into `HTTPBearer` under **Authorize**. The separately supp
 platform key goes into `PlatformApiKey`; it is required for tenant, store-import, and
 catalog-import operations. Keeping these credentials outside GitHub prevents arbitrary
 visitors from mutating or exhausting the shared reviewer database.
+
+After login, call `GET /v1/me` and `GET /v1/stores` to discover the authenticated
+user's role and visible store IDs before opening inventory, policies, and tasks.
 
 ## Reviewer quick start
 
@@ -105,6 +108,13 @@ streaming and S3 source-file retention are production extensions, not demo depen
   schema migrations use a separate owner connection without those request limits.
 - Every tenant transaction sets `app.tenant_id`; forced RLS fails closed when the
   context is absent. Tenant IDs in request bodies are never trusted.
+- RLS deliberately enforces the tenant boundary. Store authorization is a separate,
+  explicit application boundary: current role and store assignments are loaded from
+  PostgreSQL on every request, and collection/resource handlers apply the centralized
+  `Principal` scope checks. Tests cover both store denial and corporate tenant-wide
+  access. A production deployment that requires database-enforced store scoping could
+  add a store-scope session setting, trading a stronger database backstop for more
+  complex policies and operational context management.
 - Accepted RFID events, retry-batch links, and their durable inbox records commit
   together. A worker outage therefore leaves recoverable work, not a false `202`.
 - Raw-event and catalog jobs have bounded retries. Exhausted work reaches a terminal
@@ -129,11 +139,11 @@ streaming and S3 source-file retention are production extensions, not demo depen
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.5.1`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.6.0`).
 
 The visible contract includes all required endpoints:
 
-- Onboarding: tenants, store imports, zones, devices
+- Onboarding: tenants, store imports, scoped store discovery, zones, devices
 - Catalog: create import, status, row errors, SKU discovery
 - RFID: submit batch, batch status, tenant-wide quarantine inspection
 - Inventory: store projection, physical item state
@@ -154,6 +164,9 @@ Compose does not trust arbitrary proxy headers.
 
 Device discovery returns each reader with its currently effective store/zone
 assignment. Plaintext device tokens are returned only at registration or rotation.
+Store discovery, SKU discovery, inventory, and replenishment-task collections use
+bounded `{items, total, limit, offset}` pages. SKU discovery accepts `active=ACTIVE`,
+`INACTIVE`, or `ALL`; the previous `true` and `false` values remain supported aliases.
 
 ## Catalog and RFID behavior
 

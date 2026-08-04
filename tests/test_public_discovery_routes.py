@@ -2,10 +2,15 @@ import uuid
 from datetime import UTC, datetime
 from unittest.mock import Mock
 
+import pytest
 from sqlalchemy.orm import Session
 
+from abacus.api.errors import ApiError
 from abacus.api.routes import catalog as catalog_routes
-from abacus.api.routes.onboarding import list_store_devices_endpoint
+from abacus.api.routes.onboarding import (
+    list_store_devices_endpoint,
+    list_store_zones_endpoint,
+)
 from abacus.enums import DeviceStatus
 from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.catalog import ProductStyle, Sku
@@ -147,3 +152,16 @@ def test_store_device_discovery_returns_current_assignment_mapping() -> None:
     assert result[0].assignment.device_id == device_id
     assert result[0].assignment.store_id == store_id
     assert result[0].assignment.zone_id == zone_id
+
+
+def test_store_zone_discovery_rejects_unknown_store() -> None:
+    tenant_id = uuid.uuid4()
+    principal = _principal(tenant_id, CanonicalIdentityRole.TENANT_ADMIN)
+    db = Mock(spec=Session)
+    db.scalar.return_value = None
+
+    with pytest.raises(ApiError) as caught:
+        list_store_zones_endpoint(uuid.uuid4(), db, principal)
+
+    assert caught.value.status_code == 404
+    assert caught.value.title == "Store not found"

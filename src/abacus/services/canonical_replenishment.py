@@ -1038,11 +1038,7 @@ def list_store_tasks(
     if status is not None:
         predicates.append(CanonicalReplenishmentTask.status == status)
     total = (
-        db.scalar(
-            select(func.count())
-            .select_from(CanonicalReplenishmentTask)
-            .where(*predicates)
-        )
+        db.scalar(select(func.count()).select_from(CanonicalReplenishmentTask).where(*predicates))
         or 0
     )
     tasks = list(
