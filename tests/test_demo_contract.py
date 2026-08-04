@@ -62,7 +62,7 @@ def test_openapi_contains_the_submission_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.7.0"
+    assert __version__ == "0.8.0"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",
@@ -92,6 +92,14 @@ def test_openapi_contains_the_submission_contract() -> None:
         ): "replayRfidQuarantine",
         ("get", "/v1/stores/{store_id}/inventory"): "getStoreInventory",
         ("get", "/v1/items/{epc}"): "getCurrentItemState",
+        (
+            "post",
+            "/v1/stores/{store_id}/business-events",
+        ): "createBusinessEvent",
+        (
+            "get",
+            "/v1/stores/{store_id}/business-events/{event_id}",
+        ): "getBusinessEvent",
         ("post", "/v1/users"): "createUser",
         ("put", "/v1/users/{user_id}/roles"): "replaceUserRoles",
         ("put", "/v1/users/{user_id}/access"): "replaceUserAccess",
@@ -175,6 +183,8 @@ def test_openapi_contains_the_submission_contract() -> None:
         ("/v1/stores/{store_id}/devices", "get"),
         ("/v1/stores/{store_id}/inventory", "get"),
         ("/v1/items/{epc}", "get"),
+        ("/v1/stores/{store_id}/business-events", "post"),
+        ("/v1/stores/{store_id}/business-events/{event_id}", "get"),
         ("/v1/replenishment-policies", "post"),
         ("/v1/replenishment/evaluations", "post"),
         ("/v1/stores/{store_id}/replenishment-tasks", "get"),
@@ -190,6 +200,10 @@ def test_openapi_contains_the_submission_contract() -> None:
         "confidence",
         "freshness_status",
     }.issubset(inventory_fields)
+    item_fields = schema["components"]["schemas"]["ItemStateRead"]["properties"]
+    assert "presence_status" in item_fields
+    assert "authoritative_removal_event_id" in item_fields
+    assert "authoritative_removed_at" in item_fields
     device_mapping_fields = schema["components"]["schemas"]["StoreDeviceMappingRead"]["properties"]
     assert set(device_mapping_fields) == {"device", "assignment"}
     assignment_fields = schema["components"]["schemas"]["DeviceAssignmentRead"]["properties"]

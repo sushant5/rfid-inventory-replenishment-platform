@@ -39,6 +39,7 @@ class Permission(StrEnum):
     IDENTITY_AUDIT_READ = "identity-audit:read"
     CATALOG_INGEST = "catalog:ingest"
     CATALOG_READ = "catalog:read"
+    INVENTORY_ADJUST = "inventory:adjust"
     INVENTORY_READ = "inventory:read"
     POLICY_READ = "policy:read"
     POLICY_MANAGE = "policy:manage"
@@ -57,6 +58,7 @@ ROLE_PERMISSIONS: dict[AuthorizationRole, frozenset[Permission]] = {
             Permission.USERS_READ,
             Permission.USERS_SUSPEND,
             Permission.CATALOG_READ,
+            Permission.INVENTORY_ADJUST,
             Permission.INVENTORY_READ,
             Permission.POLICY_READ,
             Permission.REPLENISHMENT_READ,
@@ -88,6 +90,7 @@ ROLE_PERMISSIONS: dict[AuthorizationRole, frozenset[Permission]] = {
             Permission.USERS_READ,
             Permission.USERS_SUSPEND,
             Permission.CATALOG_READ,
+            Permission.INVENTORY_ADJUST,
             Permission.INVENTORY_READ,
             Permission.POLICY_READ,
             Permission.REPLENISHMENT_READ,

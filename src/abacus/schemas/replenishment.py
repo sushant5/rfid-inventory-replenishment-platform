@@ -163,9 +163,17 @@ class ReplenishmentTaskPage(ApiModel):
 class ReplenishmentEvaluationRead(ApiModel):
     store_id: uuid.UUID
     created_count: int
+    updated_count: int
     suppressed_connectivity: bool
     suppressed_low_confidence: int
+    deferred_count: int = Field(
+        description="SKU shortages deferred because a task is already claimed or in progress."
+    )
+    deferred_quantity: int = Field(
+        description="Total uncovered units deferred behind claimed or in-progress tasks."
+    )
     tasks: list[ReplenishmentTaskRead]
+    updated_tasks: list[ReplenishmentTaskRead]
 
 
 class ReplenishmentTaskPatch(ApiModel):

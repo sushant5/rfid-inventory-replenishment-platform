@@ -36,6 +36,9 @@ OPERATION_PROBLEM_RESPONSES: dict[str, dict[str, str]] = {
     "submitRfidObservationBatch": {
         "409": "An event identifier conflicts with a previously accepted observation",
     },
+    "createBusinessEvent": {
+        "409": "The idempotency key, item location, or item event order conflicts",
+    },
     "replayRfidQuarantine": {
         "409": "The quarantined event is incomplete, already in flight, or cannot be replayed",
     },

@@ -532,6 +532,21 @@ def run(args: argparse.Namespace) -> None:
     if denied_status != 403:
         raise DemoFailure("store-scoped authorization was not enforced")
 
+    denied_business_event = {
+        "source_system": "ORANGE_POS",
+        "external_event_id": f"denied-sale-{run_id}",
+        "event_type": "SALE",
+        "epc": EPCS[0],
+        "occurred_at": (base_time + timedelta(seconds=20)).isoformat(),
+    }
+    client.request(
+        "POST",
+        f"/v1/stores/{store1_id}/business-events",
+        expected=403,
+        headers=bearer(associate_token),
+        payload=denied_business_event,
+    )
+
     task = tasks[0]
     _, task_list_value = client.request(
         "GET",
@@ -550,12 +565,100 @@ def run(args: argparse.Namespace) -> None:
         )
         task = object_result(task_value, "task transition")
 
+    authoritative_event = {
+        "source_system": "ORANGE_POS",
+        "external_event_id": f"sale-{run_id}",
+        "event_type": "SALE",
+        "epc": EPCS[0],
+        "occurred_at": (base_time + timedelta(seconds=30)).isoformat(),
+        "note": "Hosted demo authoritative sale",
+    }
+    _, business_event_value = client.request(
+        "POST",
+        f"/v1/stores/{store1_id}/business-events",
+        expected=201,
+        headers=bearer(admin_token),
+        payload=authoritative_event,
+    )
+    business_event = object_result(business_event_value, "business event")
+    poll(
+        "business event projection",
+        lambda: client.request(
+            "GET",
+            f"/v1/stores/{store1_id}/business-events/{business_event['id']}",
+            headers=bearer(admin_token),
+        )[1],
+        lambda item: item["processing_status"] == "PROJECTED",
+        timeout=args.poll_timeout,
+    )
+    _, replay_value = client.request(
+        "POST",
+        f"/v1/stores/{store1_id}/business-events",
+        expected=200,
+        headers=bearer(admin_token),
+        payload=authoritative_event,
+    )
+    replay = object_result(replay_value, "business event replay")
+    if replay["id"] != business_event["id"] or replay["idempotent_replay"] is not True:
+        raise DemoFailure("authoritative business-event retry was not idempotent")
+    conflicting_event = {**authoritative_event, "note": "Conflicting reuse"}
+    client.request(
+        "POST",
+        f"/v1/stores/{store1_id}/business-events",
+        expected=409,
+        headers=bearer(admin_token),
+        payload=conflicting_event,
+    )
+    removed_item = poll(
+        "authoritative inventory removal",
+        lambda: {
+            "item": client.request("GET", f"/v1/items/{EPCS[0]}", headers=bearer(admin_token))[1],
+            "inventory": client.request(
+                "GET", f"/v1/stores/{store1_id}/inventory", headers=bearer(admin_token)
+            )[1],
+        },
+        lambda item: (
+            item["item"]["presence_status"] == "REMOVED"
+            and sum(row["quantity"] for row in page_items(item["inventory"], "inventory")) == 3
+        ),
+        timeout=args.poll_timeout,
+    )
+    if removed_item["item"]["state_version"] != before_item["state_version"] + 1:
+        raise DemoFailure("authoritative removal did not advance item state exactly once")
+    if removed_item["item"]["authoritative_removal_event_id"] != business_event["id"]:
+        raise DemoFailure("authoritative removal did not retain business-event provenance")
+    post_sale_batch = submit_batch(
+        client,
+        device_id=str(required(floor_device, "id")),
+        device_token=str(required(devices["floor"], "device_token")),
+        observations=[
+            observation(
+                str(uuid.uuid4()),
+                EPCS[0],
+                base_time + timedelta(seconds=31 + index),
+                -35,
+            )
+            for index in range(3)
+        ],
+    )
+    wait_for_batch(client, admin_token, post_sale_batch, args.poll_timeout)
+    after_post_sale_reads = object_result(
+        client.request("GET", f"/v1/items/{EPCS[0]}", headers=bearer(admin_token))[1],
+        "post-sale item state",
+    )
+    if (
+        after_post_sale_reads["presence_status"] != "REMOVED"
+        or after_post_sale_reads["state_version"] != removed_item["item"]["state_version"]
+    ):
+        raise DemoFailure("RFID reads incorrectly reversed an authoritative removal")
+
     print("PASS tenant/store/zones/devices")
     print("PASS staged catalog import and atomic promotion")
     print("PASS RFID stable-zone inventory: floor=1 backroom=3")
     print("PASS duplicate and late-event replay protection")
     print("PASS replenishment policy, quantity=2 task, and completed lifecycle")
     print("PASS store-scoped authorization denied Store 2")
+    print("PASS idempotent authoritative sale removed one physical item")
     print("DEMO COMPLETE")
 
 

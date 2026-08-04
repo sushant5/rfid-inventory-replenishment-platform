@@ -7,17 +7,13 @@ from pydantic import ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from abacus.api.errors import ApiError
-from abacus.config import get_settings
 from abacus.db import SessionLocal, tenant_session_scope
 from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.identity import IdentityRole
 from abacus.schemas.identity import CanonicalUserCreate, RoleAssignmentCreate, UserCreate
 from abacus.schemas.tenancy import TenantCreate
 from abacus.services.identity import bootstrap_corporate_admin, bootstrap_public_reviewer
-from abacus.services.streaming_inventory import (
-    confirm_timed_out_removals,
-    rebuild_inventory_projection,
-)
+from abacus.services.streaming_inventory import rebuild_inventory_projection
 
 
 class BootstrapSettings(BaseSettings):
@@ -70,11 +66,6 @@ def _parser() -> argparse.ArgumentParser:
         help="rebuild derived inventory counts from current physical-item state",
     )
     projection.add_argument("--tenant-id", required=True, type=uuid.UUID)
-    removal = commands.add_parser(
-        "confirm-timed-out-removals",
-        help="confirm removals whose stores are live and whose item sightings timed out",
-    )
-    removal.add_argument("--tenant-id", required=True, type=uuid.UUID)
     return parser
 
 
@@ -197,16 +188,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             count = rebuild_inventory_projection(db, arguments.tenant_id)
             db.commit()
         print(f"Inventory projection rebuilt: buckets={count}")
-        return 0
-    if arguments.command == "confirm-timed-out-removals":
-        with tenant_session_scope(arguments.tenant_id) as db:
-            count = confirm_timed_out_removals(
-                db,
-                tenant_id=arguments.tenant_id,
-                settings=get_settings(),
-            )
-            db.commit()
-        print(f"Timed-out removals confirmed: items={count}")
         return 0
     raise AssertionError(f"Unhandled command: {arguments.command}")
 

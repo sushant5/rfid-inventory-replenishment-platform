@@ -31,6 +31,7 @@ class Product(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "products"
     __table_args__ = (
         UniqueConstraint("tenant_id", "style_code", name="uq_products_tenant_style"),
+        UniqueConstraint("tenant_id", "id", name="uq_products_tenant_id"),
         Index("ix_products_tenant_category", "tenant_id", "category"),
     )
 
@@ -50,6 +51,13 @@ class ProductVariant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UniqueConstraint(
             "tenant_id", "product_id", "color", name="uq_product_variants_product_color"
         ),
+        UniqueConstraint("tenant_id", "id", name="uq_product_variants_tenant_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "product_id"],
+            ["products.tenant_id", "products.id"],
+            name="fk_product_variants_tenant_product",
+            ondelete="CASCADE",
+        ),
         Index("ix_product_variants_tenant_product", "tenant_id", "product_id"),
     )
 
@@ -68,6 +76,18 @@ class RfidTag(TimestampMixin, Base):
     __tablename__ = "rfid_tags"
     __table_args__ = (
         PrimaryKeyConstraint("tenant_id", "epc", name="pk_rfid_tags"),
+        ForeignKeyConstraint(
+            ["tenant_id", "sku_id"],
+            ["skus.tenant_id", "skus.id"],
+            name="fk_rfid_tags_tenant_sku",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "source_import_id"],
+            ["catalog_imports.tenant_id", "catalog_imports.id"],
+            name="fk_rfid_tags_tenant_source_import",
+            ondelete="RESTRICT",
+        ),
         Index("ix_rfid_tags_tenant_sku", "tenant_id", "sku_id"),
     )
 
@@ -98,6 +118,12 @@ class UserRole(Base):
     __tablename__ = "user_roles"
     __table_args__ = (
         PrimaryKeyConstraint("tenant_id", "user_id", "role", name="pk_user_roles"),
+        ForeignKeyConstraint(
+            ["tenant_id", "user_id"],
+            ["users.tenant_id", "users.id"],
+            name="fk_user_roles_tenant_user",
+            ondelete="CASCADE",
+        ),
         Index("ix_user_roles_tenant_role", "tenant_id", "role"),
     )
 
@@ -125,6 +151,18 @@ class UserStoreAssignment(Base):
     __tablename__ = "user_store_assignments"
     __table_args__ = (
         PrimaryKeyConstraint("tenant_id", "user_id", "store_id", name="pk_user_store_assignments"),
+        ForeignKeyConstraint(
+            ["tenant_id", "user_id"],
+            ["users.tenant_id", "users.id"],
+            name="fk_user_store_assignments_tenant_user",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_user_store_assignments_tenant_store",
+            ondelete="CASCADE",
+        ),
         Index("ix_user_store_assignments_store", "tenant_id", "store_id"),
     )
 
@@ -159,6 +197,25 @@ class RfidObservationBatch(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "processed_count + rejected_count <= accepted_count",
             name="ck_rfid_batches_counts_reconcile",
+        ),
+        UniqueConstraint("tenant_id", "id", name="uq_rfid_observation_batches_tenant_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "device_id"],
+            ["devices.tenant_id", "devices.id"],
+            name="fk_rfid_batches_tenant_device",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_rfid_batches_tenant_store",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id", "zone_id"],
+            ["zones.tenant_id", "zones.store_id", "zones.id"],
+            name="fk_rfid_batches_tenant_store_zone",
+            ondelete="RESTRICT",
         ),
         Index("ix_rfid_batches_tenant_received", "tenant_id", "received_at"),
     )
@@ -213,6 +270,24 @@ class RfidObservationEventLedger(Base):
     __tablename__ = "rfid_observation_events"
     __table_args__ = (
         PrimaryKeyConstraint("tenant_id", "event_id", name="pk_rfid_observation_events"),
+        ForeignKeyConstraint(
+            ["tenant_id", "device_id"],
+            ["devices.tenant_id", "devices.id"],
+            name="fk_rfid_events_tenant_device",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_rfid_events_tenant_store",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id", "zone_id"],
+            ["zones.tenant_id", "zones.store_id", "zones.id"],
+            name="fk_rfid_events_tenant_store_zone",
+            ondelete="RESTRICT",
+        ),
         Index(
             "ix_rfid_observation_events_pending",
             "tenant_id",
@@ -279,6 +354,12 @@ class RfidObservationBatchEvent(Base):
             ["rfid_observation_events.tenant_id", "rfid_observation_events.event_id"],
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ["tenant_id", "batch_id"],
+            ["rfid_observation_batches.tenant_id", "rfid_observation_batches.id"],
+            name="fk_rfid_batch_events_tenant_batch",
+            ondelete="CASCADE",
+        ),
         Index("ix_rfid_batch_events_event", "tenant_id", "event_id"),
     )
 
@@ -325,6 +406,12 @@ class RfidObservationOutbox(UUIDPrimaryKeyMixin, Base):
             "acceptance_sequence",
             postgresql_where=text("published_at IS NULL"),
         ),
+        Index(
+            "ix_rfid_observation_outbox_tenant_pending",
+            "tenant_id",
+            "acceptance_sequence",
+            postgresql_where=text("published_at IS NULL"),
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -350,7 +437,19 @@ class RfidQuarantine(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "rfid_quarantine"
     __table_args__ = (
         UniqueConstraint("tenant_id", "event_id", name="uq_rfid_quarantine_tenant_event"),
+        ForeignKeyConstraint(
+            ["tenant_id", "batch_id"],
+            ["rfid_observation_batches.tenant_id", "rfid_observation_batches.id"],
+            name="fk_rfid_quarantine_tenant_batch",
+            ondelete="CASCADE",
+        ),
         Index("ix_rfid_quarantine_tenant_batch", "tenant_id", "batch_id"),
+        Index(
+            "ix_rfid_quarantine_tenant_created",
+            "tenant_id",
+            text("quarantined_at DESC"),
+            text("id DESC"),
+        ),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -373,18 +472,48 @@ class CurrentItemState(Base):
         PrimaryKeyConstraint("tenant_id", "epc", name="pk_current_item_state"),
         CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_item_state_confidence"),
         CheckConstraint("state_version >= 1", name="ck_item_state_positive_version"),
+        CheckConstraint(
+            "(store_id IS NULL) = (zone_id IS NULL)",
+            name="ck_current_item_state_location_pair",
+        ),
+        CheckConstraint(
+            "authoritative_removal_event_id IS NULL OR (store_id IS NULL AND zone_id IS NULL)",
+            name="ck_current_item_state_authoritative_removal_location",
+        ),
+        CheckConstraint(
+            "(authoritative_removal_event_id IS NULL) = (authoritative_removed_at IS NULL)",
+            name="ck_current_item_state_authoritative_removal_pair",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "sku_id"],
+            ["skus.tenant_id", "skus.id"],
+            name="fk_current_item_state_tenant_sku",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_current_item_state_tenant_store",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id", "zone_id"],
+            ["zones.tenant_id", "zones.store_id", "zones.id"],
+            name="fk_current_item_state_tenant_store_zone",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "authoritative_removal_event_id"],
+            ["business_events.tenant_id", "business_events.id"],
+            name="fk_current_item_state_tenant_authoritative_removal_event",
+            ondelete="RESTRICT",
+        ),
         Index(
             "ix_current_item_state_reconcile",
             "tenant_id",
             "store_id",
             "sku_id",
             "zone_id",
-        ),
-        Index(
-            "ix_current_item_state_removal_sweep",
-            "tenant_id",
-            "last_observed_at",
-            postgresql_where=text("zone_id IS NOT NULL"),
         ),
     )
 
@@ -405,11 +534,22 @@ class CurrentItemState(Base):
     last_received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    authoritative_removal_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    authoritative_removed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class InventoryTransitionOutbox(Base):
     __tablename__ = "inventory_transition_outbox"
     __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "transition_id",
+            name="uq_inventory_transition_outbox_tenant_transition",
+        ),
         UniqueConstraint("tenant_id", "epc", "state_version", name="uq_outbox_item_state_version"),
         Index(
             "ix_inventory_outbox_unpublished",
@@ -453,10 +593,94 @@ class InventoryTransitionOutbox(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class BusinessEventType(StrEnum):
+    """Authoritative hosted-demo events that remove one physical item."""
+
+    SALE = "SALE"
+    TRANSFER_OUT = "TRANSFER_OUT"
+    ADJUSTMENT_REMOVE = "ADJUSTMENT_REMOVE"
+
+
+class BusinessEventStatus(StrEnum):
+    PENDING_PROJECTION = "PENDING_PROJECTION"
+    PROJECTED = "PROJECTED"
+    FAILED = "FAILED"
+
+
+class BusinessEvent(UUIDPrimaryKeyMixin, Base):
+    """Idempotent POS/WMS removal accepted by the hosted vertical slice."""
+
+    __tablename__ = "business_events"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id", name="uq_business_events_tenant_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "source_system",
+            "external_event_id",
+            name="uq_business_events_source_event",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_business_events_tenant_store",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "transition_id"],
+            ["inventory_transition_outbox.tenant_id", "inventory_transition_outbox.transition_id"],
+            name="fk_business_events_tenant_transition",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ix_business_events_store_created",
+            "tenant_id",
+            "store_id",
+            text("created_at DESC"),
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    store_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("stores.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_system: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[BusinessEventType] = mapped_column(
+        Enum(
+            BusinessEventType,
+            name="business_event_type",
+            native_enum=False,
+            create_constraint=True,
+        ),
+        nullable=False,
+    )
+    epc: Mapped[str] = mapped_column(String(128), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    transition_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("inventory_transition_outbox.transition_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class FreshnessStatus(StrEnum):
     LIVE = "LIVE"
     DEGRADED = "DEGRADED"
     STALE = "STALE"
+
+
+class ItemPresenceStatus(StrEnum):
+    OBSERVED = "OBSERVED"
+    UNOBSERVED = "UNOBSERVED"
+    LOCATION_UNKNOWN = "LOCATION_UNKNOWN"
+    REMOVED = "REMOVED"
 
 
 class InventoryProjection(Base):
@@ -468,6 +692,24 @@ class InventoryProjection(Base):
         CheckConstraint("quantity >= 0", name="ck_inventory_projection_nonnegative"),
         CheckConstraint(
             "confidence >= 0 AND confidence <= 1", name="ck_inventory_projection_confidence"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_inventory_projection_tenant_store",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "sku_id"],
+            ["skus.tenant_id", "skus.id"],
+            name="fk_inventory_projection_tenant_sku",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id", "zone_id"],
+            ["zones.tenant_id", "zones.store_id", "zones.id"],
+            name="fk_inventory_projection_tenant_store_zone",
+            ondelete="CASCADE",
         ),
         Index("ix_inventory_projection_store_sku", "tenant_id", "store_id", "sku_id"),
     )
@@ -504,6 +746,26 @@ class InventoryProjection(Base):
 
 class AppliedInventoryDelta(Base):
     __tablename__ = "applied_inventory_deltas"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_applied_inventory_deltas_tenant_store",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "sku_id"],
+            ["skus.tenant_id", "skus.id"],
+            name="fk_applied_inventory_deltas_tenant_sku",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id", "zone_id"],
+            ["zones.tenant_id", "zones.store_id", "zones.id"],
+            name="fk_applied_inventory_deltas_tenant_store_zone",
+            ondelete="CASCADE",
+        ),
+    )
 
     delta_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -526,7 +788,15 @@ class AppliedInventoryDelta(Base):
 
 class StoreConnectivity(Base):
     __tablename__ = "store_connectivity"
-    __table_args__ = (PrimaryKeyConstraint("tenant_id", "store_id", name="pk_store_connectivity"),)
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "store_id", name="pk_store_connectivity"),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_store_connectivity_tenant_store",
+            ondelete="CASCADE",
+        ),
+    )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
@@ -573,6 +843,7 @@ class PolicyDefinition(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "replenishment_policies"
     __table_args__ = (
         UniqueConstraint("tenant_id", "name", name="uq_versioned_policy_tenant_name"),
+        UniqueConstraint("tenant_id", "id", name="uq_replenishment_policies_tenant_id"),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -586,6 +857,18 @@ class PolicyVersion(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "replenishment_policy_versions"
     __table_args__ = (
         UniqueConstraint("policy_id", "version_number", name="uq_policy_versions_number"),
+        UniqueConstraint("tenant_id", "id", name="uq_replenishment_policy_versions_tenant_id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "policy_id"],
+            ["replenishment_policies.tenant_id", "replenishment_policies.id"],
+            name="fk_policy_versions_tenant_policy",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "activated_by_user_id"],
+            ["users.tenant_id", "users.id"],
+            name="fk_policy_versions_tenant_activated_by",
+        ),
         Index(
             "uq_policy_versions_one_active",
             "policy_id",
@@ -621,6 +904,30 @@ class PolicyRule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "replenishment_policy_rules"
     __table_args__ = (
         CheckConstraint("min_floor_qty >= 0", name="ck_policy_rules_min_nonnegative"),
+        UniqueConstraint(
+            "tenant_id",
+            "version_id",
+            "id",
+            name="uq_replenishment_policy_rules_tenant_version_id",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "version_id"],
+            ["replenishment_policy_versions.tenant_id", "replenishment_policy_versions.id"],
+            name="fk_policy_rules_tenant_version",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_policy_rules_tenant_store",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "sku_id"],
+            ["skus.tenant_id", "skus.id"],
+            name="fk_policy_rules_tenant_sku",
+            ondelete="CASCADE",
+        ),
         CheckConstraint(
             "target_floor_qty >= min_floor_qty", name="ck_policy_rules_target_at_least_min"
         ),
@@ -680,6 +987,39 @@ class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint("quantity > 0", name="ck_replenishment_tasks_positive_quantity"),
         CheckConstraint("version >= 1", name="ck_replenishment_tasks_positive_version"),
+        ForeignKeyConstraint(
+            ["tenant_id", "store_id"],
+            ["stores.tenant_id", "stores.id"],
+            name="fk_replenishment_tasks_tenant_store",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "sku_id"],
+            ["skus.tenant_id", "skus.id"],
+            name="fk_replenishment_tasks_tenant_sku",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "policy_version_id"],
+            ["replenishment_policy_versions.tenant_id", "replenishment_policy_versions.id"],
+            name="fk_replenishment_tasks_tenant_policy_version",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "policy_version_id", "policy_rule_id"],
+            [
+                "replenishment_policy_rules.tenant_id",
+                "replenishment_policy_rules.version_id",
+                "replenishment_policy_rules.id",
+            ],
+            name="fk_replenishment_tasks_tenant_version_rule",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "claimed_by_user_id"],
+            ["users.tenant_id", "users.id"],
+            name="fk_replenishment_tasks_tenant_claimed_by",
+        ),
         Index(
             "uq_replenishment_tasks_active_store_sku",
             "tenant_id",

@@ -94,7 +94,15 @@ services:
       DATABASE_URL: postgresql+psycopg://abacus_app:abacus_app_local_only@postgres:5432/abacus_test
       MIGRATION_DATABASE_URL: postgresql+psycopg://abacus_owner:abacus_owner_local_only@postgres:5432/abacus_test
       APP_ENV: test
-    command: ["pytest", "--cov=abacus", "--cov-report=term-missing"]
+      COVERAGE_FILE: /tmp/.coverage
+    command:
+      - python
+      - -m
+      - pytest
+      - -o
+      - cache_dir=/tmp/pytest-cache
+      - --cov=abacus
+      - --cov-report=term-missing
     depends_on:
       postgres:
         condition: service_healthy

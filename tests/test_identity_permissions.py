@@ -28,6 +28,7 @@ def test_corporate_user_can_read_every_store_but_cannot_manage_inventory() -> No
 
     assert principal.can_access_store(Permission.INVENTORY_READ, uuid.uuid4())
     assert principal.can_access_store(Permission.REPLENISHMENT_READ, uuid.uuid4())
+    assert not principal.has_permission(Permission.INVENTORY_ADJUST)
     assert not principal.has_permission(Permission.REPLENISHMENT_MANAGE)
     assert not principal.has_permission(Permission.USERS_CREATE)
 
@@ -41,6 +42,8 @@ def test_store_manager_access_is_limited_to_assigned_store() -> None:
     assert not principal.can_access_store(Permission.USERS_READ, another_store)
     assert not principal.has_tenant_permission(Permission.USERS_READ)
     assert not principal.has_permission(Permission.IDENTITY_AUDIT_READ)
+    assert principal.can_access_store(Permission.INVENTORY_ADJUST, assigned_store)
+    assert not principal.can_access_store(Permission.INVENTORY_ADJUST, another_store)
 
 
 def test_store_associate_cannot_administer_users_or_policies() -> None:
@@ -50,4 +53,5 @@ def test_store_associate_cannot_administer_users_or_policies() -> None:
     assert not principal.has_permission(Permission.USERS_READ)
     assert not principal.has_permission(Permission.USERS_SUSPEND)
     assert not principal.has_permission(Permission.POLICY_MANAGE)
+    assert not principal.has_permission(Permission.INVENTORY_ADJUST)
     assert principal.has_permission(Permission.REPLENISHMENT_EXECUTE)

@@ -102,6 +102,8 @@ def run_checks(
         "/version",
         "/v1/rfid/observation-batches",
         "/v1/stores",
+        "/v1/stores/{store_id}/business-events",
+        "/v1/stores/{store_id}/business-events/{event_id}",
         "/v1/stores/{store_id}/inventory",
     }
     missing = sorted(required_paths - paths.keys())

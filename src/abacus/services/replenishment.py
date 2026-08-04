@@ -83,8 +83,11 @@ class InventorySnapshot:
 class EvaluationResult:
     store_id: uuid.UUID
     tasks: tuple[ReplenishmentTask, ...]
+    updated_tasks: tuple[ReplenishmentTask, ...]
     suppressed_connectivity: bool
     suppressed_low_confidence: int
+    deferred_count: int
+    deferred_quantity: int
 
 
 def calculate_replenishment_quantity(
@@ -738,11 +741,19 @@ def activate_policy_version(
     version_id: uuid.UUID,
 ) -> PolicyBundle:
     db.scalar(select(Tenant.id).where(Tenant.id == principal.tenant_id).with_for_update())
-    bundle = _load_bundle(db, principal.tenant_id, version_id)
     version = db.scalar(
-        select(PolicyVersion).where(PolicyVersion.id == version_id).with_for_update()
+        select(PolicyVersion)
+        .where(
+            PolicyVersion.tenant_id == principal.tenant_id,
+            PolicyVersion.id == version_id,
+        )
+        .with_for_update()
     )
-    assert version is not None
+    if version is None:
+        raise ApiError(404, "Policy version not found", "The policy version does not exist.")
+    # Patch operations lock this parent row. Loading the rules only after acquiring
+    # the same lock guarantees activation validates the committed draft contents.
+    bundle = _load_bundle(db, principal.tenant_id, version_id)
     bundle = PolicyBundle(policy=bundle.policy, version=version, rules=bundle.rules)
     _ensure_manage_rule_scopes(principal, bundle.rules)
     if version.status == PolicyVersionStatus.ACTIVE:
@@ -832,7 +843,15 @@ def evaluate_replenishment(
     )
     evaluated_at = datetime.now(UTC)
     if effective_freshness(connectivity, settings, now=evaluated_at) != FreshnessStatus.LIVE:
-        return EvaluationResult(store.id, (), True, 0)
+        return EvaluationResult(
+            store_id=store.id,
+            tasks=(),
+            updated_tasks=(),
+            suppressed_connectivity=True,
+            suppressed_low_confidence=0,
+            deferred_count=0,
+            deferred_quantity=0,
+        )
 
     rules = tuple(
         db.scalars(
@@ -846,7 +865,15 @@ def evaluate_replenishment(
     )
     descriptors = tuple(map(_descriptor, rules))
     if not descriptors:
-        return EvaluationResult(store.id, (), False, 0)
+        return EvaluationResult(
+            store_id=store.id,
+            tasks=(),
+            updated_tasks=(),
+            suppressed_connectivity=False,
+            suppressed_low_confidence=0,
+            deferred_count=0,
+            deferred_quantity=0,
+        )
 
     current_metadata = current_inventory_bucket_metadata(
         tenant_id=principal.tenant_id,
@@ -946,16 +973,21 @@ def evaluate_replenishment(
     active_tasks = {
         task.sku_id: task
         for task in db.scalars(
-            select(ReplenishmentTask).where(
+            select(ReplenishmentTask)
+            .where(
                 ReplenishmentTask.tenant_id == principal.tenant_id,
                 ReplenishmentTask.store_id == store.id,
                 ReplenishmentTask.status.in_(active_statuses),
             )
+            .with_for_update()
         ).all()
     }
     rules_by_id = {rule.id: rule for rule in rules}
     created: list[ReplenishmentTask] = []
+    updated_tasks: list[ReplenishmentTask] = []
     suppressed_low_confidence = 0
+    deferred_count = 0
+    deferred_quantity = 0
     for snapshot in snapshots.values():
         if snapshot.confidence < minimum_confidence:
             suppressed_low_confidence += 1
@@ -983,9 +1015,27 @@ def evaluate_replenishment(
             min_floor_qty=selected.min_floor_qty,
             target_floor_qty=selected.target_floor_qty,
         )
-        if quantity <= 0 or active_task is not None:
+        if quantity <= 0:
             continue
         selected_model = rules_by_id[selected.id]
+        if active_task is not None:
+            if active_task.status == ReplenishmentTaskStatus.OPEN:
+                # Store-level evaluation locking serializes evaluators, while this
+                # row lock and version increment make a concurrent claim fail its
+                # optimistic compare-and-set instead of silently losing the update.
+                active_task.quantity += quantity
+                active_task.version += 1
+                active_task.policy_version_id = selected_model.version_id
+                active_task.policy_rule_id = selected_model.id
+                updated_tasks.append(active_task)
+            else:
+                # A picker may already be acting on a CLAIMED or IN_PROGRESS task.
+                # Do not change that contract behind them; report the uncovered
+                # shortage so the caller can reevaluate after it reaches a terminal
+                # state.
+                deferred_count += 1
+                deferred_quantity += quantity
+            continue
         task = ReplenishmentTask(
             tenant_id=principal.tenant_id,
             store_id=store.id,
@@ -1010,7 +1060,17 @@ def evaluate_replenishment(
         ) from exc
     for task in created:
         db.refresh(task)
-    return EvaluationResult(store.id, tuple(created), False, suppressed_low_confidence)
+    for task in updated_tasks:
+        db.refresh(task)
+    return EvaluationResult(
+        store_id=store.id,
+        tasks=tuple(created),
+        updated_tasks=tuple(updated_tasks),
+        suppressed_connectivity=False,
+        suppressed_low_confidence=suppressed_low_confidence,
+        deferred_count=deferred_count,
+        deferred_quantity=deferred_quantity,
+    )
 
 
 def list_store_tasks(
@@ -1078,20 +1138,23 @@ def patch_replenishment_task(
         ReplenishmentTaskStatus.EXPIRED: frozenset(),
     }
     if request.status in {ReplenishmentTaskStatus.CANCELED, ReplenishmentTaskStatus.EXPIRED}:
-        if (
-            task.status
-            not in {
-                ReplenishmentTaskStatus.OPEN,
-                ReplenishmentTaskStatus.CLAIMED,
-                ReplenishmentTaskStatus.IN_PROGRESS,
-            }
-            or not manager
-        ):
+        if not manager:
             raise ApiError(
                 403,
                 "Forbidden",
                 "Only a store manager may cancel or expire an active task.",
                 code="task_transition_forbidden",
+            )
+        if task.status not in {
+            ReplenishmentTaskStatus.OPEN,
+            ReplenishmentTaskStatus.CLAIMED,
+            ReplenishmentTaskStatus.IN_PROGRESS,
+        }:
+            raise ApiError(
+                409,
+                "Invalid task transition",
+                f"{task.status.value} cannot transition to {request.status.value}.",
+                code="invalid_task_transition",
             )
     elif request.status not in allowed[task.status]:
         raise ApiError(

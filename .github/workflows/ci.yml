@@ -61,6 +61,8 @@ jobs:
           scripts/smoke_test.py
           scripts/public_demo_smoke.py
           scripts/generate_store_batch.py
+      - name: Audit dependencies
+        run: pip-audit --skip-editable
       - name: Migrate clean database
         run: alembic upgrade head
       - name: Verify full migration rollback chain
@@ -78,3 +80,45 @@ jobs:
           -c "from abacus.main import app; assert app.openapi()['info']['version']"
       - name: Validate Compose model
         run: docker compose -f docker-compose.yml config --quiet
+
+  readme-workflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start the clean Compose stack
+        run: docker compose up --build -d --wait
+      - name: Run the documented migration command
+        run: make migrate
+      - name: Run the documented seed command
+        run: make seed
+      - name: Run the complete documented demo
+        run: make demo
+      - name: Smoke-test the running API
+        run: python3 scripts/smoke_test.py --base-url http://localhost:8000
+      - name: Prove service restart recovery
+        run: |
+          docker compose restart api catalog-worker event-worker
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://localhost:8000/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs --tail=200
+          exit 1
+      - name: Smoke-test after restart
+        run: python3 scripts/smoke_test.py --base-url http://localhost:8000
+      - name: Verify every long-running process recovered
+        run: |
+          docker compose ps --status running --services | sort > /tmp/actual-services
+          printf '%s\n' api catalog-worker event-worker postgres | sort > /tmp/expected-services
+          diff -u /tmp/expected-services /tmp/actual-services
+      - name: Run the documented test command
+        run: make test
+      - name: Show Compose logs on failure
+        if: failure()
+        run: docker compose logs --tail=300
+      - name: Tear down the clean stack
+        if: always()
+        run: docker compose down --volumes --remove-orphans

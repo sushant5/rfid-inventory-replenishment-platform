@@ -29,6 +29,10 @@ class Settings(BaseSettings):
         ge=1_000,
         le=600_000,
     )
+    database_pool_size: int = Field(default=3, ge=1, le=50)
+    database_pool_max_overflow: int = Field(default=2, ge=0, le=50)
+    database_pool_timeout_seconds: int = Field(default=10, ge=1, le=300)
+    database_pool_recycle_seconds: int = Field(default=300, ge=30, le=86_400)
     jwt_secret: str = Field(
         default="local-development-secret-change-before-deploy",
         min_length=32,
@@ -50,8 +54,7 @@ class Settings(BaseSettings):
     worker_max_attempts: int = Field(default=5, ge=1, le=100)
     rfid_move_confirmation_reads: int = Field(default=3, ge=1, le=10)
     rfid_move_confirmation_window_seconds: int = Field(default=10, ge=1, le=300)
-    rfid_removal_timeout_seconds: int = Field(default=1800, ge=60, le=604_800)
-    rfid_removal_sweep_interval_seconds: int = Field(default=60, ge=1, le=3600)
+    rfid_unobserved_after_seconds: int = Field(default=1800, ge=60, le=604_800)
     rfid_last_seen_flush_seconds: int = Field(default=30, ge=1, le=3600)
     rfid_confidence_half_life_seconds: int = Field(default=1800, ge=60, le=604_800)
     connectivity_live_window_seconds: int = Field(default=120, ge=10, le=3600)
@@ -77,6 +80,10 @@ class Settings(BaseSettings):
         if self.connectivity_stale_window_seconds <= self.connectivity_live_window_seconds:
             raise ValueError(
                 "CONNECTIVITY_STALE_WINDOW_SECONDS must exceed CONNECTIVITY_LIVE_WINDOW_SECONDS"
+            )
+        if self.rfid_unobserved_after_seconds <= self.rfid_last_seen_flush_seconds:
+            raise ValueError(
+                "RFID_UNOBSERVED_AFTER_SECONDS must exceed RFID_LAST_SEEN_FLUSH_SECONDS"
             )
         if self.build_sha == "local" and self.render_git_commit:
             self.build_sha = self.render_git_commit

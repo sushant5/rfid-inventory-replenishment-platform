@@ -757,6 +757,65 @@ def _ensure_can_suspend(principal: Principal, target_grants: tuple[UserAccessGra
         )
 
 
+def _ensure_another_active_tenant_admin(
+    db: Session,
+    tenant_id: uuid.UUID,
+    excluded_user_id: uuid.UUID,
+) -> None:
+    another_canonical_admin = db.scalar(
+        select(UserRole.user_id)
+        .join(User, User.id == UserRole.user_id)
+        .where(
+            UserRole.tenant_id == tenant_id,
+            UserRole.user_id != excluded_user_id,
+            UserRole.role == CanonicalIdentityRole.TENANT_ADMIN,
+            User.status == UserStatus.ACTIVE,
+        )
+        .limit(1)
+    )
+    another_legacy_admin = db.scalar(
+        select(UserAccessGrant.user_id)
+        .join(User, User.id == UserAccessGrant.user_id)
+        .where(
+            UserAccessGrant.tenant_id == tenant_id,
+            UserAccessGrant.user_id != excluded_user_id,
+            UserAccessGrant.role == IdentityRole.CORPORATE_ADMIN,
+            UserAccessGrant.store_id.is_(None),
+            User.status == UserStatus.ACTIVE,
+        )
+        .limit(1)
+    )
+    if another_canonical_admin is None and another_legacy_admin is None:
+        raise ApiError(
+            409,
+            "Last tenant administrator",
+            "Assign another tenant administrator before removing this administrator's access.",
+            code="last_tenant_admin",
+        )
+
+
+def _ensure_not_suspending_last_tenant_admin(
+    db: Session,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    grants: tuple[UserAccessGrant, ...],
+) -> None:
+    canonical_admin = db.scalar(
+        select(UserRole.user_id)
+        .where(
+            UserRole.tenant_id == tenant_id,
+            UserRole.user_id == user_id,
+            UserRole.role == CanonicalIdentityRole.TENANT_ADMIN,
+        )
+        .limit(1)
+    )
+    legacy_admin = any(
+        grant.role == IdentityRole.CORPORATE_ADMIN and grant.store_id is None for grant in grants
+    )
+    if canonical_admin is not None or legacy_admin:
+        _ensure_another_active_tenant_admin(db, tenant_id, user_id)
+
+
 def suspend_user(db: Session, principal: Principal, user_id: uuid.UUID) -> UserRecord:
     if user_id == principal.user_id:
         raise ApiError(
@@ -766,14 +825,10 @@ def suspend_user(db: Session, principal: Principal, user_id: uuid.UUID) -> UserR
             code="self_suspension_forbidden",
         )
 
-    user = db.scalar(
-        select(User).where(
-            User.id == user_id,
-            User.tenant_id == principal.tenant_id,
-        )
-    )
-    if user is None:
-        raise ApiError(404, "User not found", "The requested user does not exist.")
+    # Access changes use the same lock, serializing every operation that could remove
+    # the tenant's final active administrator.
+    db.scalar(select(Tenant.id).where(Tenant.id == principal.tenant_id).with_for_update())
+    user = _lock_access_target(db, principal, user_id)
 
     grants = _load_grants(db, principal.tenant_id, user.id)
     _ensure_can_suspend(principal, grants)
@@ -783,6 +838,12 @@ def suspend_user(db: Session, principal: Principal, user_id: uuid.UUID) -> UserR
             grants=_visible_grants(principal, Permission.USERS_READ, grants),
         )
 
+    _ensure_not_suspending_last_tenant_admin(
+        db,
+        principal.tenant_id,
+        user.id,
+        grants,
+    )
     user.status = UserStatus.SUSPENDED
     user.token_version += 1
     _add_audit_record(
@@ -1036,36 +1097,7 @@ def _ensure_not_removing_last_tenant_admin(
         and CanonicalIdentityRole.TENANT_ADMIN not in requested_roles
     ):
         return
-    another_canonical_admin = db.scalar(
-        select(UserRole.user_id)
-        .join(User, User.id == UserRole.user_id)
-        .where(
-            UserRole.tenant_id == tenant_id,
-            UserRole.user_id != user_id,
-            UserRole.role == CanonicalIdentityRole.TENANT_ADMIN,
-            User.status == UserStatus.ACTIVE,
-        )
-        .limit(1)
-    )
-    another_legacy_admin = db.scalar(
-        select(UserAccessGrant.user_id)
-        .join(User, User.id == UserAccessGrant.user_id)
-        .where(
-            UserAccessGrant.tenant_id == tenant_id,
-            UserAccessGrant.user_id != user_id,
-            UserAccessGrant.role == IdentityRole.CORPORATE_ADMIN,
-            UserAccessGrant.store_id.is_(None),
-            User.status == UserStatus.ACTIVE,
-        )
-        .limit(1)
-    )
-    if another_canonical_admin is None and another_legacy_admin is None:
-        raise ApiError(
-            409,
-            "Last tenant administrator",
-            "Assign another tenant administrator before removing this role.",
-            code="last_tenant_admin",
-        )
+    _ensure_another_active_tenant_admin(db, tenant_id, user_id)
 
 
 def _audit_access_change(

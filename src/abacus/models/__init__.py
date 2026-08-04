@@ -1,8 +1,10 @@
 from abacus.models.architecture import (
     AppliedInventoryDelta,
+    BusinessEvent,
     CurrentItemState,
     InventoryProjection,
     InventoryTransitionOutbox,
+    ItemPresenceStatus,
     PolicyDefinition,
     PolicyRule,
     PolicyVersion,
@@ -44,6 +46,7 @@ from abacus.models.tenancy import (
 __all__ = [
     "AppliedInventoryDelta",
     "Base",
+    "BusinessEvent",
     "CatalogImport",
     "CatalogImportError",
     "CatalogImportRow",
@@ -56,6 +59,7 @@ __all__ = [
     "IdentityAuditRecord",
     "InventoryProjection",
     "InventoryTransitionOutbox",
+    "ItemPresenceStatus",
     "OnboardingBatch",
     "OrganizationUnit",
     "PolicyDefinition",

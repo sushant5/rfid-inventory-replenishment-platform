@@ -189,9 +189,13 @@ def evaluate_replenishment_endpoint(
     return ReplenishmentEvaluationRead(
         store_id=result.store_id,
         created_count=len(result.tasks),
+        updated_count=len(result.updated_tasks),
         suppressed_connectivity=result.suppressed_connectivity,
         suppressed_low_confidence=result.suppressed_low_confidence,
+        deferred_count=result.deferred_count,
+        deferred_quantity=result.deferred_quantity,
         tasks=[ReplenishmentTaskRead.model_validate(task) for task in result.tasks],
+        updated_tasks=[ReplenishmentTaskRead.model_validate(task) for task in result.updated_tasks],
     )
 
 
