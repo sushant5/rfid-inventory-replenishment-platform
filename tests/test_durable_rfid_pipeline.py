@@ -1733,9 +1733,7 @@ def test_confirmed_backroom_to_floor_move_verifies_completed_task(
             )
             == 1
         )
-        assert replenishment_verification_status(task) is (
-            ReplenishmentVerificationStatus.VERIFIED
-        )
+        assert replenishment_verification_status(task) is (ReplenishmentVerificationStatus.VERIFIED)
 
 
 def test_projection_rebuild_rejects_pending_transition(
