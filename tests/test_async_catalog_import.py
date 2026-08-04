@@ -60,7 +60,7 @@ def _create_tenant(
     )
     assert response.status_code == 201, response.text
     tenant_id = uuid.UUID(response.json()["id"])
-    email = f"admin-{suffix}@example.test"
+    email = f"admin-{suffix}@example.com"
     password = f"Async-Catalog-{suffix}!"
     with postgres_session_factory() as db:
         user = User(
