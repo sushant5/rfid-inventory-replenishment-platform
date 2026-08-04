@@ -171,7 +171,13 @@ def test_inventory_and_task_pages_have_stable_order_totals_and_store_authorizati
             target_floor_qty=2,
             priority=0,
         )
-        db.add_all([tenant, store, style, sku, *zones, policy, version, rule])
+        db.add(tenant)
+        db.flush()
+        db.add_all([store, style, policy])
+        db.flush()
+        db.add_all([sku, *zones, version])
+        db.flush()
+        db.add(rule)
         db.flush()
         db.add_all(
             [

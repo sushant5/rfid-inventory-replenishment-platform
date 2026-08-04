@@ -98,6 +98,11 @@ def store_discovery_data(
                     name="Blue Store Discovery",
                     status=TenantStatus.ACTIVE,
                 ),
+            ]
+        )
+        db.flush()
+        db.add_all(
+            [
                 Store(
                     id=first_store_id,
                     tenant_id=tenant_id,
@@ -128,6 +133,11 @@ def store_discovery_data(
                 corporate_user,
                 associate_user,
                 unassigned_user,
+            ]
+        )
+        db.flush()
+        db.add_all(
+            [
                 UserRole(
                     tenant_id=tenant_id,
                     user_id=corporate_user.id,
