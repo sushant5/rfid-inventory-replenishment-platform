@@ -1,12 +1,20 @@
+import hashlib
 from datetime import UTC, datetime
 from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
-from abacus.models.catalog import CatalogImportMode
+from abacus.api.errors import ApiError
+from abacus.models.catalog import CatalogImport, CatalogImportMode
 from abacus.schemas.catalog import CatalogRowData, normalize_epc, normalize_upc
-from abacus.services.catalog import parse_catalog_csv, resolve_active_epc
+from abacus.services.catalog import (
+    MAX_CATALOG_FILE_BYTES,
+    accept_catalog_import,
+    parse_catalog_csv,
+    resolve_active_epc,
+)
 
 HEADER = "style_code,style_name,sku,upc,color,size,epc,attributes,attr.brand\n"
 
@@ -157,3 +165,48 @@ def test_resolve_active_epc_returns_none_for_invalid_identifier() -> None:
 
 def test_import_mode_is_explicit() -> None:
     assert {mode.value for mode in CatalogImportMode} == {"DELTA", "FULL"}
+
+
+def test_catalog_acceptance_rejects_source_larger_than_hosted_limit() -> None:
+    db = Mock()
+    db.get.return_value = object()
+
+    with pytest.raises(ApiError) as exc_info:
+        accept_catalog_import(
+            db,
+            uuid4(),
+            "oversized-import",
+            CatalogImportMode.FULL,
+            b"x" * (MAX_CATALOG_FILE_BYTES + 1),
+            filename="catalog.csv",
+            content_type="text/csv",
+        )
+
+    assert exc_info.value.status_code == 413
+    assert exc_info.value.code == "catalog_file_too_large"
+    db.add.assert_not_called()
+
+
+def test_concurrent_equivalent_catalog_acceptance_returns_committed_winner() -> None:
+    content = b"accepted source"
+    winner = CatalogImport(
+        checksum=hashlib.sha256(content).hexdigest(),
+        mode=CatalogImportMode.FULL,
+    )
+    db = Mock()
+    db.get.return_value = object()
+    db.scalar.side_effect = [None, winner]
+    db.flush.side_effect = IntegrityError("insert", {}, Exception("duplicate"))
+
+    result = accept_catalog_import(
+        db,
+        uuid4(),
+        "concurrent-import",
+        CatalogImportMode.FULL,
+        content,
+        filename="catalog.csv",
+        content_type="text/csv",
+    )
+
+    assert result is winner
+    db.rollback.assert_called_once_with()

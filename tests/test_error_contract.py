@@ -2,7 +2,7 @@ from fastapi.testclient import TestClient
 
 from abacus.main import create_app
 
-PROBLEM_STATUS_CODES = {"400", "401", "403", "404", "409", "422", "429", "500", "503"}
+PROBLEM_STATUS_CODES = {"400", "401", "403", "404", "409", "413", "422", "429", "500", "503"}
 
 EXPECTED_PROBLEM_STATUSES = {
     "createTenant": {"401", "409", "422", "500"},
@@ -14,14 +14,15 @@ EXPECTED_PROBLEM_STATUSES = {
     "rotateDeviceCredential": {"401", "403", "404", "422", "500"},
     "listStores": {"401", "403", "422", "500"},
     "listTenantStores": {"401", "404", "422", "500"},
-    "createCatalogImport": {"400", "401", "404", "409", "422", "500"},
-    "getCatalogImport": {"401", "404", "422", "500"},
-    "listCatalogImportErrors": {"401", "404", "422", "500"},
+    "createCatalogImport": {"400", "401", "403", "404", "409", "413", "422", "500"},
+    "getCatalogImport": {"401", "403", "404", "422", "500"},
+    "listCatalogImportErrors": {"401", "403", "404", "422", "500"},
     "listSkus": {"401", "403", "422", "500"},
     "getSku": {"401", "403", "404", "422", "500"},
     "submitRfidObservationBatch": {"401", "403", "409", "422", "500"},
     "getRfidObservationBatch": {"401", "403", "404", "422", "500"},
     "listRfidQuarantine": {"401", "403", "422", "500"},
+    "replayRfidQuarantine": {"401", "403", "404", "409", "422", "500"},
     "getStoreInventory": {"401", "403", "404", "422", "500"},
     "getCurrentItemState": {"401", "403", "404", "422", "500"},
     "getCurrentUser": {"401", "500"},
@@ -68,7 +69,7 @@ def test_openapi_documents_runtime_error_contract() -> None:
     assert len(operations) == len(EXPECTED_PROBLEM_STATUSES)
     assert all("500" in operation["responses"] for operation in operations)
     secured = [operation for operation in operations if operation.get("security")]
-    assert len(secured) == 37
+    assert len(secured) == 38
     assert all("401" in operation["responses"] for operation in secured)
     assert "401" in schema["paths"]["/v1/auth/login"]["post"]["responses"]
 

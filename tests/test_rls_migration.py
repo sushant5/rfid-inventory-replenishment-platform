@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import uuid
 from pathlib import Path
 from types import ModuleType
@@ -28,21 +29,68 @@ def _load_rls_migration() -> ModuleType:
     return module
 
 
+def _load_retirement_migration() -> ModuleType:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "c9e8d4f2a715_retire_compatibility_schema.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "abacus_compatibility_retirement_migration",
+        migration_path,
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("Unable to load compatibility retirement migration")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def _load_catalog_source_migration() -> ModuleType:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "e2f6a1b3c904_add_catalog_import_sources.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "abacus_catalog_source_migration",
+        migration_path,
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("Unable to load catalog source migration")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 def test_rls_table_inventory_matches_all_tenant_owned_models() -> None:
     migration = _load_rls_migration()
+    retirement = _load_retirement_migration()
+    catalog_source = _load_catalog_source_migration()
     modeled_tenant_tables = {
         table.name for table in Base.metadata.tables.values() if "tenant_id" in table.columns
     }
     modeled_tenant_tables.add("tenants")
 
-    assert set(migration.TENANT_OWNED_TABLES) == modeled_tenant_tables
+    historical_tables = set(migration.TENANT_OWNED_TABLES)
+    retired_tables = set(retirement.RETIRED_TABLES)
+    added_tables = set(catalog_source.ADDED_TENANT_TABLES)
+    assert historical_tables | added_tables == modeled_tenant_tables | retired_tables
+    assert historical_tables.isdisjoint(added_tables)
+    assert modeled_tenant_tables.isdisjoint(retired_tables)
     assert "NULLIF" in migration.TENANT_CONTEXT_SQL
     assert "current_setting('app.tenant_id', true)" in migration.TENANT_CONTEXT_SQL
 
 
 @pytest.mark.integration
 def test_postgres_rls_and_security_definer_boundaries(postgres_engine: Engine) -> None:
-    migration = _load_rls_migration()
+    retirement = _load_retirement_migration()
+    modeled_tenant_tables = {
+        table.name for table in Base.metadata.tables.values() if "tenant_id" in table.columns
+    }
+    modeled_tenant_tables.add("tenants")
     role_name = f"abacus_rls_test_{uuid.uuid4().hex}"
     quoted_role = postgres_engine.dialect.identifier_preparer.quote(role_name)
     tenant_a = uuid.uuid4()
@@ -64,8 +112,53 @@ def test_postgres_rls_and_security_definer_boundaries(postgres_engine: Engine) -
                 )
             )
         }
-        assert set(migration.TENANT_OWNED_TABLES) <= set(rls_relations)
-        assert all(rls_relations[table] == (True, True) for table in migration.TENANT_OWNED_TABLES)
+        assert modeled_tenant_tables <= set(rls_relations)
+        assert all(rls_relations[table] == (True, True) for table in modeled_tenant_tables)
+        retired_relations = {
+            row.relname: (row.relrowsecurity, row.relforcerowsecurity)
+            for row in admin.execute(
+                text(
+                    "SELECT relname, relrowsecurity, relforcerowsecurity "
+                    "FROM pg_catalog.pg_class "
+                    "WHERE relnamespace = 'retired_compatibility'::regnamespace "
+                    "AND relkind = 'r'"
+                )
+            )
+        }
+        assert set(retirement.RETIRED_TABLES) == set(retired_relations)
+        assert all(value == (True, True) for value in retired_relations.values())
+        assert admin.scalar(
+            text("SELECT to_regclass('public.rfid_observation_acceptance_seq') IS NOT NULL")
+        )
+        assert admin.scalar(text("SELECT to_regprocedure('public.app_cutover_ready()') IS NULL"))
+        assert admin.scalar(
+            text(
+                "SELECT to_regprocedure("
+                "'public.abacus_resolve_catalog_import_tenant(uuid)') IS NULL"
+            )
+        )
+        assert not admin.scalar(
+            text("SELECT has_schema_privilege('public', 'retired_compatibility', 'USAGE')")
+        )
+        application_role = os.environ.get("APPLICATION_DATABASE_ROLE", "abacus_app")
+        if admin.scalar(
+            text("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :role)"),
+            {"role": application_role},
+        ):
+            assert not admin.scalar(
+                text("SELECT has_schema_privilege(:role, 'retired_compatibility', 'USAGE')"),
+                {"role": application_role},
+            )
+            for retired_table in retirement.RETIRED_TABLES:
+                for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                    assert not admin.scalar(
+                        text("SELECT has_table_privilege(:role, :relation, :privilege)"),
+                        {
+                            "role": application_role,
+                            "relation": f"retired_compatibility.{retired_table}",
+                            "privilege": privilege,
+                        },
+                    )
         assert not admin.scalar(
             text(
                 "SELECT has_function_privilege("

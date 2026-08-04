@@ -1,6 +1,5 @@
 from abacus.models.architecture import (
     AppliedInventoryDelta,
-    CanonicalReplenishmentTask,
     CurrentItemState,
     InventoryProjection,
     InventoryTransitionOutbox,
@@ -9,6 +8,7 @@ from abacus.models.architecture import (
     PolicyVersion,
     Product,
     ProductVariant,
+    ReplenishmentTask,
     RfidObservationBatch,
     RfidObservationBatchEvent,
     RfidObservationEventLedger,
@@ -24,25 +24,13 @@ from abacus.models.catalog import (
     CatalogImport,
     CatalogImportError,
     CatalogImportRow,
+    CatalogImportSource,
     EpcBinding,
     ProductStyle,
     Sku,
 )
 from abacus.models.identity import IdentityAuditRecord, User, UserAccessGrant
 from abacus.models.jobs import DurableJob
-from abacus.models.replenishment import (
-    ReplenishmentPolicy,
-    ReplenishmentPolicyImport,
-    ReplenishmentRun,
-    ReplenishmentRunLine,
-    ReplenishmentTask,
-)
-from abacus.models.rfid import (
-    InventoryBalance,
-    InventoryChange,
-    InventoryItemState,
-    RfidObservation,
-)
 from abacus.models.tenancy import (
     Device,
     DeviceAssignment,
@@ -56,19 +44,16 @@ from abacus.models.tenancy import (
 __all__ = [
     "AppliedInventoryDelta",
     "Base",
-    "CanonicalReplenishmentTask",
     "CatalogImport",
     "CatalogImportError",
     "CatalogImportRow",
+    "CatalogImportSource",
     "CurrentItemState",
     "Device",
     "DeviceAssignment",
     "DurableJob",
     "EpcBinding",
     "IdentityAuditRecord",
-    "InventoryBalance",
-    "InventoryChange",
-    "InventoryItemState",
     "InventoryProjection",
     "InventoryTransitionOutbox",
     "OnboardingBatch",
@@ -79,12 +64,7 @@ __all__ = [
     "Product",
     "ProductStyle",
     "ProductVariant",
-    "ReplenishmentPolicy",
-    "ReplenishmentPolicyImport",
-    "ReplenishmentRun",
-    "ReplenishmentRunLine",
     "ReplenishmentTask",
-    "RfidObservation",
     "RfidObservationBatch",
     "RfidObservationBatchEvent",
     "RfidObservationEventLedger",

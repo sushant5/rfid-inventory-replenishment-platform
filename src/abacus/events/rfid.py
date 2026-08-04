@@ -27,6 +27,7 @@ class RfidObservationEvent(BaseModel):
     is_buffered: bool = False
     backlog_drained: bool = True
     reader_coverage_ok: bool = True
+    replayed_from_quarantine_id: uuid.UUID | None = None
 
     @field_validator("epc")
     @classmethod

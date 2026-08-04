@@ -24,7 +24,7 @@ SettingsDependency = Annotated[Settings, Depends(get_settings)]
 _platform_key_header = APIKeyHeader(
     name="X-Platform-Key",
     scheme_name="PlatformApiKey",
-    description="Trusted platform integration key for onboarding and operational APIs.",
+    description="Trusted platform key for tenant and initial-store onboarding.",
     auto_error=False,
 )
 PlatformKey = Annotated[str | None, Depends(_platform_key_header)]

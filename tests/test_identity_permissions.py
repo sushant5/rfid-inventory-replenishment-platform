@@ -1,11 +1,8 @@
 import uuid
 
-import pytest
-
-from abacus.api.errors import ApiError
 from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.identity import IdentityRole
-from abacus.security import Permission, Principal, RoleScope, ensure_can_assign_roles
+from abacus.security import Permission, Principal, RoleScope
 
 
 def _principal(*scopes: RoleScope) -> Principal:
@@ -54,47 +51,3 @@ def test_store_associate_cannot_administer_users_or_policies() -> None:
     assert not principal.has_permission(Permission.USERS_SUSPEND)
     assert not principal.has_permission(Permission.POLICY_MANAGE)
     assert principal.has_permission(Permission.REPLENISHMENT_EXECUTE)
-
-
-@pytest.mark.parametrize(
-    "assignment",
-    [
-        RoleScope(IdentityRole.CORPORATE_ADMIN, None),
-        RoleScope(IdentityRole.STORE_MANAGER, uuid.uuid4()),
-        RoleScope(IdentityRole.STORE_ASSOCIATE, uuid.uuid4()),
-    ],
-)
-def test_store_manager_cannot_delegate_privilege_or_another_store(
-    assignment: RoleScope,
-) -> None:
-    managed_store = uuid.uuid4()
-    principal = _principal(RoleScope(IdentityRole.STORE_MANAGER, managed_store))
-
-    with pytest.raises(ApiError) as error:
-        ensure_can_assign_roles(principal, [assignment])
-
-    assert error.value.status_code == 403
-    assert error.value.code == "role_assignment_forbidden"
-
-
-def test_store_manager_can_create_associate_only_in_managed_store() -> None:
-    managed_store = uuid.uuid4()
-    principal = _principal(RoleScope(IdentityRole.STORE_MANAGER, managed_store))
-
-    ensure_can_assign_roles(
-        principal,
-        [RoleScope(IdentityRole.STORE_ASSOCIATE, managed_store)],
-    )
-
-
-def test_corporate_admin_can_delegate_all_role_types() -> None:
-    principal = _principal(RoleScope(IdentityRole.CORPORATE_ADMIN, None))
-
-    ensure_can_assign_roles(
-        principal,
-        [
-            RoleScope(IdentityRole.CORPORATE_ADMIN, None),
-            RoleScope(IdentityRole.STORE_MANAGER, uuid.uuid4()),
-            RoleScope(IdentityRole.STORE_ASSOCIATE, uuid.uuid4()),
-        ],
-    )

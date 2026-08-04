@@ -13,10 +13,6 @@ from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.identity import IdentityRole
 from abacus.schemas.identity import CanonicalUserCreate, RoleAssignmentCreate, UserCreate
 from abacus.schemas.tenancy import TenantCreate
-from abacus.services.cutover import (
-    list_pending_reservation_cutovers,
-    reconcile_reservation_cutover_task,
-)
 from abacus.services.identity import bootstrap_corporate_admin, bootstrap_public_reviewer
 from abacus.services.streaming_inventory import (
     confirm_timed_out_removals,
@@ -69,18 +65,6 @@ def _parser() -> argparse.ArgumentParser:
         "bootstrap-public-reviewer",
         help="idempotently create the configured public read-only reviewer",
     )
-    commands.add_parser(
-        "list-reservation-cutover",
-        help="list legacy replenishment tasks that require cutover review",
-    )
-    reconcile = commands.add_parser(
-        "reconcile-reservation-cutover",
-        help="record the reviewed RFID baseline for one legacy task",
-    )
-    reconcile.add_argument("--task-id", required=True, type=uuid.UUID)
-    reconcile.add_argument("--baseline", required=True, type=int)
-    reconcile.add_argument("--reviewed-by", required=True)
-    reconcile.add_argument("--note", required=True)
     projection = commands.add_parser(
         "rebuild-inventory-projection",
         help="rebuild derived inventory counts from current physical-item state",
@@ -202,64 +186,12 @@ def _bootstrap_public_reviewer_from_environment() -> int:
     return 0
 
 
-def _list_reservation_cutover() -> int:
-    with SessionLocal() as db:
-        pending = list_pending_reservation_cutovers(db)
-    if not pending:
-        print("No reservation cutover tasks require review.")
-        return 0
-    for item in pending:
-        print(
-            f"task={item.task_id} tenant={item.tenant_id} store={item.store_id} "
-            f"sku={item.sku_id} moved_quantity={item.moved_quantity}"
-        )
-    print(f"Pending reservation cutover tasks: {len(pending)}")
-    return 0
-
-
-def _reconcile_reservation_cutover(
-    *,
-    task_id: uuid.UUID,
-    baseline: int,
-    reviewed_by: str,
-    note: str,
-) -> int:
-    with SessionLocal() as db:
-        try:
-            task = reconcile_reservation_cutover_task(
-                db,
-                task_id=task_id,
-                baseline=baseline,
-                reviewed_by=reviewed_by,
-                note=note,
-            )
-            db.commit()
-        except ValueError as exc:
-            db.rollback()
-            print(f"Cutover reconciliation failed: {exc}", file=sys.stderr)
-            return 2
-    print(
-        f"Reservation cutover reviewed: task={task.id} "
-        f"baseline={task.reconciled_before_tracking_quantity}"
-    )
-    return 0
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.command == "bootstrap-admin":
         return _bootstrap_from_environment(if_configured=arguments.if_configured)
     if arguments.command == "bootstrap-public-reviewer":
         return _bootstrap_public_reviewer_from_environment()
-    if arguments.command == "list-reservation-cutover":
-        return _list_reservation_cutover()
-    if arguments.command == "reconcile-reservation-cutover":
-        return _reconcile_reservation_cutover(
-            task_id=arguments.task_id,
-            baseline=arguments.baseline,
-            reviewed_by=arguments.reviewed_by,
-            note=arguments.note,
-        )
     if arguments.command == "rebuild-inventory-projection":
         with tenant_session_scope(arguments.tenant_id) as db:
             count = rebuild_inventory_projection(db, arguments.tenant_id)

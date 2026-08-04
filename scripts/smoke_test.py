@@ -70,8 +70,6 @@ def run_checks(
         raise RuntimeError("readiness response is missing schema_revision")
     if ready.get("restricted_database_role") is not True:
         raise RuntimeError("readiness response did not confirm a restricted database role")
-    if ready.get("cutover_ready") is not True:
-        raise RuntimeError("readiness response did not confirm cutover readiness")
     if expected_schema_revision is not None and schema_revision != expected_schema_revision:
         raise RuntimeError(
             f"schema revision mismatch: expected {expected_schema_revision}, got {schema_revision}"

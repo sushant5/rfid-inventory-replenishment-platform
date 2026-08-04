@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import delete, event, func, select, update
+from sqlalchemy import delete, event, func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 import abacus.processes.event_worker as event_worker
@@ -16,13 +16,13 @@ from abacus.api.routes.rfid import (
     get_item_state_endpoint,
     get_store_inventory_endpoint,
     list_rfid_quarantine_endpoint,
+    replay_rfid_quarantine_endpoint,
 )
 from abacus.config import Settings
 from abacus.enums import DeviceStatus, StoreStatus, TenantStatus, ZoneKind
 from abacus.events.rfid import RfidObservationEvent
 from abacus.models.architecture import (
     AppliedInventoryDelta,
-    CanonicalReplenishmentTask,
     CurrentItemState,
     FreshnessStatus,
     InventoryProjection,
@@ -34,6 +34,7 @@ from abacus.models.architecture import (
     PolicyVersionStatus,
     Product,
     ProductVariant,
+    ReplenishmentTask,
     RfidEventProcessingStatus,
     RfidObservationBatch,
     RfidObservationBatchEvent,
@@ -54,16 +55,17 @@ from abacus.models.catalog import (
 from abacus.models.identity import IdentityRole
 from abacus.models.tenancy import Device, DeviceAssignment, Store, Tenant, Zone
 from abacus.schemas.architecture import (
-    CanonicalObservationBatchCreate,
-    CanonicalObservationInput,
+    ObservationBatchCreate,
+    ObservationInput,
 )
-from abacus.schemas.canonical_replenishment import ReplenishmentEvaluationCreate
+from abacus.schemas.replenishment import ReplenishmentEvaluationCreate
 from abacus.security import Principal, RoleScope
-from abacus.services.canonical_replenishment import evaluate_replenishment
+from abacus.services.replenishment import evaluate_replenishment
 from abacus.services.rfid_ingress import accept_observation_batch
 from abacus.services.streaming_inventory import (
     ProcessingResult,
     RecentObservationState,
+    effective_freshness,
     rebuild_inventory_projection,
 )
 from abacus.services.streaming_inventory import (
@@ -258,11 +260,11 @@ def _request(
     *,
     epc: str | None = None,
     rssi_offset: float = 0,
-) -> CanonicalObservationBatchCreate:
-    return CanonicalObservationBatchCreate(
+) -> ObservationBatchCreate:
+    return ObservationBatchCreate(
         device_id=fixture.device_id,
         observations=[
-            CanonicalObservationInput(
+            ObservationInput(
                 event_id=event_id,
                 epc=epc or fixture.epc,
                 observed_at=fixture.observed_at + timedelta(seconds=index),
@@ -276,7 +278,7 @@ def _request(
 def _accept(
     postgres_session_factory: sessionmaker[Session],
     fixture: DurablePipelineFixture,
-    request: CanonicalObservationBatchCreate,
+    request: ObservationBatchCreate,
     *,
     received_at: datetime,
 ) -> uuid.UUID:
@@ -539,8 +541,8 @@ def test_replenishment_suppresses_old_item_evidence_while_store_remains_live(
         assert (
             db.scalar(
                 select(func.count())
-                .select_from(CanonicalReplenishmentTask)
-                .where(CanonicalReplenishmentTask.tenant_id == durable_pipeline.tenant_id)
+                .select_from(ReplenishmentTask)
+                .where(ReplenishmentTask.tenant_id == durable_pipeline.tenant_id)
             )
             == 0
         )
@@ -553,10 +555,10 @@ def test_throttled_item_refresh_keeps_a_durable_restart_watermark(
     _establish_projection(postgres_session_factory, durable_pipeline)
     repeated_at = durable_pipeline.observed_at + timedelta(seconds=10)
     repeated_id = str(uuid.uuid4())
-    repeated = CanonicalObservationBatchCreate(
+    repeated = ObservationBatchCreate(
         device_id=durable_pipeline.device_id,
         observations=[
-            CanonicalObservationInput(
+            ObservationInput(
                 event_id=repeated_id,
                 epc=durable_pipeline.epc,
                 observed_at=repeated_at,
@@ -591,10 +593,10 @@ def test_throttled_item_refresh_keeps_a_durable_restart_watermark(
     # but older than the processed ledger watermark, so it must not regress state.
     late_at = repeated_at - timedelta(seconds=1)
     late_id = str(uuid.uuid4())
-    late = CanonicalObservationBatchCreate(
+    late = ObservationBatchCreate(
         device_id=durable_pipeline.device_id,
         observations=[
-            CanonicalObservationInput(
+            ObservationInput(
                 event_id=late_id,
                 epc=durable_pipeline.epc,
                 observed_at=late_at,
@@ -836,16 +838,16 @@ def test_batch_assignment_resolution_uses_half_open_historical_boundaries(
         db.commit()
 
     event_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
-    request = CanonicalObservationBatchCreate(
+    request = ObservationBatchCreate(
         device_id=durable_pipeline.device_id,
         observations=[
-            CanonicalObservationInput(
+            ObservationInput(
                 event_id=event_ids[0],
                 epc=durable_pipeline.epc,
                 observed_at=cutover_at - timedelta(microseconds=1),
                 rssi=-42,
             ),
-            CanonicalObservationInput(
+            ObservationInput(
                 event_id=event_ids[1],
                 epc=durable_pipeline.epc,
                 observed_at=cutover_at,
@@ -980,10 +982,10 @@ def test_effective_epc_binding_controls_historical_and_current_sku_projection(
         assert historical_state is not None
         assert historical_state.sku_id == durable_pipeline.sku_id
 
-    current = CanonicalObservationBatchCreate(
+    current = ObservationBatchCreate(
         device_id=durable_pipeline.device_id,
         observations=[
-            CanonicalObservationInput(
+            ObservationInput(
                 event_id=str(uuid.uuid4()),
                 epc=durable_pipeline.epc,
                 observed_at=effective_at + timedelta(seconds=index),
@@ -1082,10 +1084,10 @@ def test_equal_timestamp_reads_can_confirm_a_stable_zone_move(
         )
         db.commit()
 
-    move_request = CanonicalObservationBatchCreate(
+    move_request = ObservationBatchCreate(
         device_id=backroom_device_id,
         observations=[
-            CanonicalObservationInput(
+            ObservationInput(
                 event_id=str(uuid.uuid4()),
                 epc=durable_pipeline.epc,
                 observed_at=move_at,
@@ -1387,6 +1389,8 @@ def test_unknown_epc_rejects_every_link_and_completes_retry_batches(
             assert page.items[0].event_id == event_id
             assert page.items[0].reason == "UNKNOWN_EPC"
             assert page.items[0].payload.get("tenant_marker") is None
+            assert page.items[0].processing_status is RfidEventProcessingStatus.REJECTED
+            assert page.items[0].resolved_at is None
             store_reader = Principal(
                 user_id=uuid.uuid4(),
                 tenant_id=durable_pipeline.tenant_id,
@@ -1665,3 +1669,306 @@ def test_worker_quarantines_exhausted_poison_event_and_continues(
         assert state.state_version == 1
         assert projection is not None
         assert projection.quantity == 1
+
+
+def test_poison_transition_does_not_block_later_projection_and_requires_rebuild(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _establish_projection(postgres_session_factory, durable_pipeline)
+    poison_transition_id = uuid.uuid4()
+    valid_transition_id = uuid.uuid4()
+    created_at = datetime.now(UTC)
+    base_delta: dict[str, object] = {
+        "schema_version": 1,
+        "tenant_id": str(durable_pipeline.tenant_id),
+        "store_id": str(durable_pipeline.store_id),
+        "sku_id": str(durable_pipeline.sku_id),
+        "zone_id": str(durable_pipeline.zone_id),
+        "confidence": 0.95,
+        "observed_at": created_at.isoformat(),
+    }
+    poison_delta = {
+        **base_delta,
+        "delta_id": f"{poison_transition_id}:poison",
+        "transition_id": str(poison_transition_id),
+        "epc": "POISON-TRANSITION",
+        "quantity_delta": "not-an-integer",
+    }
+    valid_delta = {
+        **base_delta,
+        "delta_id": f"{valid_transition_id}:valid",
+        "transition_id": str(valid_transition_id),
+        "epc": "VALID-TRANSITION",
+        "quantity_delta": 1,
+    }
+    with postgres_session_factory() as db:
+        db.add_all(
+            [
+                InventoryTransitionOutbox(
+                    transition_id=poison_transition_id,
+                    tenant_id=durable_pipeline.tenant_id,
+                    epc="POISON-TRANSITION",
+                    state_version=1,
+                    deltas=[poison_delta],
+                    created_at=created_at,
+                    publish_attempts=0,
+                ),
+                InventoryTransitionOutbox(
+                    transition_id=valid_transition_id,
+                    tenant_id=durable_pipeline.tenant_id,
+                    epc="VALID-TRANSITION",
+                    state_version=1,
+                    deltas=[valid_delta],
+                    created_at=created_at + timedelta(milliseconds=1),
+                    publish_attempts=0,
+                ),
+            ]
+        )
+        db.commit()
+
+    monkeypatch.setattr(
+        event_worker,
+        "get_settings",
+        lambda: Settings(worker_max_attempts=2),
+    )
+    recent = RecentObservationState()
+
+    # The malformed row records a retry, while the later valid transition commits.
+    assert event_worker.process_tenant_once(
+        durable_pipeline.tenant_id,
+        recent,
+        sweep_removals=False,
+    ) == (0, 1)
+    with postgres_session_factory() as db:
+        poison = db.get(InventoryTransitionOutbox, poison_transition_id)
+        valid = db.get(InventoryTransitionOutbox, valid_transition_id)
+        projection = db.get(
+            InventoryProjection,
+            (
+                durable_pipeline.tenant_id,
+                durable_pipeline.store_id,
+                durable_pipeline.sku_id,
+                durable_pipeline.zone_id,
+            ),
+        )
+        assert poison is not None and poison.publish_attempts == 1
+        assert poison.quarantined_at is None
+        assert valid is not None and valid.published_at is not None
+        assert projection is not None and projection.quantity == 2
+
+    # The bounded final attempt quarantines the poison row and fails closed.
+    assert event_worker.process_tenant_once(
+        durable_pipeline.tenant_id,
+        recent,
+        sweep_removals=False,
+    ) == (0, 0)
+    with postgres_session_factory() as db:
+        poison = db.get(InventoryTransitionOutbox, poison_transition_id)
+        connectivity = db.get(
+            StoreConnectivity,
+            (durable_pipeline.tenant_id, durable_pipeline.store_id),
+        )
+        assert poison is not None
+        assert poison.published_at is None
+        assert poison.publish_attempts == 2
+        assert poison.quarantined_at is not None
+        assert poison.quarantine_reason == event_worker.TRANSITION_ATTEMPTS_EXHAUSTED
+        assert poison.reconciled_at is None
+        assert connectivity is not None
+        assert connectivity.inventory_reconciliation_required_at is not None
+        assert (
+            effective_freshness(connectivity, Settings(), now=datetime.now(UTC))
+            == FreshnessStatus.DEGRADED
+        )
+        assert (
+            db.scalar(
+                text(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM app_pending_inventory_outbox_tenants() "
+                    "WHERE tenant_id = :tenant_id)"
+                ),
+                {"tenant_id": durable_pipeline.tenant_id},
+            )
+            is False
+        )
+
+        # Rebuild is the explicit recovery boundary: current item state wins over
+        # both the bad payload and the deliberately synthetic valid delta above.
+        assert rebuild_inventory_projection(db, durable_pipeline.tenant_id) == 1
+        db.commit()
+
+    with postgres_session_factory() as db:
+        poison = db.get(InventoryTransitionOutbox, poison_transition_id)
+        connectivity = db.get(
+            StoreConnectivity,
+            (durable_pipeline.tenant_id, durable_pipeline.store_id),
+        )
+        projection = db.get(
+            InventoryProjection,
+            (
+                durable_pipeline.tenant_id,
+                durable_pipeline.store_id,
+                durable_pipeline.sku_id,
+                durable_pipeline.zone_id,
+            ),
+        )
+        assert poison is not None and poison.reconciled_at is not None
+        assert connectivity is not None
+        assert connectivity.inventory_reconciliation_required_at is None
+        assert projection is not None and projection.quantity == 1
+
+
+def test_quarantine_replay_is_idempotent_and_recovers_after_late_catalog(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    unknown_epc = "3034FFFFFFFFFFFFFFFFFFFF"
+    event_ids = (str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()))
+    batch_id = _accept(
+        postgres_session_factory,
+        durable_pipeline,
+        _request(durable_pipeline, event_ids, epc=unknown_epc),
+        received_at=durable_pipeline.observed_at + timedelta(seconds=4),
+    )
+    recent = RecentObservationState()
+    assert event_worker.process_tenant_once(durable_pipeline.tenant_id, recent) == (3, 0)
+
+    with postgres_session_factory() as db:
+        quarantines = list(
+            db.scalars(
+                select(RfidQuarantine)
+                .where(RfidQuarantine.tenant_id == durable_pipeline.tenant_id)
+                .order_by(RfidQuarantine.event_id)
+            ).all()
+        )
+        assert len(quarantines) == 3
+        first = replay_rfid_quarantine_endpoint(
+            quarantines[0].id, db, _tenant_admin(durable_pipeline)
+        )
+        repeated_pending = replay_rfid_quarantine_endpoint(
+            quarantines[0].id, db, _tenant_admin(durable_pipeline)
+        )
+        assert first.queued is True
+        assert first.processing_status is RfidEventProcessingStatus.PENDING
+        assert repeated_pending.queued is False
+        assert repeated_pending.processing_status is RfidEventProcessingStatus.PENDING
+
+    # Retrying before remediation fails again without creating another quarantine row.
+    assert event_worker.process_tenant_once(durable_pipeline.tenant_id, recent) == (1, 0)
+    with postgres_session_factory() as db:
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(RfidQuarantine)
+                .where(RfidQuarantine.tenant_id == durable_pipeline.tenant_id)
+            )
+            == 3
+        )
+        first_ledger = db.get(
+            RfidObservationEventLedger,
+            (durable_pipeline.tenant_id, event_ids[0]),
+        )
+        assert first_ledger is not None
+        assert first_ledger.processing_status is RfidEventProcessingStatus.REJECTED
+
+        source_import_id = db.scalar(
+            select(EpcBinding.source_import_id).where(
+                EpcBinding.tenant_id == durable_pipeline.tenant_id,
+                EpcBinding.epc == durable_pipeline.epc,
+            )
+        )
+        assert source_import_id is not None
+        db.add_all(
+            [
+                EpcBinding(
+                    tenant_id=durable_pipeline.tenant_id,
+                    epc=unknown_epc,
+                    sku_id=durable_pipeline.sku_id,
+                    effective_from=datetime.now(UTC),
+                    source_import_id=source_import_id,
+                ),
+                RfidTag(
+                    tenant_id=durable_pipeline.tenant_id,
+                    epc=unknown_epc,
+                    sku_id=durable_pipeline.sku_id,
+                    source_import_id=source_import_id,
+                    active=True,
+                ),
+            ]
+        )
+        db.commit()
+
+        for quarantine in quarantines:
+            queued = replay_rfid_quarantine_endpoint(
+                quarantine.id, db, _tenant_admin(durable_pipeline)
+            )
+            assert queued.queued is True
+            assert queued.processing_status is RfidEventProcessingStatus.PENDING
+        repeated_pending = replay_rfid_quarantine_endpoint(
+            quarantines[0].id, db, _tenant_admin(durable_pipeline)
+        )
+        assert repeated_pending.queued is False
+
+    # The binding was created after observed_at. Explicit UNKNOWN_EPC recovery may
+    # use it; ordinary processing remains event-time based.
+    assert event_worker.process_tenant_once(durable_pipeline.tenant_id, recent) == (3, 1)
+    with postgres_session_factory() as db:
+        projection = db.get(
+            InventoryProjection,
+            (
+                durable_pipeline.tenant_id,
+                durable_pipeline.store_id,
+                durable_pipeline.sku_id,
+                durable_pipeline.zone_id,
+            ),
+        )
+        assert projection is not None
+        assert projection.quantity == 1
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(RfidQuarantine)
+                .where(RfidQuarantine.tenant_id == durable_pipeline.tenant_id)
+            )
+            == 3
+        )
+        assert all(
+            db.get(
+                RfidObservationEventLedger, (durable_pipeline.tenant_id, event_id)
+            ).processing_status
+            is RfidEventProcessingStatus.PROCESSED
+            for event_id in event_ids
+        )
+        batch = db.get(RfidObservationBatch, batch_id)
+        assert batch is not None
+        assert batch.status is ObservationBatchStatus.COMPLETED
+        assert (batch.processed_count, batch.rejected_count, batch.pending_count) == (3, 0, 0)
+
+        resolved = list_rfid_quarantine_endpoint(
+            db,
+            _tenant_admin(durable_pipeline),
+            event_id=event_ids[0],
+        )
+        assert resolved.items[0].processing_status is RfidEventProcessingStatus.PROCESSED
+        assert resolved.items[0].resolved_at is not None
+
+        already_processed = replay_rfid_quarantine_endpoint(
+            quarantines[0].id, db, _tenant_admin(durable_pipeline)
+        )
+        assert already_processed.queued is False
+        assert already_processed.processing_status is RfidEventProcessingStatus.PROCESSED
+
+    assert event_worker.process_tenant_once(durable_pipeline.tenant_id, recent) == (0, 0)
+    with postgres_session_factory() as db:
+        projection = db.get(
+            InventoryProjection,
+            (
+                durable_pipeline.tenant_id,
+                durable_pipeline.store_id,
+                durable_pipeline.sku_id,
+                durable_pipeline.zone_id,
+            ),
+        )
+        assert projection is not None and projection.quantity == 1

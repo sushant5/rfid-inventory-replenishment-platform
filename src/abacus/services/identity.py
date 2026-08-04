@@ -34,8 +34,6 @@ from abacus.schemas.tenancy import TenantCreate
 from abacus.security import (
     Permission,
     Principal,
-    RoleScope,
-    ensure_can_assign_roles,
     hash_password,
     verify_password_and_update,
 )
@@ -550,99 +548,6 @@ def authenticate_user(
     db.commit()
     db.refresh(user)
     return user
-
-
-def create_user(db: Session, principal: Principal, request: UserCreate) -> UserRecord:
-    assignments = tuple(
-        RoleScope(role=assignment.role, store_id=assignment.store_id)
-        for assignment in request.role_assignments
-    )
-    ensure_can_assign_roles(principal, assignments)
-
-    scoped_store_ids = {
-        assignment.store_id for assignment in assignments if assignment.store_id is not None
-    }
-    if scoped_store_ids:
-        active_store_ids = set(
-            db.scalars(
-                select(Store.id).where(
-                    Store.tenant_id == principal.tenant_id,
-                    Store.id.in_(scoped_store_ids),
-                    Store.status == StoreStatus.ACTIVE,
-                )
-            ).all()
-        )
-        if active_store_ids != scoped_store_ids:
-            raise ApiError(
-                422,
-                "Invalid store scope",
-                "Every role assignment must reference an active store in the current tenant.",
-                code="invalid_store_scope",
-            )
-
-    existing_user = db.scalar(
-        select(User.id).where(
-            User.tenant_id == principal.tenant_id,
-            User.email == str(request.email),
-        )
-    )
-    if existing_user is not None:
-        raise ApiError(
-            409,
-            "User already exists",
-            "A user with this email already exists in the tenant.",
-            code="user_email_conflict",
-        )
-
-    user = User(
-        tenant_id=principal.tenant_id,
-        email=str(request.email),
-        display_name=request.display_name,
-        password_hash=hash_password(request.password.get_secret_value()),
-        status=UserStatus.ACTIVE,
-        token_version=1,
-    )
-    db.add(user)
-    try:
-        db.flush()
-        grants = tuple(
-            UserAccessGrant(
-                tenant_id=principal.tenant_id,
-                user_id=user.id,
-                role=assignment.role,
-                store_id=assignment.store_id,
-            )
-            for assignment in assignments
-        )
-        db.add_all(grants)
-        _add_audit_record(
-            db,
-            tenant_id=principal.tenant_id,
-            actor_user_id=principal.user_id,
-            action=IdentityAuditAction.USER_CREATED,
-            target_user_id=user.id,
-            details={
-                "email": user.email,
-                "role_assignments": [
-                    {
-                        "role": grant.role.value,
-                        "store_id": str(grant.store_id) if grant.store_id else None,
-                    }
-                    for grant in grants
-                ],
-            },
-        )
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise ApiError(
-            409,
-            "User creation conflict",
-            "The user or one of its role assignments was created concurrently.",
-            code="user_creation_conflict",
-        ) from exc
-    db.refresh(user)
-    return UserRecord(user=user, grants=grants)
 
 
 def create_canonical_user(

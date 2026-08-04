@@ -17,11 +17,14 @@ from abacus.events.inventory import InventoryDeltaEvent
 from abacus.events.rfid import RfidObservationEvent
 from abacus.logging import configure_logging
 from abacus.models.architecture import (
+    CurrentItemState,
+    FreshnessStatus,
     InventoryTransitionOutbox,
     RfidEventProcessingStatus,
     RfidObservationBatchEvent,
     RfidObservationEventLedger,
     RfidObservationOutbox,
+    StoreConnectivity,
 )
 from abacus.services.streaming_inventory import (
     RecentObservationState,
@@ -35,6 +38,7 @@ configure_logging()
 logger = structlog.get_logger(__name__)
 _stop_requested = False
 PROCESSING_ATTEMPTS_EXHAUSTED = "PROCESSING_ATTEMPTS_EXHAUSTED"
+TRANSITION_ATTEMPTS_EXHAUSTED = "TRANSITION_ATTEMPTS_EXHAUSTED"
 
 
 def _request_stop(*_: object) -> None:
@@ -95,6 +99,79 @@ def _terminal_event(
             backlog_drained=ledger.backlog_drained,
             reader_coverage_ok=ledger.reader_coverage_ok,
         )
+
+
+def _transition_store_ids(
+    db: Session,
+    transition: InventoryTransitionOutbox,
+) -> set[uuid.UUID]:
+    """Best-effort blast-radius recovery for a schema-invalid transition."""
+
+    store_ids: set[uuid.UUID] = set()
+    if isinstance(transition.deltas, list):
+        for payload in transition.deltas:
+            if not isinstance(payload, dict):
+                continue
+            try:
+                store_ids.add(uuid.UUID(str(payload["store_id"])))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+    state = db.get(CurrentItemState, (transition.tenant_id, transition.epc))
+    if state is not None and state.store_id is not None:
+        store_ids.add(state.store_id)
+    return store_ids
+
+
+def _validated_transition_deltas(
+    transition: InventoryTransitionOutbox,
+) -> list[InventoryDeltaEvent]:
+    if not isinstance(transition.deltas, list) or not transition.deltas:
+        raise ValueError("inventory transition must contain at least one delta")
+    deltas = [InventoryDeltaEvent.model_validate(item) for item in transition.deltas]
+    if any(item.transition_id != transition.transition_id for item in deltas):
+        raise ValueError("inventory delta transition_id does not match its outbox row")
+    if any(item.tenant_id != transition.tenant_id for item in deltas):
+        raise ValueError("inventory delta tenant_id does not match its outbox row")
+    if any(item.epc != transition.epc for item in deltas):
+        raise ValueError("inventory delta EPC does not match its outbox row")
+    if len({item.delta_id for item in deltas}) != len(deltas):
+        raise ValueError("inventory transition contains duplicate delta IDs")
+    return deltas
+
+
+def _quarantine_transition(
+    db: Session,
+    transition: InventoryTransitionOutbox,
+    *,
+    error: Exception,
+    quarantined_at: datetime,
+) -> None:
+    """Terminalize one poison delta and fail closed until projection rebuild."""
+
+    transition.quarantined_at = quarantined_at
+    transition.quarantine_reason = TRANSITION_ATTEMPTS_EXHAUSTED
+    transition.last_error = f"{type(error).__name__}: {error}"[:2000]
+    store_ids = _transition_store_ids(db, transition)
+    connectivity_query = select(StoreConnectivity).where(
+        StoreConnectivity.tenant_id == transition.tenant_id
+    )
+    if store_ids:
+        connectivity_query = connectivity_query.where(StoreConnectivity.store_id.in_(store_ids))
+    connectivity_rows = list(db.scalars(connectivity_query.with_for_update()).all())
+    if store_ids and not connectivity_rows:
+        # If the corrupt payload names no real store and current state cannot recover
+        # one, the safe blast radius is the tenant rather than no degradation at all.
+        connectivity_rows = list(
+            db.scalars(
+                select(StoreConnectivity)
+                .where(StoreConnectivity.tenant_id == transition.tenant_id)
+                .with_for_update()
+            ).all()
+        )
+    for connectivity in connectivity_rows:
+        connectivity.inventory_reconciliation_required_at = quarantined_at
+        if connectivity.freshness_status == FreshnessStatus.LIVE:
+            connectivity.freshness_status = FreshnessStatus.DEGRADED
 
 
 def process_tenant_once(
@@ -210,51 +287,80 @@ def process_tenant_once(
             )
             db.commit()
 
-    # A separate transaction makes item state visible before its derived projection.
-    failed_transition_id: uuid.UUID | None = None
-    try:
-        with tenant_session_scope(tenant_id) as db:
-            transitions = list(
-                db.scalars(
+    # Each transition commits independently. A malformed payload is retried without
+    # rolling back valid work or blocking unrelated items behind it.
+    with tenant_session_scope(tenant_id) as db:
+        transition_ids = list(
+            db.scalars(
+                select(InventoryTransitionOutbox.transition_id)
+                .where(
+                    InventoryTransitionOutbox.tenant_id == tenant_id,
+                    InventoryTransitionOutbox.published_at.is_(None),
+                    InventoryTransitionOutbox.quarantined_at.is_(None),
+                )
+                .order_by(
+                    InventoryTransitionOutbox.created_at,
+                    InventoryTransitionOutbox.state_version,
+                    InventoryTransitionOutbox.transition_id,
+                )
+                .limit(limit)
+            ).all()
+        )
+    for transition_id in transition_ids:
+        try:
+            with tenant_session_scope(tenant_id) as db:
+                transition = db.scalar(
                     select(InventoryTransitionOutbox)
                     .where(
                         InventoryTransitionOutbox.tenant_id == tenant_id,
+                        InventoryTransitionOutbox.transition_id == transition_id,
                         InventoryTransitionOutbox.published_at.is_(None),
+                        InventoryTransitionOutbox.quarantined_at.is_(None),
                     )
-                    .order_by(
-                        InventoryTransitionOutbox.created_at,
-                        InventoryTransitionOutbox.state_version,
-                    )
-                    .with_for_update()
-                    .limit(limit)
-                ).all()
-            )
-            for transition in transitions:
-                failed_transition_id = transition.transition_id
-                deltas = [InventoryDeltaEvent.model_validate(item) for item in transition.deltas]
+                    .with_for_update(skip_locked=True)
+                )
+                if transition is None:
+                    continue
+                deltas = _validated_transition_deltas(transition)
                 apply_inventory_deltas(db, deltas)
                 transition.published_at = datetime.now(UTC)
                 transition.publish_attempts += 1
                 transition.last_error = None
+                db.commit()
                 transition_count += 1
-            db.commit()
-    except Exception as exc:
-        if failed_transition_id is not None:
+        except Exception as exc:
+            terminalized = False
+            error_message = f"{type(exc).__name__}: {exc}"[:2000]
             with tenant_session_scope(tenant_id) as db:
                 failed_transition = db.scalar(
                     select(InventoryTransitionOutbox)
                     .where(
                         InventoryTransitionOutbox.tenant_id == tenant_id,
-                        InventoryTransitionOutbox.transition_id == failed_transition_id,
+                        InventoryTransitionOutbox.transition_id == transition_id,
                         InventoryTransitionOutbox.published_at.is_(None),
+                        InventoryTransitionOutbox.quarantined_at.is_(None),
                     )
                     .with_for_update()
                 )
                 if failed_transition is not None:
                     failed_transition.publish_attempts += 1
-                    failed_transition.last_error = f"{type(exc).__name__}: {exc}"[:2000]
+                    failed_transition.last_error = error_message
+                    if failed_transition.publish_attempts >= settings.worker_max_attempts:
+                        _quarantine_transition(
+                            db,
+                            failed_transition,
+                            error=exc,
+                            quarantined_at=datetime.now(UTC),
+                        )
+                        terminalized = True
                     db.commit()
-        raise
+            logger.warning(
+                "inventory_transition_failed",
+                tenant_id=str(tenant_id),
+                transition_id=str(transition_id),
+                terminalized=terminalized,
+                error=error_message,
+            )
     if raw_error is not None:
         raise raw_error
     return raw_count, transition_count

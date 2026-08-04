@@ -177,13 +177,6 @@ class CatalogImportRead(ApiModel):
     updated_at: datetime
 
 
-class CatalogImportListRead(ApiModel):
-    items: list[CatalogImportRead]
-    total: int
-    limit: int
-    offset: int
-
-
 class CatalogImportErrorRead(ApiModel):
     id: uuid.UUID
     import_id: uuid.UUID

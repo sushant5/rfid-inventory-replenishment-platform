@@ -1,10 +1,13 @@
 flowchart LR
     subgraph Demo[Submitted hosted scope]
-        Reviewer[Reviewer / Swagger] -->|JWT or platform key| API[FastAPI API]
+        Reviewer[Reviewer / Swagger] -->|JWT| API[FastAPI API]
+        Platform[Platform onboarding operator] -->|platform key| API
         Gateway[RFID gateway] -->|device token + batches| API
 
         API -->|tenant-scoped transactions| PG[(PostgreSQL 17 + RLS)]
-        Catalog[Catalog worker] -->|validate staging + atomic promotion| PG
+        API -->|immutable catalog source + durable job| PG
+        PG -->|accepted import| Catalog[Catalog worker]
+        Catalog -->|validate staging + atomic promotion| PG
 
         API -->|event ledger + durable inbox| PG
         PG --> Events[Event worker]

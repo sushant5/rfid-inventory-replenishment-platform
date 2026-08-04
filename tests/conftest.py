@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
-from fastapi import APIRouter
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import make_url
@@ -54,7 +53,7 @@ def _validated_test_app_database_url() -> str:
     return TEST_APP_DATABASE_URL
 
 
-def _reset_public_schema(engine: Engine) -> None:
+def _reset_test_schemas(engine: Engine) -> None:
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         actual_database = str(connection.scalar(text("SELECT current_database()")) or "")
         if "test" not in actual_database.lower():
@@ -62,6 +61,10 @@ def _reset_public_schema(engine: Engine) -> None:
                 "Refusing to reset PostgreSQL schema: connected database name "
                 f"{actual_database!r} does not contain 'test'."
             )
+        # Migration round-trip checks intentionally leave retired compatibility
+        # tables outside public. A test session must start from a clean database,
+        # while the production migration keeps its fail-closed CREATE SCHEMA.
+        connection.execute(text("DROP SCHEMA IF EXISTS retired_compatibility CASCADE"))
         connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
         connection.execute(text("CREATE SCHEMA public"))
 
@@ -70,7 +73,7 @@ def _reset_public_schema(engine: Engine) -> None:
 def postgres_engine() -> Generator[Engine]:
     database_url = _validated_test_database_url()
     engine = create_engine(database_url, pool_pre_ping=True)
-    _reset_public_schema(engine)
+    _reset_test_schemas(engine)
 
     project_root = Path(__file__).resolve().parents[1]
     alembic_config = Config(str(project_root / "alembic.ini"))
@@ -134,34 +137,3 @@ def api_client(
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as client:
         yield client
-
-
-@pytest.fixture
-def compatibility_api_client(
-    application_session_factory: sessionmaker[Session],
-) -> Generator[TestClient]:
-    from abacus.api.routes.catalog import router as catalog_fixture_router
-    from abacus.api.routes.onboarding import router as onboarding_fixture_router
-    from abacus.api.routes.replenishment import router as replenishment_fixture_router
-    from abacus.api.routes.rfid import device_router as rfid_device_fixture_router
-    from abacus.api.routes.rfid import platform_router as rfid_platform_fixture_router
-    from abacus.db import get_db
-    from abacus.main import create_app
-
-    def override_get_db() -> Generator[Session]:
-        with application_session_factory() as session:
-            yield session
-
-    fixture_router = APIRouter()
-    fixture_router.include_router(onboarding_fixture_router, include_in_schema=False)
-    fixture_router.include_router(catalog_fixture_router, include_in_schema=False)
-    fixture_router.include_router(rfid_device_fixture_router, include_in_schema=False)
-    fixture_router.include_router(rfid_platform_fixture_router, include_in_schema=False)
-    fixture_router.include_router(replenishment_fixture_router, include_in_schema=False)
-
-    app = create_app()
-    app.include_router(fixture_router)
-    app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as client:
-        yield client
-    app.dependency_overrides.clear()

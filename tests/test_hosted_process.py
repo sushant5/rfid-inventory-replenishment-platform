@@ -34,8 +34,31 @@ def test_hosted_port_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_hosted_startup_runs_checked_command(monkeypatch: pytest.MonkeyPatch) -> None:
     run = MagicMock()
     monkeypatch.setattr("abacus.processes.hosted.subprocess.run", run)
-    hosted._run_startup(("python", "-m", "alembic"), "migration-test")
-    run.assert_called_once_with(["python", "-m", "alembic"], check=True)
+    environment = {"DATABASE_URL": "runtime", "MIGRATION_DATABASE_URL": "owner"}
+    hosted._run_startup(
+        ("python", "-m", "alembic"),
+        "migration-test",
+        environment=environment,
+    )
+    run.assert_called_once_with(
+        ["python", "-m", "alembic"],
+        check=True,
+        env=environment,
+    )
+
+
+def test_hosted_runtime_environment_removes_only_migration_credential() -> None:
+    startup_environment = {
+        "DATABASE_URL": "runtime",
+        "MIGRATION_DATABASE_URL": "owner",
+        "JWT_SECRET": "secret",
+    }
+
+    assert hosted._runtime_environment(startup_environment) == {
+        "DATABASE_URL": "runtime",
+        "JWT_SECRET": "secret",
+    }
+    assert startup_environment["MIGRATION_DATABASE_URL"] == "owner"
 
 
 def test_hosted_terminate_kills_child_that_ignores_graceful_stop() -> None:
@@ -58,6 +81,8 @@ def test_hosted_run_supervises_children_and_handles_shutdown(
     handlers: dict[int, Callable[[int, object], None]] = {}
 
     monkeypatch.setattr(hosted, "_run_startup", startup)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://runtime")
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql+psycopg://owner")
     monkeypatch.setattr(hosted, "_port", lambda: "8123")
     monkeypatch.setattr("abacus.processes.hosted.subprocess.Popen", launch)
     monkeypatch.setattr(
@@ -71,9 +96,18 @@ def test_hosted_run_supervises_children_and_handles_shutdown(
 
     assert hosted.run() == 0
     assert startup.call_count == 3
+    assert (
+        startup.call_args_list[0].kwargs["environment"]["MIGRATION_DATABASE_URL"].endswith("owner")
+    )
+    for startup_call in startup.call_args_list[1:]:
+        assert "MIGRATION_DATABASE_URL" not in startup_call.kwargs["environment"]
     assert startup.call_args_list[1].args[0][-1] == "bootstrap-admin"
     assert startup.call_args_list[2].args[0][-1] == "bootstrap-public-reviewer"
     assert launch.call_count == 3
+    for launch_call in launch.call_args_list:
+        assert launch_call.kwargs["env"]["DATABASE_URL"].endswith("runtime")
+        assert "MIGRATION_DATABASE_URL" not in launch_call.kwargs["env"]
+    assert "MIGRATION_DATABASE_URL" not in hosted.os.environ
     api_command = launch.call_args_list[-1].args[0]
     assert api_command[api_command.index("--port") + 1] == "8123"
     assert api_command[-3:] == ("--proxy-headers", "--forwarded-allow-ips", "*")
@@ -85,14 +119,17 @@ def test_hosted_run_propagates_unexpected_child_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     processes = [_process_mock(return_code=7), _process_mock(), _process_mock()]
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql+psycopg://owner")
     monkeypatch.setattr(hosted, "_run_startup", MagicMock())
+    launch = MagicMock(side_effect=processes)
     monkeypatch.setattr(
         "abacus.processes.hosted.subprocess.Popen",
-        MagicMock(side_effect=processes),
+        launch,
     )
     monkeypatch.setattr("abacus.processes.hosted.signal.signal", MagicMock())
 
     assert hosted.run() == 7
+    assert all("MIGRATION_DATABASE_URL" not in call.kwargs["env"] for call in launch.call_args_list)
     processes[0].terminate.assert_not_called()
     processes[1].terminate.assert_called_once_with()
     processes[2].terminate.assert_called_once_with()

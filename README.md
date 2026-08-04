@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.6.1` on Render with PostgreSQL 16. Render may need
+The hosted demo runs release `0.7.0` on Render with PostgreSQL 16. Render may need
 about a minute to wake the free web service after inactivity.
 
 Public reviewer login:
@@ -64,9 +64,10 @@ the script discovers the current public login from `GET /`:
 python scripts/public_demo_smoke.py
 ```
 
-The platform key, tenant-admin login, and device credentials stay private. They permit
-tenant provisioning, catalog mutation, identity administration, or RFID ingestion and
-are not needed to inspect the hosted API. The repository owner can run the full
+The platform key, tenant-admin login, and device credentials stay private. The platform
+key is limited to platform-led tenant/store onboarding; the tenant administrator owns
+catalog and identity changes, and device credentials permit RFID ingestion. None are
+needed to inspect the hosted API. The repository owner can run the full
 write-path walkthrough with those credentials through `scripts/run_architecture_demo.py`.
 
 The hosted database is preseeded. Startup intentionally reconciles identities but does
@@ -131,8 +132,12 @@ The three deployable processes share one image and codebase:
 3. Durable RFID/inventory event worker
 
 PostgreSQL is the system of record and durable work inbox for the hosted deployment.
-Parsed catalog rows remain in staging until validation succeeds. Kafka-compatible
-streaming and S3 source-file retention are production extensions, not demo dependencies.
+The catalog API atomically stores an immutable source file and durable job, then returns
+`202`; the catalog worker performs parsing, conflict validation, staging, and atomic
+promotion. The hosted scope retains files up to 10 MiB in PostgreSQL so a worker crash
+cannot lose accepted work. Production replaces that byte column with versioned S3
+storage while preserving the checksum and job contract. Kafka-compatible streaming is
+also a production extension, not a demo dependency.
 
 ## Correctness and failure handling
 
@@ -159,11 +164,14 @@ streaming and S3 source-file retention are production extensions, not demo depen
   transition IDs, and unique delta IDs make retries safe; no exactly-once claim is made.
 - Item state and its inventory-transition outbox commit in one transaction. The event
   worker deduplicates each delta before updating derived bucket counts.
+- Projection transitions commit independently. After `WORKER_MAX_ATTEMPTS`, a poison
+  transition is retained as quarantined and affected stores report `DEGRADED`, which
+  suppresses automatic replenishment. The `abacus-cli rebuild-inventory-projection`
+  command reconstructs counts from current item state and closes the reconciliation
+  marker.
 - Repeated reads throttle `current_item_state` last-seen writes. The immutable event
   ledger provides the durable event-time watermark after a worker restart, so this
   optimization cannot allow a late event to regress state.
-- Projection counts are rebuildable from `current_item_state` with
-  `abacus-cli rebuild-inventory-projection --tenant-id …`.
 - Freshness is derived from heartbeat age, live-event age, backlog drain, and reader
   coverage. It decays without needing another event. Non-live stores cannot trigger
   automatic replenishment or RFID timeout removals.
@@ -173,13 +181,13 @@ streaming and S3 source-file retention are production extensions, not demo depen
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.6.1`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.7.0`).
 
 The visible contract includes all required endpoints:
 
 - Onboarding: tenants, store imports, scoped store discovery, zones, devices
 - Catalog: create import, status, row errors, SKU discovery
-- RFID: submit batch, batch status, tenant-wide quarantine inspection
+- RFID: submit batch, batch status, tenant-wide quarantine inspection and recovery
 - Inventory: store projection, physical item state
 - Identity: create user, atomically replace access, replace roles/store assignments, current user
 - Replenishment: policy discovery/version/activation, evaluation, task list/lifecycle
@@ -265,9 +273,16 @@ tenant/store/SKU. The lifecycle is `OPEN → CLAIMED → IN_PROGRESS → COMPLET
 `CANCELED` and `EXPIRED` terminal alternatives.
 
 Quarantined RFID records expose their reason and original payload through
-`GET /v1/rfid/quarantine` to tenant-wide inventory readers. A terminal event ID is
-never silently reset: after remediation, the operator resubmits the physical
-observation with a new event ID so the original idempotency and audit trail remain intact.
+`GET /v1/rfid/quarantine` to tenant-wide inventory readers. The response derives each
+record's processing status and resolution time from the event ledger. A tenant
+administrator can request recovery with
+`POST /v1/rfid/quarantine/{quarantine_id}:replay`. Recovery reconstructs the immutable
+observation from that ledger and requeues the same event identity; repeated requests
+while it is pending or after it succeeds are no-ops. The original quarantine row remains
+as audit history, and event, transition, and delta uniqueness constraints prevent
+duplicate inventory. For `UNKNOWN_EPC`, explicit replay after a product-master
+correction may use the current active EPC binding because the master data arrived after
+the physical read; ordinary observations continue to use event-time bindings.
 
 ## Tests and utilities
 
@@ -275,7 +290,7 @@ observation with a new event ID so the original idempotency and audit trail rema
 python -m pytest
 ruff check .
 ruff format --check .
-mypy src scripts/run_architecture_demo.py scripts/rfid_simulator.py scripts/smoke_test.py scripts/generate_store_batch.py
+mypy src scripts/run_architecture_demo.py scripts/rfid_simulator.py scripts/smoke_test.py scripts/public_demo_smoke.py scripts/generate_store_batch.py
 ```
 
 The suite covers RLS tenant isolation, store/corporate authorization, catalog
@@ -291,7 +306,7 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.6.1 --expected-build-sha <release-sha> --expected-schema-revision a1d4e7b9c203
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.7.0 --expected-build-sha <release-sha> --expected-schema-revision e2f6a1b3c904
 ```
 
 ## Hosting
@@ -314,15 +329,19 @@ GRANT CONNECT ON DATABASE <database_name> TO abacus_app;
 Use the owner connection for `MIGRATION_DATABASE_URL` and construct `DATABASE_URL`
 with the new `abacus_app` credential. `/health/ready` rejects a production runtime
 connection that is not exactly this configured non-superuser, non-`BYPASSRLS` role.
+Compose supplies the owner URL only to its one-shot migration service. On the free
+hosted topology, the supervisor removes that URL before launching the API and workers,
+so long-running processes receive only the restricted runtime credential.
 
 Local Compose is free apart from the host machine. Hosted secrets must be supplied out
 of band. Create the application role before the first migration so Alembic can grant
 table, sequence, function, and RLS access. The Blueprint references database URLs as
 secrets instead of creating a provider-specific database. A free Render web instance
 sleeps when idle, so its workers sleep too; use a paid always-on instance for a more
-reliable reviewer URL. The free launcher must retain the owner URL to run migrations
-at startup because pre-deploy commands are paid-only. A production deployment keeps
-that credential out of the runtime container. Kafka/S3 can be added later without
+reliable reviewer URL. The free launcher uses the owner URL only during startup because
+pre-deploy commands are paid-only, then strips it from the API and worker environments.
+A production deployment moves migration into a separate release job so the owner
+credential never enters the runtime container. Kafka/S3 can be added later without
 changing the item-state, transition-ID, delta-ID, or projection contracts.
 
 Kubernetes, Flink, regional cells, DynamoDB, enterprise OIDC/SAML/SCIM, X.509 device

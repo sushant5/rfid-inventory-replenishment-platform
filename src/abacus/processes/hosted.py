@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import structlog
 
@@ -33,10 +33,23 @@ def _port() -> str:
     return str(value)
 
 
-def _run_startup(command: Sequence[str], name: str) -> None:
+def _run_startup(
+    command: Sequence[str],
+    name: str,
+    *,
+    environment: Mapping[str, str],
+) -> None:
     logger.info("hosted_startup_step_started", step=name)
-    subprocess.run(list(command), check=True)  # noqa: S603
+    subprocess.run(list(command), check=True, env=dict(environment))  # noqa: S603
     logger.info("hosted_startup_step_completed", step=name)
+
+
+def _runtime_environment(startup_environment: Mapping[str, str]) -> dict[str, str]:
+    """Return a child environment without the migration-owner credential."""
+
+    environment = dict(startup_environment)
+    environment.pop("MIGRATION_DATABASE_URL", None)
+    return environment
 
 
 def _terminate(children: Sequence[subprocess.Popen[bytes]]) -> None:
@@ -58,11 +71,27 @@ def run() -> int:
     """Run migrations, seed the reviewer login, and supervise all demo processes."""
 
     executable = sys.executable
-    _run_startup((executable, "-m", "alembic", "upgrade", "head"), "migrations")
-    _run_startup((executable, "-m", "abacus.cli", "bootstrap-admin"), "reviewer_seed")
+    startup_environment = dict(os.environ)
+    _run_startup(
+        (executable, "-m", "alembic", "upgrade", "head"),
+        "migrations",
+        environment=startup_environment,
+    )
+
+    # Nothing after Alembic needs the database-owner credential. Remove it from
+    # both the supervisor and every subsequent child environment immediately.
+    os.environ.pop("MIGRATION_DATABASE_URL", None)
+    runtime_environment = _runtime_environment(startup_environment)
+    del startup_environment
+    _run_startup(
+        (executable, "-m", "abacus.cli", "bootstrap-admin"),
+        "reviewer_seed",
+        environment=runtime_environment,
+    )
     _run_startup(
         (executable, "-m", "abacus.cli", "bootstrap-public-reviewer"),
         "public_reviewer_seed",
+        environment=runtime_environment,
     )
 
     commands = (
@@ -95,7 +124,9 @@ def run() -> int:
 
     try:
         for launch_command in commands:
-            children.append(subprocess.Popen(launch_command))  # noqa: S603
+            children.append(
+                subprocess.Popen(launch_command, env=runtime_environment)  # noqa: S603
+            )
         while not stop_requested:
             for watched_command, child in zip(commands, children, strict=True):
                 return_code = child.poll()

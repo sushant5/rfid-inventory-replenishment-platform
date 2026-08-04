@@ -40,7 +40,6 @@ class ReadinessResponse(HealthResponse):
     database: Literal["ok"] = "ok"
     schema_revision: str
     restricted_database_role: bool
-    cutover_ready: bool
 
 
 class VersionResponse(BaseModel):
@@ -101,30 +100,9 @@ async def readiness(db: Annotated[Session, Depends(get_db)]) -> ReadinessRespons
             "The database schema is not at the required application revision.",
             code="schema_not_ready",
         )
-    try:
-        # The runtime role has no tenant context during a global readiness check.
-        # This narrow SECURITY DEFINER function can see every cutover row without
-        # granting the application a general RLS bypass.
-        cutover_ready = db.scalar(text("SELECT app_cutover_ready()"))
-    except SQLAlchemyError as exc:
-        db.rollback()
-        raise ApiError(
-            503,
-            "Service unavailable",
-            "The database is unavailable.",
-            code="database_not_ready",
-        ) from exc
-    if cutover_ready is not True:
-        raise ApiError(
-            503,
-            "Cutover reconciliation required",
-            "Legacy replenishment movement must be reconciled before serving traffic.",
-            code="cutover_reconciliation_required",
-        )
     return ReadinessResponse(
         schema_revision=schema_revision,
         restricted_database_role=runtime_role_ready,
-        cutover_ready=cutover_ready,
     )
 
 

@@ -11,8 +11,8 @@ from abacus.main import (
     PUBLIC_DEMO_TENANT,
     create_app,
 )
-from abacus.schemas.architecture import CanonicalObservationBatchCreate
-from abacus.schemas.canonical_replenishment import PolicyCreate
+from abacus.schemas.architecture import ObservationBatchCreate
+from abacus.schemas.replenishment import PolicyCreate
 from abacus.schemas.tenancy import BulkStoreOnboardingRequest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +46,7 @@ def test_assignment_sized_store_fixture_is_valid_and_deterministic() -> None:
 
 def test_checked_in_examples_match_the_public_request_schemas() -> None:
     PolicyCreate.model_validate(json.loads((ROOT / "examples" / "policies.json").read_text()))
-    CanonicalObservationBatchCreate.model_validate(
+    ObservationBatchCreate.model_validate(
         json.loads((ROOT / "examples" / "rfid-batch.json").read_text())
     )
     BulkStoreOnboardingRequest.model_validate(
@@ -62,7 +62,7 @@ def test_openapi_contains_the_submission_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.6.1"
+    assert __version__ == "0.7.0"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",
@@ -86,6 +86,10 @@ def test_openapi_contains_the_submission_contract() -> None:
             "/v1/rfid/observation-batches/{batch_id}",
         ): "getRfidObservationBatch",
         ("get", "/v1/rfid/quarantine"): "listRfidQuarantine",
+        (
+            "post",
+            "/v1/rfid/quarantine/{quarantine_id}:replay",
+        ): "replayRfidQuarantine",
         ("get", "/v1/stores/{store_id}/inventory"): "getStoreInventory",
         ("get", "/v1/items/{epc}"): "getCurrentItemState",
         ("post", "/v1/users"): "createUser",
@@ -158,14 +162,14 @@ def test_openapi_contains_the_submission_contract() -> None:
     for path, method in (
         ("/v1/tenants", "post"),
         ("/v1/tenants/{tenant_id}/store-imports", "post"),
-        ("/v1/tenants/{tenant_id}/catalog-imports", "post"),
-        ("/v1/catalog-imports/{import_id}", "get"),
-        ("/v1/catalog-imports/{import_id}/errors", "get"),
     ):
         assert paths[path][method]["security"] == [{"PlatformApiKey": []}]
     for path, method in (
         ("/v1/me", "get"),
         ("/v1/stores", "get"),
+        ("/v1/tenants/{tenant_id}/catalog-imports", "post"),
+        ("/v1/catalog-imports/{import_id}", "get"),
+        ("/v1/catalog-imports/{import_id}/errors", "get"),
         ("/v1/skus", "get"),
         ("/v1/skus/{sku_id}", "get"),
         ("/v1/stores/{store_id}/devices", "get"),

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
-from sqlalchemy import delete, func, literal, or_, select, text
+from sqlalchemy import delete, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.selectable import Subquery
@@ -173,6 +173,11 @@ class RecentObservationState:
             self._event_ids.popitem(last=False)
         return True
 
+    def forget_event(self, event: RfidObservationEvent) -> None:
+        """Allow an explicit operator replay to rebuild evidence for one event."""
+
+        self._event_ids.pop((event.tenant_id, event.event_id), None)
+
     def add(
         self, event: RfidObservationEvent, window_seconds: int
     ) -> tuple[RfidObservationEvent, ...]:
@@ -326,6 +331,8 @@ def effective_freshness(
         or live_event_age > settings.connectivity_stale_window_seconds
     ):
         return FreshnessStatus.STALE
+    if connectivity.inventory_reconciliation_required_at is not None:
+        return FreshnessStatus.DEGRADED
     if (
         connectivity.reader_coverage_ok
         and heartbeat_age <= settings.connectivity_live_window_seconds
@@ -595,31 +602,7 @@ def _advance_batch(
                 batch.status = ObservationBatchStatus.PROCESSING
         return
 
-    # Compatibility for legacy/unit paths created before the durable event ledger.
-    batch = db.scalar(
-        select(RfidObservationBatch)
-        .where(
-            RfidObservationBatch.id == event.batch_id,
-            RfidObservationBatch.tenant_id == event.tenant_id,
-        )
-        .with_for_update()
-    )
-    if batch is None:
-        raise ValueError("RFID batch does not exist")
-    if batch.processed_count + batch.rejected_count < batch.accepted_count:
-        if rejected:
-            batch.rejected_count += 1
-        else:
-            batch.processed_count += 1
-    if batch.processed_count + batch.rejected_count == batch.accepted_count:
-        batch.status = (
-            ObservationBatchStatus.COMPLETED_WITH_ERRORS
-            if batch.rejected_count
-            else ObservationBatchStatus.COMPLETED
-        )
-        batch.completed_at = event.received_at
-    else:
-        batch.status = ObservationBatchStatus.PROCESSING
+    raise ValueError("RFID event ledger does not exist")
 
 
 def process_observation(
@@ -630,6 +613,12 @@ def process_observation(
 ) -> ProcessingResult:
     """Apply one partition-ordered observation and emit an outbox transition."""
 
+    if event.replayed_from_quarantine_id is not None:
+        # A terminally quarantined event has already passed through this process's
+        # bounded in-memory dedupe set. The durable ledger remains the authoritative
+        # idempotency boundary; an explicit recovery request may therefore release
+        # only this process-local marker before retrying the immutable event.
+        recent.forget_event(event)
     if not recent.remember_event(event):
         _advance_batch(db, event, rejected=False, disposition="DUPLICATE")
         return ProcessingResult("DUPLICATE")
@@ -666,6 +655,30 @@ def process_observation(
         .order_by(EpcBinding.effective_from.desc())
         .limit(1)
     )
+    if binding is None and event.replayed_from_quarantine_id is not None:
+        quarantine = db.scalar(
+            select(RfidQuarantine).where(
+                RfidQuarantine.id == event.replayed_from_quarantine_id,
+                RfidQuarantine.tenant_id == event.tenant_id,
+                RfidQuarantine.event_id == event.event_id,
+                RfidQuarantine.reason == "UNKNOWN_EPC",
+            )
+        )
+        if quarantine is not None:
+            # Product-master data may legitimately arrive after a physical read.
+            # The explicit replay is the operator's authorization to use the current
+            # active binding while retaining the observation's original event time.
+            binding = db.scalar(
+                select(EpcBinding)
+                .where(
+                    EpcBinding.tenant_id == event.tenant_id,
+                    EpcBinding.epc == event.epc,
+                    EpcBinding.effective_from <= datetime.now(UTC),
+                    EpcBinding.effective_to.is_(None),
+                )
+                .order_by(EpcBinding.effective_from.desc())
+                .limit(1)
+            )
     if binding is None:
         return _quarantine(db, event, reason="UNKNOWN_EPC")
 
@@ -973,6 +986,7 @@ def rebuild_inventory_projection(db: Session, tenant_id: uuid.UUID) -> int:
         .where(
             InventoryTransitionOutbox.tenant_id == tenant_id,
             InventoryTransitionOutbox.published_at.is_(None),
+            InventoryTransitionOutbox.quarantined_at.is_(None),
         )
     )
     if pending_before:
@@ -1028,10 +1042,26 @@ def rebuild_inventory_projection(db: Session, tenant_id: uuid.UUID) -> int:
         .where(
             InventoryTransitionOutbox.tenant_id == tenant_id,
             InventoryTransitionOutbox.published_at.is_(None),
+            InventoryTransitionOutbox.quarantined_at.is_(None),
         )
     )
     if pending_after:
         raise RuntimeError(
             "an inventory transition arrived during projection rebuild; retry after draining"
         )
+    reconciled_at = datetime.now(UTC)
+    db.execute(
+        update(InventoryTransitionOutbox)
+        .where(
+            InventoryTransitionOutbox.tenant_id == tenant_id,
+            InventoryTransitionOutbox.quarantined_at.is_not(None),
+            InventoryTransitionOutbox.reconciled_at.is_(None),
+        )
+        .values(reconciled_at=reconciled_at)
+    )
+    db.execute(
+        update(StoreConnectivity)
+        .where(StoreConnectivity.tenant_id == tenant_id)
+        .values(inventory_reconciliation_required_at=None)
+    )
     return len(rows)

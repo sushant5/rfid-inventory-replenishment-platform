@@ -23,7 +23,6 @@ from abacus.models.tenancy import (
 )
 from abacus.schemas.tenancy import (
     BulkStoreOnboardingRequest,
-    DeviceAssignmentCreate,
     StoreDeviceCreate,
     TenantCreate,
     ZoneCreate,
@@ -435,17 +434,6 @@ def list_visible_stores(
     return stores, total
 
 
-def list_devices(db: Session, tenant_id: uuid.UUID) -> list[Device]:
-    if isinstance(db, TenantSession):
-        pin_session_to_tenant(db, tenant_id)
-    _get_tenant(db, tenant_id)
-    return list(
-        db.scalars(
-            select(Device).where(Device.tenant_id == tenant_id).order_by(Device.serial_number.asc())
-        ).all()
-    )
-
-
 def rotate_device_credential(
     db: Session,
     tenant_id: uuid.UUID,
@@ -461,140 +449,3 @@ def rotate_device_credential(
     device.credential_hash = hashlib.sha256(secret.encode()).hexdigest()
     db.commit()
     return f"{device.id}.{secret}"
-
-
-def assign_device(
-    db: Session,
-    tenant_id: uuid.UUID,
-    device_id: uuid.UUID,
-    request: DeviceAssignmentCreate,
-) -> DeviceAssignment:
-    if isinstance(db, TenantSession):
-        pin_session_to_tenant(db, tenant_id)
-    device = db.scalar(
-        select(Device)
-        .where(Device.id == device_id, Device.tenant_id == tenant_id)
-        .with_for_update()
-    )
-    if device is None:
-        raise ApiError(404, "Device not found", "The requested device does not exist.")
-    zone = db.scalar(
-        select(Zone).where(
-            Zone.id == request.zone_id,
-            Zone.tenant_id == tenant_id,
-            Zone.store_id == request.store_id,
-        )
-    )
-    if zone is None:
-        raise ApiError(
-            422,
-            "Invalid assignment location",
-            "The zone and store must belong to the requested tenant and to each other.",
-            code="invalid_device_assignment_location",
-        )
-
-    current = db.scalar(
-        select(DeviceAssignment)
-        .where(
-            DeviceAssignment.tenant_id == tenant_id,
-            DeviceAssignment.device_id == device_id,
-            DeviceAssignment.effective_to.is_(None),
-        )
-        .with_for_update()
-    )
-    if (
-        current is not None
-        and current.store_id == request.store_id
-        and current.zone_id == request.zone_id
-    ):
-        if request.effective_from < current.effective_from:
-            previous = db.scalar(
-                select(DeviceAssignment)
-                .where(
-                    DeviceAssignment.tenant_id == tenant_id,
-                    DeviceAssignment.device_id == device_id,
-                    DeviceAssignment.id != current.id,
-                    DeviceAssignment.effective_to.is_not(None),
-                )
-                .order_by(DeviceAssignment.effective_to.desc())
-                .limit(1)
-            )
-            if (
-                previous is not None
-                and previous.effective_to is not None
-                and request.effective_from < previous.effective_to
-            ):
-                raise ApiError(
-                    409,
-                    "Invalid assignment interval",
-                    "The backdated assignment would overlap assignment history.",
-                    code="device_assignment_interval_conflict",
-                )
-            current.effective_from = request.effective_from
-            try:
-                db.commit()
-            except IntegrityError as exc:
-                db.rollback()
-                raise ApiError(
-                    409,
-                    "Device assignment conflict",
-                    "The assignment overlaps existing assignment history.",
-                    code="device_assignment_conflict",
-                ) from exc
-            db.refresh(current)
-        return current
-    if current is not None:
-        if request.effective_from <= current.effective_from:
-            raise ApiError(
-                409,
-                "Invalid assignment interval",
-                "A reassignment must start after the current assignment starts.",
-                code="device_assignment_interval_conflict",
-            )
-        current.effective_to = request.effective_from
-        db.flush()
-
-    assignment = DeviceAssignment(
-        tenant_id=tenant_id,
-        device_id=device_id,
-        store_id=request.store_id,
-        zone_id=request.zone_id,
-        effective_from=request.effective_from,
-    )
-    db.add(assignment)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise ApiError(
-            409,
-            "Device assignment conflict",
-            "The assignment conflicted with another active assignment.",
-            code="device_assignment_conflict",
-        ) from exc
-    db.refresh(assignment)
-    return assignment
-
-
-def list_device_assignments(
-    db: Session,
-    tenant_id: uuid.UUID,
-    device_id: uuid.UUID,
-) -> list[DeviceAssignment]:
-    if isinstance(db, TenantSession):
-        pin_session_to_tenant(db, tenant_id)
-    device_exists = db.scalar(
-        select(Device.id).where(Device.id == device_id, Device.tenant_id == tenant_id)
-    )
-    if device_exists is None:
-        raise ApiError(404, "Device not found", "The requested device does not exist.")
-    return list(
-        db.scalars(
-            select(DeviceAssignment)
-            .where(
-                DeviceAssignment.tenant_id == tenant_id,
-                DeviceAssignment.device_id == device_id,
-            )
-            .order_by(DeviceAssignment.effective_from.desc())
-        ).all()
-    )
