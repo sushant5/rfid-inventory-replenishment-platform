@@ -378,11 +378,14 @@ def bootstrap_public_reviewer(
         changes.append("status_reactivated")
         invalidate_tokens = True
 
-    password_matches, _replacement_hash = verify_password_and_update(password, user.password_hash)
+    password_matches, replacement_hash = verify_password_and_update(password, user.password_hash)
     if not password_matches:
         user.password_hash = hash_password(password)
         changes.append("password_rotated")
         invalidate_tokens = True
+    elif replacement_hash is not None and replacement_hash != user.password_hash:
+        user.password_hash = replacement_hash
+        changes.append("password_hash_upgraded")
     if roles != expected_roles:
         _persist_role_rows(db, tenant.id, user.id, expected_roles)
         changes.append("roles_reconciled")

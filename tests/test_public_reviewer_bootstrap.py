@@ -4,9 +4,12 @@ import json
 import uuid
 
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from pwdlib import PasswordHash
+from pwdlib.hashers.argon2 import Argon2Hasher
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from abacus.db import TENANT_CONTEXT_KEY, TenantSession
 from abacus.enums import StoreStatus, TenantStatus
 from abacus.models.architecture import (
     CanonicalIdentityRole,
@@ -272,3 +275,124 @@ def test_public_reviewer_password_rotation_invalidates_existing_jwt(
         json={"tenant_code": tenant_code, "email": email, "password": new_password},
     )
     assert new_login.status_code == 200
+
+
+def test_public_reviewer_upgrades_password_hash_without_invalidating_token(
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    suffix = uuid.uuid4().hex[:10]
+    tenant_code = f"rehash-{suffix}"
+    email = f"viewer-{suffix}@orange.example"
+    password = "Orange-Rehash-ReadOnly-1!"
+    request = _request(email=email, password=password)
+    outdated_hash = PasswordHash(
+        (Argon2Hasher(time_cost=1, memory_cost=8192, parallelism=1),)
+    ).hash(password)
+
+    with postgres_session_factory() as db:
+        tenant = _create_tenant(db, code=tenant_code)
+        created = bootstrap_public_reviewer(db, tenant_code=tenant_code, request=request)
+        created.user.password_hash = outdated_hash
+        db.commit()
+        original_token_version = created.user.token_version
+        original_audit_count = db.scalar(
+            select(func.count(IdentityAuditRecord.id)).where(
+                IdentityAuditRecord.tenant_id == tenant.id,
+                IdentityAuditRecord.target_user_id == created.user.id,
+            )
+        )
+
+        upgraded = bootstrap_public_reviewer(db, tenant_code=tenant_code, request=request)
+
+        assert upgraded.user.password_hash != outdated_hash
+        assert upgraded.user.token_version == original_token_version
+        assert verify_password_and_update(password, upgraded.user.password_hash) == (True, None)
+        upgraded_hash = upgraded.user.password_hash
+        upgrade_audit = db.scalar(
+            select(IdentityAuditRecord)
+            .where(
+                IdentityAuditRecord.tenant_id == tenant.id,
+                IdentityAuditRecord.target_user_id == created.user.id,
+            )
+            .order_by(IdentityAuditRecord.occurred_at.desc(), IdentityAuditRecord.id.desc())
+            .limit(1)
+        )
+        assert upgrade_audit is not None
+        assert upgrade_audit.details["changes"] == ["password_hash_upgraded"]
+        assert upgrade_audit.details["new_token_version"] == original_token_version
+        assert (
+            db.scalar(
+                select(func.count(IdentityAuditRecord.id)).where(
+                    IdentityAuditRecord.tenant_id == tenant.id,
+                    IdentityAuditRecord.target_user_id == created.user.id,
+                )
+            )
+            == original_audit_count + 1
+        )
+
+        unchanged = bootstrap_public_reviewer(db, tenant_code=tenant_code, request=request)
+        assert unchanged.user.password_hash == upgraded_hash
+        assert unchanged.user.token_version == original_token_version
+        assert (
+            db.scalar(
+                select(func.count(IdentityAuditRecord.id)).where(
+                    IdentityAuditRecord.tenant_id == tenant.id,
+                    IdentityAuditRecord.target_user_id == created.user.id,
+                )
+            )
+            == original_audit_count + 1
+        )
+
+
+def test_public_reviewer_bootstrap_uses_restricted_tenant_session(
+    postgres_session_factory: sessionmaker[Session],
+    application_session_factory: sessionmaker[Session],
+) -> None:
+    suffix = uuid.uuid4().hex[:10]
+    tenant_code = f"restricted-{suffix}"
+    email = f"viewer-{suffix}@orange.example"
+    password = "Orange-Restricted-ReadOnly-1!"
+
+    with postgres_session_factory() as owner_db:
+        tenant = _create_tenant(owner_db, code=tenant_code)
+
+    with application_session_factory() as db:
+        assert isinstance(db, TenantSession)
+        reviewer = bootstrap_public_reviewer(
+            db,
+            tenant_code=tenant_code,
+            request=_request(email=email, password=password),
+        )
+
+        assert db.info[TENANT_CONTEXT_KEY] == tenant.id
+        assert db.scalar(text("SELECT current_setting('app.tenant_id')")) == str(tenant.id)
+        assert reviewer.user.tenant_id == tenant.id
+        assert reviewer.user.status is UserStatus.ACTIVE
+        assert reviewer.roles == (CanonicalIdentityRole.CORPORATE_USER,)
+        assert reviewer.store_ids == ()
+        assert set(
+            db.scalars(
+                select(UserRole.role).where(
+                    UserRole.tenant_id == tenant.id,
+                    UserRole.user_id == reviewer.user.id,
+                )
+            ).all()
+        ) == {CanonicalIdentityRole.CORPORATE_USER}
+        assert (
+            db.scalar(
+                select(func.count(UserStoreAssignment.user_id)).where(
+                    UserStoreAssignment.tenant_id == tenant.id,
+                    UserStoreAssignment.user_id == reviewer.user.id,
+                )
+            )
+            == 0
+        )
+        assert (
+            db.scalar(
+                select(func.count(UserAccessGrant.id)).where(
+                    UserAccessGrant.tenant_id == tenant.id,
+                    UserAccessGrant.user_id == reviewer.user.id,
+                )
+            )
+            == 0
+        )
