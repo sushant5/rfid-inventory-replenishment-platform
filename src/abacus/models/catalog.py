@@ -181,7 +181,7 @@ class CatalogImport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class CatalogImportSource(Base):
-    """Immutable hosted-demo copy of the exact uploaded catalog bytes."""
+    """Immutable source payload retained for asynchronous catalog processing."""
 
     __tablename__ = "catalog_import_sources"
     __table_args__ = (

@@ -1,4 +1,4 @@
-# Free hosted-demo topology: one supervised web container runs the same API and two
+# Free-plan hosted topology: one supervised web container runs the same API and two
 # worker entry points that Docker Compose runs separately. The launcher performs
 # migrations because Render pre-deploy commands and background workers are paid-only.
 # The launcher strips the owner credential from every long-running child environment.
@@ -6,7 +6,7 @@
 # so the owner credential never enters the application container.
 services:
   - type: web
-    name: abacus-take-home-api
+    name: abacus-inventory-api
     runtime: docker
     plan: free
     region: oregon
@@ -35,7 +35,7 @@ services:
       - key: BOOTSTRAP_ADMIN_EMAIL
         value: reviewer@orange.example
       - key: BOOTSTRAP_ADMIN_DISPLAY_NAME
-        value: Assignment Reviewer
+        value: Platform Administrator
       - key: BOOTSTRAP_ADMIN_PASSWORD
         sync: false
       - key: BOOTSTRAP_PUBLIC_REVIEWER_ENABLED

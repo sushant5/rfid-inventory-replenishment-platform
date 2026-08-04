@@ -1,7 +1,7 @@
-"""Supervise the complete demo topology inside one hosted web container.
+"""Supervise the complete API topology inside one hosted web container.
 
-Docker Compose keeps the API and workers as independent processes. Some hosted
-hosting tiers provide only one free web process, so this launcher starts the same
+Docker Compose keeps the API and workers as independent processes. Some hosting
+tiers provide only one web process, so this launcher starts the same
 three entry points as children and treats any unexpected child exit as fatal.
 """
 
@@ -68,7 +68,7 @@ def _terminate(children: Sequence[subprocess.Popen[bytes]]) -> None:
 
 
 def run() -> int:
-    """Run migrations, seed the reviewer login, and supervise all demo processes."""
+    """Run migrations, seed configured identities, and supervise all processes."""
 
     executable = sys.executable
     startup_environment = dict(os.environ)

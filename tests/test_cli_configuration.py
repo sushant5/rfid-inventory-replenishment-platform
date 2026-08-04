@@ -32,7 +32,7 @@ def test_bootstrap_settings_load_repository_env_file(
                 "BOOTSTRAP_TENANT_CODE=orange",
                 "BOOTSTRAP_TENANT_NAME=Orange",
                 "BOOTSTRAP_ADMIN_EMAIL=reviewer@orange.example",
-                "BOOTSTRAP_ADMIN_DISPLAY_NAME=Assignment Reviewer",
+                "BOOTSTRAP_ADMIN_DISPLAY_NAME=Platform Administrator",
                 "BOOTSTRAP_ADMIN_PASSWORD=a-strong-reviewer-password",
                 "BOOTSTRAP_PUBLIC_REVIEWER_ENABLED=true",
                 "BOOTSTRAP_PUBLIC_REVIEWER_EMAIL=demo-reader@orange.example",
@@ -48,7 +48,7 @@ def test_bootstrap_settings_load_repository_env_file(
     assert settings.bootstrap_tenant_code == "orange"
     assert settings.bootstrap_tenant_name == "Orange"
     assert settings.bootstrap_admin_email == "reviewer@orange.example"
-    assert settings.bootstrap_admin_display_name == "Assignment Reviewer"
+    assert settings.bootstrap_admin_display_name == "Platform Administrator"
     assert settings.bootstrap_admin_password == "a-strong-reviewer-password"
     assert settings.bootstrap_public_reviewer_enabled is True
     assert settings.bootstrap_public_reviewer_email == "demo-reader@orange.example"
@@ -64,7 +64,7 @@ def test_bootstrap_validation_error_does_not_echo_password(
     monkeypatch.setenv("BOOTSTRAP_TENANT_CODE", "orange")
     monkeypatch.setenv("BOOTSTRAP_TENANT_NAME", "Orange")
     monkeypatch.setenv("BOOTSTRAP_ADMIN_EMAIL", "reviewer@orange.example")
-    monkeypatch.setenv("BOOTSTRAP_ADMIN_DISPLAY_NAME", "Assignment Reviewer")
+    monkeypatch.setenv("BOOTSTRAP_ADMIN_DISPLAY_NAME", "Platform Administrator")
     monkeypatch.setenv("BOOTSTRAP_ADMIN_PASSWORD", rejected_password)
 
     assert main(["bootstrap-admin"]) == 2

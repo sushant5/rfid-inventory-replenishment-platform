@@ -1106,11 +1106,11 @@ def _sync_architecture_catalog_projection(
     catalog_import: CatalogImport,
     rows: list[CatalogRowData],
 ) -> None:
-    """Materialize the assignment-facing product hierarchy in the import transaction.
+    """Materialize the canonical product hierarchy in the import transaction.
 
     ProductStyle and SKU power catalog lookup, while effective-dated EpcBinding rows
     remain the event-time RFID source of truth. Product, ProductVariant, and RfidTag
-    expose the requested product hierarchy and its current tag projection. Updating
+    expose the product hierarchy and its current tag projection. Updating
     both representations in this transaction prevents a partially promoted catalog.
     """
 

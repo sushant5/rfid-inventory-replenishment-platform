@@ -44,7 +44,7 @@ def _store(number: int) -> dict[str, object]:
 
 
 def build_store_batch(count: int = 100) -> dict[str, object]:
-    """Build the assignment-sized payload for tests or command-line output."""
+    """Build a configurable store-import payload for tests or command-line output."""
 
     if not 1 <= count <= 500:
         raise ValueError("count must be between 1 and 500")

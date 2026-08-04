@@ -330,7 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--base-url",
-        default="https://abacus-take-home-api.onrender.com",
+        default="https://abacus-inventory-api.onrender.com",
     )
     parser.add_argument("--timeout", type=float, default=90.0)
     return parser

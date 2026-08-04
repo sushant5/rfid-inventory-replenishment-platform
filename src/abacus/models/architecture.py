@@ -594,7 +594,7 @@ class InventoryTransitionOutbox(Base):
 
 
 class BusinessEventType(StrEnum):
-    """Authoritative hosted-demo events that remove one physical item."""
+    """Authoritative events that remove one physical item from available inventory."""
 
     SALE = "SALE"
     TRANSFER_OUT = "TRANSFER_OUT"

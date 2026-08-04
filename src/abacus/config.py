@@ -37,7 +37,7 @@ class Settings(BaseSettings):
         default="local-development-secret-change-before-deploy",
         min_length=32,
     )
-    jwt_issuer: str = "abacus-assignment"
+    jwt_issuer: str = "abacus-platform"
     jwt_audience: str = "abacus-api"
     access_token_minutes: int = Field(default=15, ge=1, le=1440)
     login_throttle_enabled: bool = True

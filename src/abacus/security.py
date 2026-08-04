@@ -195,7 +195,7 @@ class LoginThrottle:
     An in-flight attempt reserves both budgets. Every completed authentication attempt
     remains in the source-IP budget, while only failed authentication remains in the
     normalized tenant/account budget. Reserving both counters under one lock prevents
-    concurrent requests from exceeding either limit in this single-service demo.
+    concurrent requests from exceeding either limit within one API process.
     """
 
     def __init__(
