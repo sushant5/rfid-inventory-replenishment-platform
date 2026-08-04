@@ -11,6 +11,13 @@ from abacus.schemas.common import ApiModel
 CODE_PATTERN = r"^[a-z0-9][a-z0-9_-]{1,63}$"
 
 
+def _normalize_non_blank(value: str, field_name: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} cannot be blank")
+    return normalized
+
+
 class TenantCreate(ApiModel):
     code: str = Field(min_length=2, max_length=64, pattern=CODE_PATTERN)
     name: str = Field(min_length=1, max_length=255)
@@ -19,6 +26,11 @@ class TenantCreate(ApiModel):
     @classmethod
     def normalize_code(cls, value: str) -> str:
         return value.strip().lower()
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return _normalize_non_blank(value, "name")
 
 
 class TenantRead(ApiModel):
@@ -45,6 +57,11 @@ class OrganizationUnitSegment(ApiModel):
     def normalize_type(cls, value: str) -> str:
         return value.strip().upper()
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return _normalize_non_blank(value, "name")
+
 
 class ZoneCreate(ApiModel):
     code: str = Field(min_length=2, max_length=64, pattern=CODE_PATTERN)
@@ -59,10 +76,7 @@ class ZoneCreate(ApiModel):
     @field_validator("name")
     @classmethod
     def normalize_name(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("name cannot be blank")
-        return normalized
+        return _normalize_non_blank(value, "name")
 
 
 class DeviceCreate(ApiModel):
@@ -83,6 +97,11 @@ class DeviceCreate(ApiModel):
     def normalize_zone_code(cls, value: str) -> str:
         return value.strip().lower()
 
+    @field_validator("display_name")
+    @classmethod
+    def normalize_display_name(cls, value: str) -> str:
+        return _normalize_non_blank(value, "display_name")
+
 
 class StoreDeviceCreate(ApiModel):
     """Register one device directly against a server-resolved store."""
@@ -102,10 +121,7 @@ class StoreDeviceCreate(ApiModel):
     @field_validator("display_name")
     @classmethod
     def normalize_display_name(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("display_name cannot be blank")
-        return normalized
+        return _normalize_non_blank(value, "display_name")
 
 
 class StoreCreate(ApiModel):
@@ -121,6 +137,11 @@ class StoreCreate(ApiModel):
     @classmethod
     def normalize_code(cls, value: str) -> str:
         return value.strip().lower()
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return _normalize_non_blank(value, "name")
 
     @field_validator("timezone")
     @classmethod

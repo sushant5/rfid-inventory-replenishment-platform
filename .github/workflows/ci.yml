@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17.6-alpine
         env:
           POSTGRES_DB: abacus_test
           POSTGRES_USER: abacus

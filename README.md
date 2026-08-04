@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.8.3` on Render with managed PostgreSQL. Render may need
+The hosted demo runs release `0.8.4` on Render with managed PostgreSQL. Render may need
 about a minute to wake the free web service after inactivity.
 
 Public reviewer login:
@@ -187,8 +187,11 @@ also a production extension, not a demo dependency.
   inventory: an old item becomes `UNOBSERVED`, remains counted, and loses confidence.
   Only an idempotent authoritative sale, transfer-out, or approved removal adjustment
   clears its location and emits `-1` through the same transactional outbox.
+- Connectivity writes are serialized per store and ordered by server receipt time, so
+  a delayed worker cannot replace newer backlog or reader-coverage status.
 - Role and store-scope changes are atomic, invalidate existing JWTs, and append an
-  audit record. The corresponding migration downgrade deliberately refuses to narrow
+  audit record. The runtime role can insert and read that audit trail but cannot update
+  or delete it. The corresponding migration downgrade deliberately refuses to narrow
   the action constraint after such records exist rather than discard audit history.
 - Catalog and identity writes still maintain their canonical and migration-compatibility
   representations in the same transaction. These are active cutover bridges, not a
@@ -196,7 +199,7 @@ also a production extension, not a demo dependency.
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.3`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.4`).
 
 The visible contract includes all required endpoints:
 
@@ -235,8 +238,12 @@ bounded `{items, total, limit, offset}` pages. SKU discovery accepts `active=ACT
 The sample catalog is [examples/catalog.csv](examples/catalog.csv). Required CSV
 columns are `style_code`, `style_name`, `sku`, `upc`, `color`, `size`, and `epc`;
 `style_attributes.category` enables category policies. Validation covers formats,
-duplicate EPCs, conflicting SKU/UPC mappings, and hierarchy consistency. The checksum
-plus idempotency key makes re-import safe.
+duplicate EPCs, conflicting SKU/UPC mappings, hierarchy consistency, and bounded
+finite attribute JSON. The checksum plus idempotency key makes re-import safe.
+
+Effective-dated device assignments and EPC bindings use the PostgreSQL clock. Stable-zone
+evidence is clipped at each binding boundary, so reads from an earlier catalog epoch
+cannot confirm a replacement SKU.
 
 The durable event record retains the logical partition key `tenant_id:epc`, so a future
 Kafka deployment can preserve per-item order without changing the event contract.
@@ -281,7 +288,8 @@ Active policy versions are immutable. Rule precedence is:
 Equal-specificity rules use explicit priority; equal-priority overlaps are rejected.
 Policy discovery returns the active version by default (or the latest draft before
 first activation for policy managers). Read-only roles see active policy only; policy
-managers may use the optional `status` filter for draft or retired versions.
+managers may use the optional `status` filter for draft or retired versions. Evaluation
+is allowed only after the store is active.
 Evaluation is per SKU/size and uses:
 
 ```text
@@ -349,7 +357,7 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.3 --expected-build-sha <release-sha> --expected-schema-revision a9d4e6f2b713
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.4 --expected-build-sha <release-sha> --expected-schema-revision d7a9b3e5f820
 ```
 
 ## Hosting

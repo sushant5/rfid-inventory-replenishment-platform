@@ -3,13 +3,14 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+import abacus.services.onboarding as onboarding_service
 from abacus.config import get_settings
 from abacus.enums import StoreStatus, TenantStatus, ZoneKind
 from abacus.models.architecture import (
@@ -27,12 +28,18 @@ from abacus.models.architecture import (
 )
 from abacus.models.catalog import ProductStyle, Sku
 from abacus.models.identity import IdentityAuditAction, User, UserStatus
-from abacus.models.tenancy import OnboardingBatch, Store, Tenant, Zone
+from abacus.models.tenancy import Device, DeviceAssignment, OnboardingBatch, Store, Tenant, Zone
 from abacus.processes import event_worker
 from abacus.security import create_access_token
 from abacus.services.streaming_inventory import RecentObservationState
 
 pytestmark = pytest.mark.integration
+
+
+class _SkewedProcessClock:
+    @staticmethod
+    def now(tz: tzinfo | None = None) -> datetime:
+        return datetime.now(tz) + timedelta(days=365)
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,8 +550,10 @@ def test_store_import_retry_is_idempotent_through_http_and_postgres(
     api_client: TestClient,
     postgres_session_factory: sessionmaker[Session],
     canonical_http_data: CanonicalHttpData,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store_code = f"imported-{uuid.uuid4().hex[:12]}"
+    device_serial = f"IMPORT-{uuid.uuid4().hex[:16]}".upper()
     idempotency_key = f"store-import-{uuid.uuid4()}"
     request = {
         "stores": [
@@ -556,7 +565,13 @@ def test_store_import_retry_is_idempotent_through_http_and_postgres(
                     {"code": "floor", "name": "Sales Floor", "kind": "SALES_FLOOR"},
                     {"code": "backroom", "name": "Backroom", "kind": "BACKROOM"},
                 ],
-                "devices": [],
+                "devices": [
+                    {
+                        "serial_number": device_serial,
+                        "display_name": "Imported floor reader",
+                        "zone_code": "floor",
+                    }
+                ],
                 "configuration": {},
             }
         ]
@@ -565,6 +580,11 @@ def test_store_import_retry_is_idempotent_through_http_and_postgres(
         "X-Platform-Key": get_settings().platform_api_key,
         "Idempotency-Key": idempotency_key,
     }
+
+    with postgres_session_factory() as db:
+        database_clock_before = db.scalar(select(func.clock_timestamp()))
+    assert database_clock_before is not None
+    monkeypatch.setattr(onboarding_service, "datetime", _SkewedProcessClock)
 
     first = api_client.post(
         f"/v1/tenants/{canonical_http_data.tenant_id}/store-imports",
@@ -582,6 +602,18 @@ def test_store_import_retry_is_idempotent_through_http_and_postgres(
     assert first.json()["status"] == "COMPLETED"
     assert (first.json()["succeeded_count"], first.json()["failed_count"]) == (1, 0)
     with postgres_session_factory() as db:
+        database_clock_after = db.scalar(select(func.clock_timestamp()))
+        assignment_effective_from = db.scalar(
+            select(DeviceAssignment.effective_from)
+            .join(Device, Device.id == DeviceAssignment.device_id)
+            .where(
+                DeviceAssignment.tenant_id == canonical_http_data.tenant_id,
+                Device.serial_number == device_serial,
+            )
+        )
+        assert database_clock_after is not None
+        assert assignment_effective_from is not None
+        assert database_clock_before <= assignment_effective_from <= database_clock_after
         assert (
             db.scalar(
                 select(func.count())

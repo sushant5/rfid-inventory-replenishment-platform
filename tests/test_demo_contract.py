@@ -64,7 +64,7 @@ def test_openapi_contains_public_api_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.8.3"
+    assert __version__ == "0.8.4"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",

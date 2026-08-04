@@ -147,3 +147,46 @@ def test_unhandled_error_is_generic_problem_detail_with_request_id() -> None:
         "request_id": "unhandled-contract-test",
     }
     assert "internal value" not in response.text
+
+
+def test_framework_not_found_is_problem_detail_with_request_id() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get(
+            "/v1/route-that-does-not-exist",
+            headers={"X-Request-ID": "not-found-contract-test"},
+        )
+
+    assert response.status_code == 404
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.headers["X-Request-ID"] == "not-found-contract-test"
+    assert response.json() == {
+        "type": "about:blank",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "Not Found",
+        "instance": "/v1/route-that-does-not-exist",
+        "code": "route_not_found",
+        "request_id": "not-found-contract-test",
+    }
+
+
+def test_framework_method_not_allowed_preserves_allow_header() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get(
+            "/v1/auth/login",
+            headers={"X-Request-ID": "method-contract-test"},
+        )
+
+    assert response.status_code == 405
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.headers["allow"] == "POST"
+    assert response.headers["X-Request-ID"] == "method-contract-test"
+    assert response.json() == {
+        "type": "about:blank",
+        "title": "Method Not Allowed",
+        "status": 405,
+        "detail": "Method Not Allowed",
+        "instance": "/v1/auth/login",
+        "code": "method_not_allowed",
+        "request_id": "method-contract-test",
+    }

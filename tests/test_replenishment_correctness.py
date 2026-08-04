@@ -382,6 +382,32 @@ def test_evaluation_expands_open_task_once_and_evaluates_each_size(
         db.rollback()
 
 
+@pytest.mark.parametrize("store_status", [StoreStatus.PROVISIONING, StoreStatus.INACTIVE])
+def test_evaluation_requires_an_active_store(
+    postgres_session_factory: sessionmaker[Session],
+    replenishment_fixture: ReplenishmentFixture,
+    store_status: StoreStatus,
+) -> None:
+    fixture = replenishment_fixture
+    with postgres_session_factory() as db:
+        store = db.get(Store, fixture.store_id)
+        assert store is not None
+        store.status = store_status
+        db.commit()
+
+        with pytest.raises(ApiError) as caught:
+            evaluate_replenishment(
+                db,
+                _principal(fixture, IdentityRole.STORE_MANAGER),
+                ReplenishmentEvaluationCreate(store_id=fixture.store_id),
+                settings=Settings(),
+                minimum_confidence=0.7,
+            )
+
+        assert caught.value.status_code == 404
+        assert caught.value.title == "Store not found"
+
+
 def test_claimed_shortage_is_reported_without_mutating_the_task(
     postgres_session_factory: sessionmaker[Session],
     replenishment_fixture: ReplenishmentFixture,

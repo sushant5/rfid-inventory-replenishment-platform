@@ -23,6 +23,7 @@ from abacus.services.streaming_inventory import (
     effective_bucket_confidence,
     effective_freshness,
     effective_item_confidence,
+    infer_stable_zone,
     process_observation,
 )
 
@@ -93,6 +94,166 @@ def _event(
         received_at=received_at,
         rssi=-42,
     )
+
+
+def test_catalog_binding_boundary_resets_stable_zone_evidence() -> None:
+    boundary = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    settings = _settings()
+    settings.rfid_move_confirmation_reads = 3
+    recent = RecentObservationState()
+    event = _event(observed_at=boundary, received_at=boundary)
+
+    for offset in (-2, -1):
+        prior = event.model_copy(
+            update={
+                "event_id": str(uuid.uuid4()),
+                "observed_at": boundary + timedelta(seconds=offset),
+                "received_at": boundary + timedelta(seconds=offset),
+            }
+        )
+        recent.add(prior, settings.rfid_move_confirmation_window_seconds)
+
+    window = recent.add(
+        event,
+        settings.rfid_move_confirmation_window_seconds,
+        evidence_not_before=boundary,
+    )
+    assert [item.observed_at for item in window] == [boundary]
+    assert infer_stable_zone(window, settings) is None
+
+    for offset in (1, 2):
+        current = event.model_copy(
+            update={
+                "event_id": str(uuid.uuid4()),
+                "observed_at": boundary + timedelta(seconds=offset),
+                "received_at": boundary + timedelta(seconds=offset),
+            }
+        )
+        window = recent.add(
+            current,
+            settings.rfid_move_confirmation_window_seconds,
+            evidence_not_before=boundary,
+        )
+
+    assert infer_stable_zone(window, settings) is not None
+
+
+@pytest.mark.parametrize("order", [("buffered", "live"), ("live", "buffered")])
+@pytest.mark.parametrize(
+    ("backlog_drained", "expected_freshness"),
+    [(True, FreshnessStatus.LIVE), (False, FreshnessStatus.STALE)],
+)
+def test_same_receipt_connectivity_is_independent_of_event_order(
+    order: tuple[str, str],
+    backlog_drained: bool,
+    expected_freshness: FreshnessStatus,
+) -> None:
+    received_at = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    connectivity = _connectivity(received_at)
+    connectivity.last_live_event_at = None
+    connectivity.freshness_status = FreshnessStatus.STALE
+    events = {
+        "buffered": _event(
+            observed_at=received_at - timedelta(minutes=2),
+            received_at=received_at,
+            store_id=connectivity.store_id,
+        ).model_copy(
+            update={
+                "is_buffered": True,
+                "backlog_drained": backlog_drained,
+            }
+        ),
+        "live": _event(
+            observed_at=received_at - timedelta(seconds=1),
+            received_at=received_at,
+            store_id=connectivity.store_id,
+        ).model_copy(update={"backlog_drained": backlog_drained}),
+    }
+
+    for event_name in order:
+        event = events[event_name]
+        # The receipt lock applies these batch-level gateway flags before event
+        # evidence is evaluated.
+        connectivity.backlog_drained = event.backlog_drained
+        connectivity.reader_coverage_ok = event.reader_coverage_ok
+        streaming_inventory._apply_connectivity_observation(
+            connectivity,
+            event,
+            _settings(),
+            is_current_receipt=True,
+        )
+
+    assert connectivity.last_live_event_at == events["live"].observed_at
+    assert connectivity.last_live_received_at == received_at
+    assert connectivity.backlog_drained is backlog_drained
+    assert effective_freshness(connectivity, _settings(), now=received_at) is expected_freshness
+    if backlog_drained:
+        assert connectivity.oldest_buffered_event_at is None
+    else:
+        assert connectivity.oldest_buffered_event_at == events["buffered"].observed_at
+
+
+def test_pre_outage_live_event_does_not_clear_newer_buffered_evidence() -> None:
+    received_at = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    connectivity = _connectivity(received_at)
+    connectivity.last_live_event_at = received_at - timedelta(minutes=5)
+    connectivity.last_live_received_at = received_at - timedelta(minutes=5)
+    buffered = _event(
+        observed_at=received_at - timedelta(minutes=2),
+        received_at=received_at,
+        store_id=connectivity.store_id,
+    ).model_copy(update={"is_buffered": True, "backlog_drained": True})
+
+    streaming_inventory._apply_connectivity_observation(
+        connectivity,
+        buffered,
+        _settings(),
+        is_current_receipt=True,
+    )
+
+    assert connectivity.backlog_drained is False
+    assert connectivity.oldest_buffered_event_at == buffered.observed_at
+    assert effective_freshness(connectivity, _settings(), now=received_at) is FreshnessStatus.STALE
+
+
+@pytest.mark.parametrize("order", [("buffered", "live"), ("live", "buffered")])
+def test_same_receipt_live_marker_is_independent_of_last_live_write_throttling(
+    order: tuple[str, str],
+) -> None:
+    received_at = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    previous_live_at = received_at - timedelta(seconds=70)
+    connectivity = _connectivity(received_at)
+    connectivity.last_live_event_at = previous_live_at
+    connectivity.last_live_received_at = previous_live_at
+    connectivity.freshness_status = FreshnessStatus.STALE
+    events = {
+        "buffered": _event(
+            observed_at=received_at - timedelta(seconds=65),
+            received_at=received_at,
+            store_id=connectivity.store_id,
+        ).model_copy(update={"is_buffered": True, "backlog_drained": True}),
+        "live": _event(
+            observed_at=received_at - timedelta(seconds=50),
+            received_at=received_at,
+            store_id=connectivity.store_id,
+        ).model_copy(update={"backlog_drained": True}),
+    }
+
+    for event_name in order:
+        event = events[event_name]
+        connectivity.backlog_drained = event.backlog_drained
+        connectivity.reader_coverage_ok = event.reader_coverage_ok
+        streaming_inventory._apply_connectivity_observation(
+            connectivity,
+            event,
+            _settings(),
+            is_current_receipt=True,
+        )
+
+    assert connectivity.last_live_event_at == previous_live_at
+    assert connectivity.last_live_received_at == received_at
+    assert connectivity.oldest_buffered_event_at is None
+    assert effective_freshness(connectivity, _settings(), now=received_at) is FreshnessStatus.LIVE
 
 
 def test_batch_finalization_requires_a_durable_event_ledger() -> None:
@@ -298,7 +459,11 @@ def test_same_zone_read_throttles_current_item_last_seen_refresh(
         confidence=0.9,
         state_version=1,
     )
-    binding = MagicMock(spec=EpcBinding, sku_id=state.sku_id)
+    binding = MagicMock(
+        spec=EpcBinding,
+        sku_id=state.sku_id,
+        effective_from=base - timedelta(days=1),
+    )
     db = MagicMock(spec=Session)
     db.scalar.side_effect = [binding, state, base]
     monkeypatch.setattr(
@@ -347,7 +512,11 @@ def test_same_zone_read_after_worker_restart_preserves_confirmed_confidence(
         confidence=0.9,
         state_version=1,
     )
-    binding = MagicMock(spec=EpcBinding, sku_id=state.sku_id)
+    binding = MagicMock(
+        spec=EpcBinding,
+        sku_id=state.sku_id,
+        effective_from=base - timedelta(days=1),
+    )
     db = MagicMock(spec=Session)
     db.scalar.side_effect = [binding, state, base]
     monkeypatch.setattr(
@@ -396,7 +565,11 @@ def test_rebuilt_stable_window_recovers_confidence_before_last_seen_flush(
         confidence=0.49,
         state_version=1,
     )
-    binding = MagicMock(spec=EpcBinding, sku_id=state.sku_id)
+    binding = MagicMock(
+        spec=EpcBinding,
+        sku_id=state.sku_id,
+        effective_from=base - timedelta(days=1),
+    )
     db = MagicMock(spec=Session)
     db.scalar.side_effect = [binding, state, state.last_observed_at]
     monkeypatch.setattr(

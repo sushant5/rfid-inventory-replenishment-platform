@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,6 +38,13 @@ from abacus.security import hash_password
 from abacus.services.jobs import claim_jobs
 
 pytestmark = pytest.mark.integration
+
+
+class _SkewedProcessClock:
+    @staticmethod
+    def now(tz: tzinfo | None = None) -> datetime:
+        return datetime.now(tz) + timedelta(days=365)
+
 
 VALID_CSV = (
     b"style_code,style_name,sku,upc,color,size,epc,style_attributes,attributes\n"
@@ -219,10 +226,15 @@ def test_catalog_request_only_accepts_source_and_worker_retry_completes_import(
             db.commit()
 
         monkeypatch.setattr(catalog_service, "parse_catalog_csv", original_parse)
+        with postgres_session_factory() as db:
+            promotion_clock_before = db.scalar(select(func.clock_timestamp()))
+        assert promotion_clock_before is not None
+        monkeypatch.setattr(catalog_service, "datetime", _SkewedProcessClock)
         second_attempt = _claim_catalog_job(tenant_id, worker_id)
         catalog_worker._process_job(tenant_id, second_attempt, worker_id)
 
         with postgres_session_factory() as db:
+            promotion_clock_after = db.scalar(select(func.clock_timestamp()))
             catalog_import = db.get(CatalogImport, import_id)
             source = db.get(CatalogImportSource, import_id)
             job = db.get(DurableJob, second_attempt.id)
@@ -277,6 +289,9 @@ def test_catalog_request_only_accepts_source_and_worker_retry_completes_import(
             tag = db.get(RfidTag, (tenant_id, "3074257BF7194E4000001B01"))
             assert variant is not None and sku.product_variant_id == variant.id
             assert binding is not None and binding.sku_id == sku.id
+            assert promotion_clock_after is not None
+            assert promotion_clock_before <= binding.effective_from <= promotion_clock_after
+            assert catalog_import.promoted_at == binding.effective_from
             assert tag is not None and tag.sku_id == sku.id
             assert binding.source_import_id == import_id
             assert tag.source_import_id == import_id

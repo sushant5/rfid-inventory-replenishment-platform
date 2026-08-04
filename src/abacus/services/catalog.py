@@ -2,13 +2,15 @@ import csv
 import hashlib
 import io
 import json
+import math
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import PurePath
 from typing import Any
+from typing import cast as type_cast
 
 from pydantic import ValidationError
 from sqlalchemy import String, cast, func, or_, select
@@ -40,8 +42,18 @@ from abacus.services.jobs import enqueue_job
 MAX_CATALOG_FILE_BYTES = 10 * 1024 * 1024
 MAX_CATALOG_ROWS = 100_000
 MAX_ATTRIBUTE_BYTES = 16_384
+MAX_ATTRIBUTE_JSON_DEPTH = 64
 REQUIRED_HEADERS = frozenset({"style_code", "style_name", "sku", "upc", "color", "size", "epc"})
 OPTIONAL_HEADERS = frozenset({"attributes", "style_attributes"})
+
+
+def _database_now(db: Session) -> datetime:
+    """Return the database clock used for effective-dated catalog boundaries."""
+
+    value = db.scalar(select(func.clock_timestamp()))
+    if value is None:  # pragma: no cover - PostgreSQL always returns a value.
+        raise RuntimeError("database clock is unavailable")
+    return type_cast(datetime, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +84,28 @@ class PromotionConflictError(Exception):
     pass
 
 
+def _reject_non_finite_json_number(value: str) -> None:
+    raise ValueError(f"non-finite JSON number {value!r} is not allowed")
+
+
+def _validate_json_value(value: object, field_name: str) -> None:
+    """Validate JSON iteratively so adversarial nesting cannot exhaust the stack."""
+
+    pending: list[tuple[object, int]] = [(value, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > MAX_ATTRIBUTE_JSON_DEPTH:
+            raise ValueError(
+                f"{field_name} must not exceed {MAX_ATTRIBUTE_JSON_DEPTH} nested JSON levels"
+            )
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("non-finite JSON number is not allowed")
+        if isinstance(item, dict):
+            pending.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+
+
 def _safe_value(value: object, *, limit: int = 500) -> str | None:
     if value is None:
         return None
@@ -85,9 +119,18 @@ def _parse_attributes(value: str, field_name: str) -> dict[str, Any]:
     if attributes_value:
         if len(attributes_value.encode("utf-8")) > MAX_ATTRIBUTE_BYTES:
             raise ValueError(f"{field_name} must be at most {MAX_ATTRIBUTE_BYTES} UTF-8 bytes")
-        decoded = json.loads(attributes_value)
+        try:
+            decoded = json.loads(
+                attributes_value,
+                parse_constant=_reject_non_finite_json_number,
+            )
+        except RecursionError as exc:
+            raise ValueError(
+                f"{field_name} must not exceed {MAX_ATTRIBUTE_JSON_DEPTH} nested JSON levels"
+            ) from exc
         if not isinstance(decoded, dict):
             raise ValueError(f"{field_name} must contain a JSON object")
+        _validate_json_value(decoded, field_name)
         attributes = decoded
     return attributes
 
@@ -1262,7 +1305,7 @@ def promote_catalog_import(db: Session, import_id: uuid.UUID) -> CatalogImport:
     rows = [CatalogRowData.model_validate(row.normalized_data) for row in staged_rows]
     catalog_import.status = CatalogImportStatus.PROCESSING
     db.flush()
-    effective_at = datetime.now(UTC)
+    effective_at = _database_now(db)
 
     try:
         with db.begin_nested():

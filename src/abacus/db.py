@@ -99,11 +99,11 @@ def pin_session_to_tenant(session: Session, tenant_id: uuid.UUID) -> TenantSessi
 
 
 def get_db() -> Generator[TenantSession]:
-    """Yield the existing unpinned session dependency.
+    """Yield a session that authentication can pin to one trusted tenant.
 
-    This remains unpinned while authentication and platform dependencies are migrated
-    incrementally. Tenant-aware callers should use ``tenant_session_scope`` or pin the
-    yielded ``TenantSession`` before issuing any SQL.
+    Authentication and device lookup resolve tenant identity through restricted
+    database functions, then pin this ``TenantSession`` before tenant-owned SQL runs.
+    Platform operations use their separately authenticated control-plane paths.
     """
 
     session = SessionLocal()

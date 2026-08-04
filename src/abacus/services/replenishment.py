@@ -828,7 +828,7 @@ def evaluate_replenishment(
         .where(
             Store.tenant_id == principal.tenant_id,
             Store.id == request.store_id,
-            Store.status != StoreStatus.INACTIVE,
+            Store.status == StoreStatus.ACTIVE,
         )
         .with_for_update()
     )

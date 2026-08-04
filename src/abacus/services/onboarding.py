@@ -3,7 +3,8 @@ import json
 import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
+from typing import cast
 
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -35,6 +36,15 @@ class StoreDeviceRegistration:
     device: Device
     assignment: DeviceAssignment
     api_key: str
+
+
+def _database_now(db: Session) -> datetime:
+    """Return the database clock used for effective-dated assignment boundaries."""
+
+    value = db.scalar(select(func.clock_timestamp()))
+    if value is None:  # pragma: no cover - PostgreSQL always returns a value.
+        raise RuntimeError("database clock is unavailable")
+    return cast(datetime, value)
 
 
 def create_tenant(db: Session, request: TenantCreate) -> Tenant:
@@ -168,15 +178,12 @@ def register_store_device(
     db.add(device)
     try:
         db.flush()
-        effective_from = db.scalar(select(func.clock_timestamp()))
-        if effective_from is None:  # pragma: no cover - PostgreSQL always returns a value.
-            raise RuntimeError("database clock is unavailable")
         assignment = DeviceAssignment(
             tenant_id=store.tenant_id,
             device_id=device.id,
             store_id=store.id,
             zone_id=zone.id,
-            effective_from=effective_from,
+            effective_from=_database_now(db),
         )
         db.add(assignment)
         db.commit()
@@ -328,7 +335,7 @@ def onboard_stores(
     )
     db.add(batch)
 
-    effective_from = datetime.now(UTC)
+    effective_from = _database_now(db)
     for store_request in request.stores:
         organization_unit_id = _resolve_organization_path(
             db,

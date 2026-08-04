@@ -1345,7 +1345,9 @@ def test_effective_epc_binding_controls_historical_and_current_sku_projection(
     postgres_session_factory: sessionmaker[Session],
     durable_pipeline: DurablePipelineFixture,
 ) -> None:
-    effective_at = durable_pipeline.observed_at + timedelta(seconds=30)
+    # Keep both catalog epochs inside the hysteresis window so the boundary,
+    # rather than ordinary time-window eviction, prevents mixed evidence.
+    effective_at = durable_pipeline.observed_at + timedelta(seconds=3)
     with postgres_session_factory() as db:
         original_sku = db.get(Sku, durable_pipeline.sku_id)
         assert original_sku is not None
@@ -1407,25 +1409,34 @@ def test_effective_epc_binding_controls_historical_and_current_sku_projection(
         assert historical_state is not None
         assert historical_state.sku_id == durable_pipeline.sku_id
 
-    current = ObservationBatchCreate(
-        device_id=durable_pipeline.device_id,
-        observations=[
-            ObservationInput(
-                event_id=str(uuid.uuid4()),
-                epc=durable_pipeline.epc,
-                observed_at=effective_at + timedelta(seconds=index),
-                rssi=-41,
+    for index in range(1, 4):
+        current = ObservationBatchCreate(
+            device_id=durable_pipeline.device_id,
+            observations=[
+                ObservationInput(
+                    event_id=str(uuid.uuid4()),
+                    epc=durable_pipeline.epc,
+                    observed_at=effective_at + timedelta(seconds=index),
+                    rssi=-41,
+                )
+            ],
+        )
+        _accept(
+            postgres_session_factory,
+            durable_pipeline,
+            current,
+            received_at=effective_at + timedelta(seconds=index + 1),
+        )
+        raw_count, _ = event_worker.process_tenant_once(durable_pipeline.tenant_id, recent)
+        assert raw_count == 1
+        with postgres_session_factory() as db:
+            intermediate_state = db.get(
+                CurrentItemState,
+                (durable_pipeline.tenant_id, durable_pipeline.epc),
             )
-            for index in range(1, 4)
-        ],
-    )
-    _accept(
-        postgres_session_factory,
-        durable_pipeline,
-        current,
-        received_at=effective_at + timedelta(seconds=5),
-    )
-    assert event_worker.process_tenant_once(durable_pipeline.tenant_id, recent) == (3, 1)
+            assert intermediate_state is not None
+            expected_sku_id = replacement_sku_id if index == 3 else durable_pipeline.sku_id
+            assert intermediate_state.sku_id == expected_sku_id
 
     with postgres_session_factory() as db:
         current_state = db.get(

@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.py[cod]
@@ -16,3 +18,4 @@ build/
 .DS_Store
 tmp/
 source/
+output/
