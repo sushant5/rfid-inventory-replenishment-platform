@@ -253,7 +253,12 @@ stale-store suppression.
 `scripts/rfid_simulator.py` generates normal, duplicate, conflicting event-ID,
 repeated, late/out-of-order, competing-zone, unknown-EPC, outage/replay, and
 stationary-burst scenarios.
-`scripts/smoke_test.py` is a dependency-free hosted health/contract check.
+`scripts/smoke_test.py` is a dependency-free hosted health/contract check. Release
+verification can pin the deployed artifact instead of accepting any healthy build:
+
+```bash
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.6.0 --expected-build-sha <release-sha> --expected-schema-revision a1d4e7b9c203
+```
 
 ## Hosting
 
