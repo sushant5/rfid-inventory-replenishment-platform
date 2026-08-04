@@ -60,6 +60,10 @@ def run() -> int:
     executable = sys.executable
     _run_startup((executable, "-m", "alembic", "upgrade", "head"), "migrations")
     _run_startup((executable, "-m", "abacus.cli", "bootstrap-admin"), "reviewer_seed")
+    _run_startup(
+        (executable, "-m", "abacus.cli", "bootstrap-public-reviewer"),
+        "public_reviewer_seed",
+    )
 
     commands = (
         (executable, "-m", "abacus.processes.catalog_worker"),

@@ -9,14 +9,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from abacus.api.errors import ApiError
 from abacus.config import get_settings
 from abacus.db import SessionLocal, tenant_session_scope
+from abacus.models.architecture import CanonicalIdentityRole
 from abacus.models.identity import IdentityRole
-from abacus.schemas.identity import RoleAssignmentCreate, UserCreate
+from abacus.schemas.identity import CanonicalUserCreate, RoleAssignmentCreate, UserCreate
 from abacus.schemas.tenancy import TenantCreate
 from abacus.services.cutover import (
     list_pending_reservation_cutovers,
     reconcile_reservation_cutover_task,
 )
-from abacus.services.identity import bootstrap_corporate_admin
+from abacus.services.identity import bootstrap_corporate_admin, bootstrap_public_reviewer
 from abacus.services.streaming_inventory import (
     confirm_timed_out_removals,
     rebuild_inventory_projection,
@@ -38,6 +39,10 @@ class BootstrapSettings(BaseSettings):
     bootstrap_admin_email: str = ""
     bootstrap_admin_display_name: str = ""
     bootstrap_admin_password: str = ""
+    bootstrap_public_reviewer_enabled: bool = False
+    bootstrap_public_reviewer_email: str = ""
+    bootstrap_public_reviewer_display_name: str = ""
+    bootstrap_public_reviewer_password: str = ""
 
 
 def _format_validation_error(exc: ValidationError) -> str:
@@ -59,6 +64,10 @@ def _parser() -> argparse.ArgumentParser:
         "--if-configured",
         action="store_true",
         help="exit successfully when a required BOOTSTRAP_* variable is absent",
+    )
+    commands.add_parser(
+        "bootstrap-public-reviewer",
+        help="idempotently create the configured public read-only reviewer",
     )
     commands.add_parser(
         "list-reservation-cutover",
@@ -128,6 +137,71 @@ def _bootstrap_from_environment(*, if_configured: bool) -> int:
     return 0
 
 
+def _bootstrap_public_reviewer_from_environment() -> int:
+    settings = BootstrapSettings()
+    if not settings.bootstrap_public_reviewer_enabled:
+        print("Public reviewer bootstrap disabled.")
+        return 0
+
+    values = {
+        "BOOTSTRAP_TENANT_CODE": settings.bootstrap_tenant_code.strip(),
+        "BOOTSTRAP_PUBLIC_REVIEWER_EMAIL": settings.bootstrap_public_reviewer_email.strip(),
+        "BOOTSTRAP_PUBLIC_REVIEWER_DISPLAY_NAME": (
+            settings.bootstrap_public_reviewer_display_name.strip()
+        ),
+        # Do not normalize a password: spaces may be intentional secret material.
+        "BOOTSTRAP_PUBLIC_REVIEWER_PASSWORD": settings.bootstrap_public_reviewer_password,
+    }
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        print(
+            f"Missing required environment variables: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        settings.bootstrap_admin_email.strip()
+        and values["BOOTSTRAP_PUBLIC_REVIEWER_EMAIL"].casefold()
+        == settings.bootstrap_admin_email.strip().casefold()
+    ):
+        print(
+            "Invalid public reviewer configuration: reviewer and administrator emails must differ.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        request = CanonicalUserCreate(
+            email=values["BOOTSTRAP_PUBLIC_REVIEWER_EMAIL"],
+            display_name=values["BOOTSTRAP_PUBLIC_REVIEWER_DISPLAY_NAME"],
+            password=values["BOOTSTRAP_PUBLIC_REVIEWER_PASSWORD"],
+            roles=[CanonicalIdentityRole.CORPORATE_USER],
+            store_ids=[],
+        )
+    except ValidationError as exc:
+        print(
+            f"Invalid public reviewer configuration: {_format_validation_error(exc)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    with SessionLocal() as db:
+        try:
+            record = bootstrap_public_reviewer(
+                db,
+                tenant_code=values["BOOTSTRAP_TENANT_CODE"],
+                request=request,
+            )
+        except ApiError as exc:
+            print(
+                f"Public reviewer bootstrap failed [{exc.status_code}]: {exc.detail}",
+                file=sys.stderr,
+            )
+            return 1
+    print(f"Public read-only reviewer ready: {record.user.email} ({record.user.id})")
+    return 0
+
+
 def _list_reservation_cutover() -> int:
     with SessionLocal() as db:
         pending = list_pending_reservation_cutovers(db)
@@ -175,6 +249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.command == "bootstrap-admin":
         return _bootstrap_from_environment(if_configured=arguments.if_configured)
+    if arguments.command == "bootstrap-public-reviewer":
+        return _bootstrap_public_reviewer_from_environment()
     if arguments.command == "list-reservation-cutover":
         return _list_reservation_cutover()
     if arguments.command == "reconcile-reservation-cutover":

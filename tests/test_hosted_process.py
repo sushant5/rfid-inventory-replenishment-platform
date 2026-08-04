@@ -70,7 +70,9 @@ def test_hosted_run_supervises_children_and_handles_shutdown(
     )
 
     assert hosted.run() == 0
-    assert startup.call_count == 2
+    assert startup.call_count == 3
+    assert startup.call_args_list[1].args[0][-1] == "bootstrap-admin"
+    assert startup.call_args_list[2].args[0][-1] == "bootstrap-public-reviewer"
     assert launch.call_count == 3
     api_command = launch.call_args_list[-1].args[0]
     assert api_command[api_command.index("--port") + 1] == "8123"

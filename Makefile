@@ -10,6 +10,7 @@ migrate:
 
 seed:
 	$(COMPOSE) run --rm api abacus-cli bootstrap-admin
+	$(COMPOSE) run --rm api abacus-cli bootstrap-public-reviewer
 
 test:
 	$(COMPOSE) --profile test run --build --rm test
@@ -17,6 +18,7 @@ test:
 demo:
 	$(COMPOSE) up --build -d --wait
 	$(COMPOSE) run --rm api abacus-cli bootstrap-admin
+	$(COMPOSE) run --rm api abacus-cli bootstrap-public-reviewer
 	$(COMPOSE) run --rm api python scripts/run_architecture_demo.py --base-url http://api:8000
 
 down:

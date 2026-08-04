@@ -217,6 +217,224 @@ def bootstrap_corporate_admin(
     return UserRecord(user=user, grants=(grant,))
 
 
+def bootstrap_public_reviewer(
+    db: Session,
+    *,
+    tenant_code: str,
+    request: CanonicalUserCreate,
+) -> CanonicalUserRecord:
+    """Create or reconcile the explicitly configured read-only demo reviewer.
+
+    The public account deliberately has only the canonical ``CORPORATE_USER`` role.
+    It has no compatibility grants or store assignments, so it cannot inherit a
+    write permission from the legacy access model. Re-running the bootstrap performs
+    no writes when the configured identity and password are unchanged.
+    """
+
+    expected_roles = frozenset({CanonicalIdentityRole.CORPORATE_USER})
+    if frozenset(request.roles) != expected_roles or request.store_ids:
+        raise ValueError(
+            "public reviewer must have exactly CORPORATE_USER and no store assignments"
+        )
+
+    normalized_tenant_code = tenant_code.strip().lower()
+    if isinstance(db, TenantSession):
+        resolved_tenant_id = db.scalar(
+            text("SELECT abacus_resolve_login_tenant(:tenant_code)"),
+            {"tenant_code": normalized_tenant_code},
+        )
+        db.rollback()
+        if resolved_tenant_id is None:
+            raise ApiError(
+                404,
+                "Bootstrap tenant not found",
+                "Create the configured tenant administrator before the public reviewer.",
+                code="public_reviewer_tenant_not_found",
+            )
+        tenant_id = uuid.UUID(str(resolved_tenant_id))
+        pin_session_to_tenant(db, tenant_id)
+        tenant = db.scalar(select(Tenant).where(Tenant.id == tenant_id).with_for_update())
+    else:
+        tenant = db.scalar(
+            select(Tenant).where(Tenant.code == normalized_tenant_code).with_for_update()
+        )
+
+    if tenant is None:
+        raise ApiError(
+            404,
+            "Bootstrap tenant not found",
+            "Create the configured tenant administrator before the public reviewer.",
+            code="public_reviewer_tenant_not_found",
+        )
+    if tenant.status != TenantStatus.ACTIVE:
+        raise ApiError(
+            409,
+            "Bootstrap tenant is inactive",
+            "The public reviewer cannot be enabled for an inactive tenant.",
+            code="public_reviewer_tenant_inactive",
+        )
+
+    email = str(request.email)
+    user = db.scalar(
+        select(User)
+        .where(
+            User.tenant_id == tenant.id,
+            User.email == email,
+        )
+        .with_for_update()
+    )
+    password = request.password.get_secret_value()
+    if user is None:
+        user = User(
+            tenant_id=tenant.id,
+            email=email,
+            display_name=request.display_name,
+            password_hash=hash_password(password),
+            status=UserStatus.ACTIVE,
+            token_version=1,
+        )
+        db.add(user)
+        try:
+            db.flush()
+            db.add(
+                UserRole(
+                    tenant_id=tenant.id,
+                    user_id=user.id,
+                    role=CanonicalIdentityRole.CORPORATE_USER,
+                )
+            )
+            _add_audit_record(
+                db,
+                tenant_id=tenant.id,
+                actor_user_id=None,
+                action=IdentityAuditAction.USER_CREATED,
+                target_user_id=user.id,
+                details={
+                    "email": user.email,
+                    "bootstrap": True,
+                    "public_reviewer": True,
+                    "roles": [CanonicalIdentityRole.CORPORATE_USER.value],
+                    "store_ids": [],
+                },
+            )
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise ApiError(
+                409,
+                "Public reviewer bootstrap conflict",
+                "The public reviewer was created concurrently or conflicts with existing data.",
+                code="public_reviewer_conflict",
+            ) from exc
+        db.refresh(user)
+        return CanonicalUserRecord(
+            user=user,
+            roles=(CanonicalIdentityRole.CORPORATE_USER,),
+            store_ids=(),
+        )
+
+    roles = frozenset(
+        db.scalars(
+            select(UserRole.role).where(
+                UserRole.tenant_id == tenant.id,
+                UserRole.user_id == user.id,
+            )
+        ).all()
+    )
+    store_ids = frozenset(
+        db.scalars(
+            select(UserStoreAssignment.store_id).where(
+                UserStoreAssignment.tenant_id == tenant.id,
+                UserStoreAssignment.user_id == user.id,
+            )
+        ).all()
+    )
+    legacy_grants = tuple(
+        db.scalars(
+            select(UserAccessGrant).where(
+                UserAccessGrant.tenant_id == tenant.id,
+                UserAccessGrant.user_id == user.id,
+            )
+        ).all()
+    )
+    if CanonicalIdentityRole.TENANT_ADMIN in roles or any(
+        grant.role is IdentityRole.CORPORATE_ADMIN for grant in legacy_grants
+    ):
+        db.rollback()
+        raise ApiError(
+            409,
+            "Protected administrator conflict",
+            "The configured public-reviewer email belongs to a tenant administrator.",
+            code="public_reviewer_admin_conflict",
+        )
+
+    changes: list[str] = []
+    invalidate_tokens = False
+    if user.display_name != request.display_name:
+        user.display_name = request.display_name
+        changes.append("display_name")
+    if user.status is not UserStatus.ACTIVE:
+        user.status = UserStatus.ACTIVE
+        changes.append("status_reactivated")
+        invalidate_tokens = True
+
+    password_matches, _replacement_hash = verify_password_and_update(password, user.password_hash)
+    if not password_matches:
+        user.password_hash = hash_password(password)
+        changes.append("password_rotated")
+        invalidate_tokens = True
+    if roles != expected_roles:
+        _persist_role_rows(db, tenant.id, user.id, expected_roles)
+        changes.append("roles_reconciled")
+        invalidate_tokens = True
+    if store_ids:
+        _persist_assignment_rows(db, tenant.id, user.id, frozenset())
+        changes.append("store_assignments_removed")
+        invalidate_tokens = True
+    if legacy_grants:
+        db.execute(
+            delete(UserAccessGrant).where(
+                UserAccessGrant.tenant_id == tenant.id,
+                UserAccessGrant.user_id == user.id,
+            )
+        )
+        changes.append("legacy_grants_removed")
+        invalidate_tokens = True
+
+    if invalidate_tokens:
+        user.token_version += 1
+    if changes:
+        _add_audit_record(
+            db,
+            tenant_id=tenant.id,
+            actor_user_id=None,
+            action=IdentityAuditAction.USER_ACCESS_CHANGED,
+            target_user_id=user.id,
+            details={
+                "email": user.email,
+                "bootstrap": True,
+                "public_reviewer": True,
+                "changes": sorted(changes),
+                "new_token_version": user.token_version,
+            },
+        )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ApiError(
+            409,
+            "Public reviewer bootstrap conflict",
+            "The public reviewer changed concurrently or conflicts with existing data.",
+            code="public_reviewer_conflict",
+        ) from exc
+    return CanonicalUserRecord(
+        user=user,
+        roles=(CanonicalIdentityRole.CORPORATE_USER,),
+        store_ids=(),
+    )
+
+
 def _add_audit_record(
     db: Session,
     *,

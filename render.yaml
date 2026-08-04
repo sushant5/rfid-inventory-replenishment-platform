@@ -37,3 +37,11 @@ services:
         value: Assignment Reviewer
       - key: BOOTSTRAP_ADMIN_PASSWORD
         sync: false
+      - key: BOOTSTRAP_PUBLIC_REVIEWER_ENABLED
+        value: "true"
+      - key: BOOTSTRAP_PUBLIC_REVIEWER_EMAIL
+        value: demo-reader@orange.example
+      - key: BOOTSTRAP_PUBLIC_REVIEWER_DISPLAY_NAME
+        value: Public API Reviewer
+      - key: BOOTSTRAP_PUBLIC_REVIEWER_PASSWORD
+        value: Orange-Demo-ReadOnly-2026!
