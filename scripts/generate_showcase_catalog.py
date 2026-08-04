@@ -44,7 +44,7 @@ def upc_for_sku(sku_number: int) -> str:
 def epcs_for_sku(sku_number: int) -> tuple[str, ...]:
     if sku_number == 1:
         return PRIMARY_EPCS
-    count = 4 if sku_number in {2, 3, 4} else 2
+    count = 4 if sku_number in {2, 3, 4, 5, 6, 7} else 2
     return tuple(f"30{sku_number:06X}{tag_number:016X}" for tag_number in range(1, count + 1))
 
 

@@ -92,10 +92,10 @@ make demo
 make test
 ```
 
-The demo ensures the 100-store Orange footprint, imports 100 SKUs, stocks three stores,
-and prints eight end-to-end checks. These include duplicate/late RFID protection,
-RFID verification of a completed task, store-level authorization, and an idempotent
-sale. Swagger is at
+The demo converges on the same zones, readers, policy, and identities when rerun. It
+ensures the 100-store Orange footprint, imports 100 SKUs, stocks five stores, and prints
+eight end-to-end checks. These include duplicate/late RFID protection, RFID verification
+of a completed task, store-level authorization, and an idempotent sale. Swagger is at
 <http://localhost:8000/docs>; readiness is
 at <http://localhost:8000/health/ready>.
 

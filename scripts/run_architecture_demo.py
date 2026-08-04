@@ -35,8 +35,11 @@ else:
 # Use a release-specific SKU for the stateful workflow. PRIMARY_EPCS remain in
 # the catalog for existing integrations, but may already have authoritative
 # history on a long-lived hosted demo.
-EPCS = epcs_for_sku(4)
-WORKFLOW_SKU = sku_for_number(4)
+EPCS = epcs_for_sku(7)
+WORKFLOW_SKU = sku_for_number(7)
+DEMO_POLICY_NAME = "Orange Sales Floor Replenishment"
+DEMO_ASSOCIATE_EMAIL = "demo-associate@orange.example"
+DEMO_ASSOCIATE_PASSWORD = "Orange-Demo-Associate-2026!"  # noqa: S105 - local demo identity.
 
 
 class DemoFailure(RuntimeError):
@@ -202,6 +205,48 @@ def create_scoped_user(
     return user_id, login(client, email, password)
 
 
+def ensure_scoped_user(
+    client: Client,
+    admin_token: str,
+    *,
+    email: str,
+    password: str,
+    role: str,
+    store_ids: list[str],
+) -> tuple[str, str]:
+    _, users_value = client.request(
+        "GET",
+        "/v1/users?limit=100",
+        headers=bearer(admin_token),
+    )
+    users = page_items(users_value, "users")
+    existing = next((user for user in users if user["email"] == email), None)
+    if existing is None:
+        return create_scoped_user(
+            client,
+            admin_token,
+            email=email,
+            password=password,
+            role=role,
+            store_ids=store_ids,
+        )
+
+    user_id = str(required(existing, "id"))
+    client.request(
+        "PUT",
+        f"/v1/users/{user_id}/roles",
+        headers=bearer(admin_token),
+        payload={"roles": [role]},
+    )
+    client.request(
+        "PUT",
+        f"/v1/users/{user_id}/store-assignments",
+        headers=bearer(admin_token),
+        payload={"store_ids": store_ids},
+    )
+    return user_id, login(client, email, password)
+
+
 def observation(event_id: str, epc: str, at: datetime, rssi: float) -> dict[str, object]:
     return {
         "event_id": event_id,
@@ -308,16 +353,14 @@ def provision_orange_estate(
     return stores
 
 
-def seed_showcase_store_inventory(
+def commission_store_readers(
     client: Client,
     *,
     admin_token: str,
     store_id: str,
     sku_number: int,
-    base_time: datetime,
-    poll_timeout: float,
-) -> None:
-    """Commission planned readers and place four dummy items in one store."""
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return one credential per planned zone without adding duplicate readers."""
 
     _, zones_value = client.request(
         "GET",
@@ -347,7 +390,7 @@ def seed_showcase_store_inventory(
     )
     mappings = list_result(mappings_value, "showcase devices")
     mapping_by_zone = {str(mapping["assignment"]["zone_id"]): mapping for mapping in mappings}
-    tokens: dict[str, tuple[str, str]] = {}
+    registrations: dict[str, dict[str, Any]] = {}
     for zone_code in ("floor", "backroom"):
         zone_id = str(required(zones[zone_code], "id"))
         mapping = mapping_by_zone.get(zone_id)
@@ -366,10 +409,7 @@ def seed_showcase_store_inventory(
             )
             registration = object_result(registration_value, "showcase device registration")
             device = object_result(required(registration, "device"), "showcase device")
-            tokens[zone_code] = (
-                str(required(device, "id")),
-                str(required(registration, "device_token")),
-            )
+            registrations[zone_code] = registration
         else:
             device = object_result(required(mapping, "device"), "showcase device")
             device_id = str(required(device, "id"))
@@ -379,15 +419,39 @@ def seed_showcase_store_inventory(
                 headers=bearer(admin_token),
             )
             credential = object_result(credential_value, "showcase credential")
-            tokens[zone_code] = (device_id, str(required(credential, "device_token")))
+            registrations[zone_code] = {
+                "device": device,
+                "assignment": required(mapping, "assignment"),
+                "device_token": str(required(credential, "device_token")),
+            }
+    return registrations["floor"], registrations["backroom"]
+
+
+def seed_showcase_store_inventory(
+    client: Client,
+    *,
+    admin_token: str,
+    store_id: str,
+    sku_number: int,
+    base_time: datetime,
+    poll_timeout: float,
+) -> None:
+    """Place four catalogued physical items in a commissioned store."""
+
+    floor_registration, back_registration = commission_store_readers(
+        client,
+        admin_token=admin_token,
+        store_id=store_id,
+        sku_number=sku_number,
+    )
 
     epcs = epcs_for_sku(sku_number)
-    floor_device_id, floor_token = tokens["floor"]
-    back_device_id, back_token = tokens["backroom"]
+    floor_device = object_result(required(floor_registration, "device"), "floor device")
+    back_device = object_result(required(back_registration, "device"), "backroom device")
     floor_batch = submit_batch(
         client,
-        device_id=floor_device_id,
-        device_token=floor_token,
+        device_id=str(required(floor_device, "id")),
+        device_token=str(required(floor_registration, "device_token")),
         observations=[
             observation(
                 str(uuid.uuid4()),
@@ -400,8 +464,8 @@ def seed_showcase_store_inventory(
     )
     back_batch = submit_batch(
         client,
-        device_id=back_device_id,
-        device_token=back_token,
+        device_id=str(required(back_device, "id")),
+        device_token=str(required(back_registration, "device_token")),
         observations=[
             observation(
                 str(uuid.uuid4()),
@@ -464,37 +528,16 @@ def run(args: argparse.Namespace) -> None:
     store1_id = str(required(stores["orange-001"], "id"))
     store2_id = str(required(stores["orange-002"], "id"))
     store3_id = str(required(stores["orange-003"], "id"))
+    store4_id = str(required(stores["orange-004"], "id"))
+    store5_id = str(required(stores["orange-005"], "id"))
     run_id = uuid.uuid4().hex[:10].upper()
-    client.request(
-        "POST",
-        f"/v1/stores/{store2_id}/zones",
-        expected=201,
-        headers=bearer(admin_token),
-        payload={
-            "code": f"audit-{run_id.lower()}",
-            "name": "Demo Audit Zone",
-            "kind": "OTHER",
-        },
+    floor_registration, back_registration = commission_store_readers(
+        client,
+        admin_token=admin_token,
+        store_id=store1_id,
+        sku_number=7,
     )
-    _, zones_value = client.request(
-        "GET", f"/v1/stores/{store1_id}/zones", headers=bearer(admin_token)
-    )
-    zones = {str(item["code"]): item for item in list_result(zones_value, "zones")}
-
-    devices: dict[str, dict[str, Any]] = {}
-    for code in ("floor", "backroom"):
-        _, registration = client.request(
-            "POST",
-            f"/v1/stores/{store1_id}/devices",
-            expected=201,
-            headers=bearer(admin_token),
-            payload={
-                "serial_number": f"ORANGE-{code.upper()}-{run_id}",
-                "display_name": f"Demo {code} reader",
-                "zone_id": required(zones[code], "id"),
-            },
-        )
-        devices[code] = object_result(registration, f"{code} device")
+    devices = {"floor": floor_registration, "backroom": back_registration}
 
     catalog_import = client.multipart_catalog(tenant_id, access_token=admin_token)
     import_id = str(required(catalog_import, "id"))
@@ -519,69 +562,64 @@ def run(args: argparse.Namespace) -> None:
     if int(required(import_errors, "total")) != 0:
         raise DemoFailure(f"catalog import unexpectedly reported errors: {import_errors}")
 
-    _, policy_value = client.request(
-        "POST",
-        "/v1/replenishment-policies",
-        expected=201,
-        headers=bearer(admin_token),
-        payload={
-            "name": f"Orange demo policy {run_id}",
-            "description": "Demo tenant default",
-            "rules": [
-                {
-                    "min_floor_qty": 2,
-                    "target_floor_qty": 3,
-                    "priority": int(run_id[:5], 16) % 1_000_000,
-                }
-            ],
-        },
-    )
-    policy = object_result(policy_value, "policy")
-    policy_id = str(required(object_result(required(policy, "policy"), "policy definition"), "id"))
-    version_id = str(required(object_result(required(policy, "version"), "version"), "id"))
     _, policy_list_value = client.request(
         "GET",
-        "/v1/replenishment-policies",
+        "/v1/replenishment-policies?limit=100",
         headers=bearer(admin_token),
     )
     policy_list = object_result(policy_list_value, "policy list")
     policy_items = list_result(required(policy_list, "items"), "policy items")
-    if not any(str(item["policy"]["id"]) == policy_id for item in policy_items):
-        raise DemoFailure("created replenishment policy was not discoverable")
+    policy = next(
+        (item for item in policy_items if item["policy"]["name"] == DEMO_POLICY_NAME),
+        None,
+    )
+    policy_created = policy is None
+    if policy_created:
+        _, policy_value = client.request(
+            "POST",
+            "/v1/replenishment-policies",
+            expected=201,
+            headers=bearer(admin_token),
+            payload={
+                "name": DEMO_POLICY_NAME,
+                "description": "Default sales-floor availability policy",
+                "rules": [{"min_floor_qty": 2, "target_floor_qty": 3, "priority": 100}],
+            },
+        )
+        policy = object_result(policy_value, "policy")
+    if policy is None:
+        raise DemoFailure("replenishment policy was not created")
+    policy_id = str(required(object_result(required(policy, "policy"), "policy definition"), "id"))
+    version = object_result(required(policy, "version"), "version")
+    version_id = str(required(version, "id"))
     client.request(
         "GET",
         f"/v1/replenishment-policies/{policy_id}",
         headers=bearer(admin_token),
     )
-    client.request(
-        "POST",
-        f"/v1/replenishment-policy-versions/{version_id}/activate",
-        headers=bearer(admin_token),
-    )
-    _, draft_value = client.request(
-        "POST",
-        f"/v1/replenishment-policies/{policy_id}/versions",
-        expected=201,
-        headers=bearer(admin_token),
-    )
-    draft = object_result(draft_value, "draft policy version")
-    draft_version_id = str(
-        required(object_result(required(draft, "version"), "draft version"), "id")
-    )
-    client.request(
-        "PATCH",
-        f"/v1/replenishment-policy-versions/{draft_version_id}",
-        headers=bearer(admin_token),
-        payload={
-            "rules": [
-                {
-                    "min_floor_qty": 2,
-                    "target_floor_qty": 4,
-                    "priority": int(run_id[:5], 16) % 1_000_000,
-                }
-            ]
-        },
-    )
+    if version["status"] != "ACTIVE":
+        client.request(
+            "POST",
+            f"/v1/replenishment-policy-versions/{version_id}/activate",
+            headers=bearer(admin_token),
+        )
+    if policy_created:
+        _, draft_value = client.request(
+            "POST",
+            f"/v1/replenishment-policies/{policy_id}/versions",
+            expected=201,
+            headers=bearer(admin_token),
+        )
+        draft = object_result(draft_value, "draft policy version")
+        draft_version_id = str(
+            required(object_result(required(draft, "version"), "draft version"), "id")
+        )
+        client.request(
+            "PATCH",
+            f"/v1/replenishment-policy-versions/{draft_version_id}",
+            headers=bearer(admin_token),
+            payload={"rules": [{"min_floor_qty": 2, "target_floor_qty": 4, "priority": 100}]},
+        )
 
     floor_device = object_result(required(devices["floor"], "device"), "floor device")
     back_device = object_result(required(devices["backroom"], "device"), "backroom device")
@@ -651,6 +689,34 @@ def run(args: argparse.Namespace) -> None:
         base_time=base_time + timedelta(seconds=60),
         poll_timeout=args.poll_timeout,
     )
+    seed_showcase_store_inventory(
+        client,
+        admin_token=admin_token,
+        store_id=store4_id,
+        sku_number=5,
+        base_time=base_time + timedelta(seconds=80),
+        poll_timeout=args.poll_timeout,
+    )
+    seed_showcase_store_inventory(
+        client,
+        admin_token=admin_token,
+        store_id=store5_id,
+        sku_number=6,
+        base_time=base_time + timedelta(seconds=100),
+        poll_timeout=args.poll_timeout,
+    )
+
+    for showcase_store_id in (store2_id, store3_id, store4_id, store5_id):
+        _, showcase_evaluation_value = client.request(
+            "POST",
+            "/v1/replenishment/evaluations",
+            headers=bearer(admin_token),
+            payload={"store_id": showcase_store_id},
+        )
+        showcase_evaluation = object_result(showcase_evaluation_value, "showcase evaluation")
+        showcase_tasks = list_result(required(showcase_evaluation, "tasks"), "showcase tasks")
+        if len(showcase_tasks) != 1 or int(showcase_tasks[0]["quantity"]) != 2:
+            raise DemoFailure(f"expected one showcase quantity-2 task: {showcase_evaluation}")
 
     before_item = object_result(
         client.request("GET", f"/v1/items/{EPCS[0]}", headers=bearer(admin_token))[1],
@@ -690,13 +756,11 @@ def run(args: argparse.Namespace) -> None:
     if len(tasks) != 1 or int(tasks[0]["quantity"]) != 2:
         raise DemoFailure(f"expected one quantity-2 task: {evaluation}")
 
-    associate_password = f"DemoAssociate-{run_id}!"
-    associate_email = f"associate-{run_id.lower()}@orange.example"
-    associate_user_id, associate_token = create_scoped_user(
+    associate_user_id, associate_token = ensure_scoped_user(
         client,
         admin_token,
-        email=associate_email,
-        password=associate_password,
+        email=DEMO_ASSOCIATE_EMAIL,
+        password=DEMO_ASSOCIATE_PASSWORD,
         role="STORE_ASSOCIATE",
         store_ids=[store1_id],
     )
@@ -917,7 +981,7 @@ def run(args: argparse.Namespace) -> None:
     print("PASS RFID stable-zone inventory: floor=1 backroom=3")
     print("PASS duplicate and late-event replay protection")
     print("PASS quantity=2 replenishment task completed with RFID verification")
-    print("PASS reviewer seed: 100 SKUs and inventory in three stores")
+    print("PASS reviewer seed: 100 SKUs and inventory/tasks in five stores")
     print("PASS store-scoped authorization denied Store 2")
     print("PASS idempotent authoritative sale removed one physical item")
     print("DEMO COMPLETE")
