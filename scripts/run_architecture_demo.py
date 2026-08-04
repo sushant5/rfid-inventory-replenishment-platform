@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -11,7 +12,15 @@ import urllib.request
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from scripts.generate_store_batch import build_store_batch
+else:
+    if __package__:
+        from scripts.generate_store_batch import build_store_batch
+    else:  # Executed as `python scripts/run_architecture_demo.py`.
+        from generate_store_batch import build_store_batch
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "examples" / "catalog.csv"
@@ -248,6 +257,49 @@ def wait_for_readiness(client: Client, timeout: float) -> None:
         time.sleep(1)
 
 
+def provision_orange_estate(
+    client: Client,
+    *,
+    tenant_id: str,
+    platform_headers: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Add missing store codes without mutating already commissioned stores."""
+
+    _, stores_value = client.request(
+        "GET", f"/v1/tenants/{tenant_id}/stores", headers=platform_headers
+    )
+    existing_store_codes = {
+        str(item["code"]) for item in list_result(stores_value, "existing stores")
+    }
+    desired_stores = list_result(build_store_batch(100)["stores"], "generated stores")
+    missing_stores = [
+        store for store in desired_stores if str(store["code"]) not in existing_store_codes
+    ]
+    if missing_stores:
+        stores_payload = {"stores": missing_stores}
+        payload_digest = hashlib.sha256(
+            json.dumps(stores_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+        client.request(
+            "POST",
+            f"/v1/tenants/{tenant_id}/store-imports",
+            expected=201,
+            headers={
+                **platform_headers,
+                "Idempotency-Key": f"orange-demo-stores-100-{payload_digest}",
+            },
+            payload=stores_payload,
+        )
+        _, stores_value = client.request(
+            "GET", f"/v1/tenants/{tenant_id}/stores", headers=platform_headers
+        )
+    stores = {str(item["code"]): item for item in list_result(stores_value, "stores")}
+    desired_codes = {str(store["code"]) for store in desired_stores}
+    if not desired_codes.issubset(stores):
+        raise DemoFailure("100-store onboarding did not produce the complete Orange estate")
+    return stores
+
+
 def run(args: argparse.Namespace) -> None:
     client = Client(args.base_url, timeout=args.request_timeout)
     platform_headers = {"X-Platform-Key": args.platform_key}
@@ -262,36 +314,17 @@ def run(args: argparse.Namespace) -> None:
         payload={"code": "orange", "name": "Orange"},
     )
     tenant_id = str(required(object_result(tenant, "tenant"), "id"))
-    admin_token = login(client, args.admin_email, args.admin_password)
+    stores = provision_orange_estate(
+        client,
+        tenant_id=tenant_id,
+        platform_headers=platform_headers,
+    )
+    if args.provision_only:
+        print("PASS tenant/100-store footprint")
+        print("PROVISIONING COMPLETE")
+        return
 
-    stores_payload = {
-        "stores": [
-            {
-                "code": code,
-                "name": name,
-                "timezone": "America/Los_Angeles",
-                "organization_path": [{"code": "west", "name": "West", "unit_type": "REGION"}],
-                "zones": [
-                    {"code": "floor", "name": "Sales Floor", "kind": "SALES_FLOOR"},
-                    {"code": "backroom", "name": "Backroom", "kind": "BACKROOM"},
-                ],
-                "devices": [],
-                "configuration": {},
-            }
-            for code, name in (("orange-001", "Orange Store 1"), ("orange-002", "Orange Store 2"))
-        ]
-    }
-    client.request(
-        "POST",
-        f"/v1/tenants/{tenant_id}/store-imports",
-        expected=201,
-        headers={**platform_headers, "Idempotency-Key": "orange-demo-stores-v2"},
-        payload=stores_payload,
-    )
-    _, stores_value = client.request(
-        "GET", f"/v1/tenants/{tenant_id}/stores", headers=platform_headers
-    )
-    stores = {str(item["code"]): item for item in list_result(stores_value, "stores")}
+    admin_token = login(client, args.admin_email, args.admin_password)
     store1_id = str(required(stores["orange-001"], "id"))
     store2_id = str(required(stores["orange-002"], "id"))
     run_id = uuid.uuid4().hex[:10].upper()
@@ -652,7 +685,7 @@ def run(args: argparse.Namespace) -> None:
     ):
         raise DemoFailure("RFID reads incorrectly reversed an authoritative removal")
 
-    print("PASS tenant/store/zones/devices")
+    print("PASS tenant/100-store footprint and Store 1 zones/devices")
     print("PASS staged catalog import and atomic promotion")
     print("PASS RFID stable-zone inventory: floor=1 backroom=3")
     print("PASS duplicate and late-event replay protection")
@@ -668,19 +701,25 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--platform-key", default=os.getenv("PLATFORM_API_KEY"))
     result.add_argument("--admin-email", default=os.getenv("BOOTSTRAP_ADMIN_EMAIL"))
     result.add_argument("--admin-password", default=os.getenv("BOOTSTRAP_ADMIN_PASSWORD"))
-    result.add_argument("--request-timeout", type=float, default=15)
+    result.add_argument("--request-timeout", type=float, default=60)
     result.add_argument("--startup-timeout", type=float, default=120)
     result.add_argument("--poll-timeout", type=float, default=90)
+    result.add_argument(
+        "--provision-only",
+        action="store_true",
+        help="add missing store codes without running the mutable inventory workflow",
+    )
     return result
 
 
 def main() -> int:
     args = parser().parse_args()
-    missing = [
-        name
-        for name in ("platform_key", "admin_email", "admin_password")
-        if not getattr(args, name)
-    ]
+    required_configuration = (
+        ("platform_key",)
+        if args.provision_only
+        else ("platform_key", "admin_email", "admin_password")
+    )
+    missing = [name for name in required_configuration if not getattr(args, name)]
     if missing:
         raise SystemExit(f"missing configuration: {', '.join(missing)}")
     try:
