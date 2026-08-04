@@ -1,5 +1,5 @@
 flowchart LR
-    subgraph Demo[Submitted hosted scope]
+    subgraph Hosted[Hosted deployment]
         Reviewer[Reviewer / Swagger] -->|JWT| API[FastAPI API]
         Platform[Platform onboarding operator] -->|platform key| API
         Gateway[RFID gateway] -->|device token + batches| API
