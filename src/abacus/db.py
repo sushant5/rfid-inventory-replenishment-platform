@@ -68,7 +68,7 @@ def _apply_transaction_tenant_context(
     )
     store_scope = session.info.get(STORE_SCOPE_CONTEXT_KEY)
     if store_scope is not None:
-        if not isinstance(store_scope, str) or not store_scope:
+        if not isinstance(store_scope, str):
             raise RuntimeError("TenantSession contains an invalid store scope")
         connection.execute(
             text("SELECT set_config('app.store_scope', :store_scope, true)"),
@@ -128,9 +128,6 @@ def pin_session_to_store_scope(
         if tenant_wide
         else ",".join(str(store_id) for store_id in normalized_ids)
     )
-    if not scope:
-        raise RuntimeError("a store-scoped session requires at least one store")
-
     existing_scope = session.info.get(STORE_SCOPE_CONTEXT_KEY)
     if existing_scope is not None and existing_scope != scope:
         raise RuntimeError("A TenantSession cannot be rebound to another store scope")

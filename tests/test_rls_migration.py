@@ -359,6 +359,10 @@ def test_postgres_rls_and_security_definer_boundaries(postgres_engine: Engine) -
             text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
             {"tenant_id": str(tenant_a)},
         )
+        role_connection.execute(
+            text("SELECT set_config('app.store_scope', :store_scope, true)"),
+            {"store_scope": str(store_a)},
+        )
         visible_tenants = role_connection.scalars(
             text("SELECT id FROM public.tenants ORDER BY id")
         ).all()

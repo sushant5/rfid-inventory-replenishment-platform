@@ -1699,7 +1699,7 @@ def test_confirmed_backroom_to_floor_move_verifies_completed_task(
             ReplenishmentVerificationStatus.PENDING
         )
 
-    floor_at = task_started_at + timedelta(seconds=1)
+    floor_at = task_started_at + timedelta(seconds=20)
     floor_request = ObservationBatchCreate(
         device_id=durable_pipeline.device_id,
         observations=[

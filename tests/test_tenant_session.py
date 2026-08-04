@@ -89,6 +89,18 @@ def test_store_scope_requires_tenant_and_is_immutable() -> None:
         pin_session_to_store_scope(session, [uuid.uuid4()])
 
 
+def test_empty_store_scope_is_valid_and_fails_closed() -> None:
+    session = pin_session_to_tenant(TenantSession(), uuid.uuid4())
+    pin_session_to_store_scope(session)
+    transaction, connection = _event_arguments()
+
+    _apply_transaction_tenant_context(session, transaction, connection)
+
+    assert session.info[STORE_SCOPE_CONTEXT_KEY] == ""
+    _, parameters = connection.execute.call_args_list[1].args
+    assert parameters == {"store_scope": ""}
+
+
 def test_tenant_binding_is_idempotent_but_cannot_be_changed() -> None:
     first_tenant_id = uuid.uuid4()
     session = pin_session_to_tenant(TenantSession(), first_tenant_id)
