@@ -100,6 +100,7 @@ def test_openapi_contains_the_submission_contract() -> None:
     }
     optional_operations = {
         ("post", "/v1/auth/login"): "login",
+        ("get", "/v1/stores"): "listStores",
         ("get", "/v1/tenants/{tenant_id}/stores"): "listTenantStores",
         ("get", "/v1/stores/{store_id}/zones"): "listStoreZones",
         ("get", "/v1/stores/{store_id}/devices"): "listStoreDevices",
@@ -141,6 +142,7 @@ def test_openapi_contains_the_submission_contract() -> None:
         assert paths[path][method]["security"] == [{"PlatformApiKey": []}]
     for path, method in (
         ("/v1/me", "get"),
+        ("/v1/stores", "get"),
         ("/v1/skus", "get"),
         ("/v1/skus/{sku_id}", "get"),
         ("/v1/stores/{store_id}/devices", "get"),
