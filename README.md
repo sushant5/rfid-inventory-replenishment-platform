@@ -24,6 +24,10 @@ Public reviewer login:
 |---|---|---|---|
 | `orange` | `demo-reader@orange.example` | `Orange-Demo-ReadOnly-2026!` | Tenant-scoped, read-only |
 
+Demo-only reviewer account with access to synthetic Orange tenant data. All
+business-data mutation endpoints are denied. Administrative, device, platform, and
+infrastructure credentials are not published.
+
 In Swagger, run `POST /v1/auth/login`, copy the returned `access_token`, select
 **Authorize**, and paste it into `HTTPBearer`. Then call `GET /v1/me`, `GET /v1/stores`,
 `GET /v1/stores/{store_id}/zones`, `GET /v1/stores/{store_id}/devices`, `GET /v1/skus`,

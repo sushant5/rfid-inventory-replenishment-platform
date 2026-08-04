@@ -193,7 +193,10 @@ def test_root_discovers_the_reviewer_endpoints() -> None:
             "email": "demo-reader@orange.example",
             "password": "Orange-Demo-ReadOnly-2026!",
         },
-        "demo_access": "Read-only Orange tenant access; mutation requests return 403.",
+        "demo_access": (
+            "Demo-only reviewer account with access to synthetic Orange tenant data. "
+            "All business-data mutation endpoints are denied."
+        ),
         "reviewer_path": [
             "POST /v1/auth/login",
             "GET /v1/me",
@@ -206,7 +209,10 @@ def test_root_discovers_the_reviewer_endpoints() -> None:
             "GET /v1/stores/{store_id}/replenishment-tasks",
             "GET /v1/rfid/quarantine",
         ],
-        "private_credentials": "Platform, tenant-admin, and device credentials are private.",
+        "private_credentials": (
+            "Administrative, device, platform, and infrastructure credentials are not "
+            "published."
+        ),
         "liveness": "/health/live",
         "readiness": "/health/ready",
     }

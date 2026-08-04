@@ -162,7 +162,10 @@ def create_app() -> FastAPI:
             "openapi": "/openapi.json",
             "login": "/v1/auth/login",
             "stores": "/v1/stores",
-            "private_credentials": "Platform, tenant-admin, and device credentials are private.",
+            "private_credentials": (
+                "Administrative, device, platform, and infrastructure credentials "
+                "are not published."
+            ),
             "liveness": "/health/live",
             "readiness": "/health/ready",
         }
@@ -175,7 +178,8 @@ def create_app() -> FastAPI:
                         "password": PUBLIC_DEMO_PASSWORD,
                     },
                     "demo_access": (
-                        "Read-only Orange tenant access; mutation requests return 403."
+                        "Demo-only reviewer account with access to synthetic Orange "
+                        "tenant data. All business-data mutation endpoints are denied."
                     ),
                     "reviewer_path": [
                         "POST /v1/auth/login",
