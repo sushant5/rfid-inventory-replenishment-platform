@@ -413,8 +413,25 @@ class InventoryTransitionOutbox(Base):
         UniqueConstraint("tenant_id", "epc", "state_version", name="uq_outbox_item_state_version"),
         Index(
             "ix_inventory_outbox_unpublished",
+            "tenant_id",
             "created_at",
-            postgresql_where=text("published_at IS NULL"),
+            postgresql_where=text("published_at IS NULL AND quarantined_at IS NULL"),
+        ),
+        Index(
+            "ix_inventory_outbox_unreconciled_quarantine",
+            "tenant_id",
+            "quarantined_at",
+            postgresql_where=text("quarantined_at IS NOT NULL AND reconciled_at IS NULL"),
+        ),
+        CheckConstraint(
+            "NOT (published_at IS NOT NULL AND quarantined_at IS NOT NULL)",
+            name="ck_inventory_outbox_one_terminal_state",
+        ),
+        CheckConstraint(
+            "(quarantined_at IS NULL AND quarantine_reason IS NULL "
+            "AND reconciled_at IS NULL) OR "
+            "(quarantined_at IS NOT NULL AND quarantine_reason IS NOT NULL)",
+            name="ck_inventory_outbox_quarantine_metadata",
         ),
     )
 
@@ -429,6 +446,9 @@ class InventoryTransitionOutbox(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    quarantined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    quarantine_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     publish_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -534,6 +554,9 @@ class StoreConnectivity(Base):
         ),
         nullable=False,
         default=FreshnessStatus.STALE,
+    )
+    inventory_reconciliation_required_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
@@ -652,14 +675,11 @@ class ReplenishmentTaskStatus(StrEnum):
     EXPIRED = "EXPIRED"
 
 
-CanonicalTaskStatus = ReplenishmentTaskStatus
-
-
-class CanonicalReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class ReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "replenishment_tasks"
     __table_args__ = (
-        CheckConstraint("quantity > 0", name="ck_canonical_tasks_positive_quantity"),
-        CheckConstraint("version >= 1", name="ck_canonical_tasks_positive_version"),
+        CheckConstraint("quantity > 0", name="ck_replenishment_tasks_positive_quantity"),
+        CheckConstraint("version >= 1", name="ck_replenishment_tasks_positive_version"),
         Index(
             "uq_replenishment_tasks_active_store_sku",
             "tenant_id",
@@ -668,7 +688,7 @@ class CanonicalReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             unique=True,
             postgresql_where=text("status IN ('OPEN', 'CLAIMED', 'IN_PROGRESS')"),
         ),
-        Index("ix_canonical_tasks_store_status", "tenant_id", "store_id", "status"),
+        Index("ix_replenishment_tasks_store_status", "tenant_id", "store_id", "status"),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -686,15 +706,15 @@ class CanonicalReplenishmentTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     policy_rule_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("replenishment_policy_rules.id", ondelete="RESTRICT"), nullable=False
     )
-    status: Mapped[CanonicalTaskStatus] = mapped_column(
+    status: Mapped[ReplenishmentTaskStatus] = mapped_column(
         Enum(
-            CanonicalTaskStatus,
-            name="canonical_task_status",
+            ReplenishmentTaskStatus,
+            name="replenishment_task_status",
             native_enum=False,
             create_constraint=True,
         ),
         nullable=False,
-        default=CanonicalTaskStatus.OPEN,
+        default=ReplenishmentTaskStatus.OPEN,
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

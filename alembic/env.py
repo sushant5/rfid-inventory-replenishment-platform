@@ -12,8 +12,6 @@ from abacus.models import (  # noqa: F401
     catalog,
     identity,
     jobs,
-    replenishment,
-    rfid,
     tenancy,
 )
 

@@ -2,6 +2,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
@@ -18,10 +19,20 @@ from abacus.models.architecture import (
     RfidObservationBatchEvent,
     RfidObservationEventLedger,
     RfidObservationOutbox,
+    RfidQuarantine,
     StoreConnectivity,
 )
 from abacus.models.tenancy import Device, DeviceAssignment
-from abacus.schemas.architecture import CanonicalObservationBatchCreate
+from abacus.schemas.architecture import ObservationBatchCreate
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantineReplayResult:
+    quarantine_id: uuid.UUID
+    batch_id: uuid.UUID
+    event_id: str
+    processing_status: RfidEventProcessingStatus
+    queued: bool
 
 
 def _assignment_unavailable() -> ApiError:
@@ -123,7 +134,7 @@ def accept_observation_batch(
     db: Session,
     *,
     device: Device,
-    request: CanonicalObservationBatchCreate,
+    request: ObservationBatchCreate,
     received_at: datetime,
 ) -> tuple[RfidObservationBatch, list[RfidObservationEvent]]:
     """Atomically accept a batch, its event identities, links, and raw outbox rows."""
@@ -290,6 +301,185 @@ def accept_observation_batch(
         db.commit()
         db.refresh(batch)
         return batch, events
+    except Exception:
+        db.rollback()
+        raise
+
+
+def queue_quarantined_observation_replay(
+    db: Session,
+    *,
+    tenant_id: uuid.UUID,
+    quarantine_id: uuid.UUID,
+) -> QuarantineReplayResult:
+    """Idempotently requeue one immutable canonical event for operator recovery."""
+
+    try:
+        quarantine = db.scalar(
+            select(RfidQuarantine)
+            .where(
+                RfidQuarantine.id == quarantine_id,
+                RfidQuarantine.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        )
+        if quarantine is None:
+            raise ApiError(
+                404,
+                "RFID quarantine record not found",
+                "The requested quarantine record does not exist.",
+            )
+        if quarantine.event_id is None:
+            raise ApiError(
+                409,
+                "RFID quarantine replay unavailable",
+                "The quarantine record has no canonical event identity to replay.",
+                code="quarantine_event_identity_missing",
+            )
+
+        ledger = db.scalar(
+            select(RfidObservationEventLedger)
+            .where(
+                RfidObservationEventLedger.tenant_id == tenant_id,
+                RfidObservationEventLedger.event_id == quarantine.event_id,
+            )
+            .with_for_update()
+        )
+        outbox = db.scalar(
+            select(RfidObservationOutbox)
+            .where(
+                RfidObservationOutbox.tenant_id == tenant_id,
+                RfidObservationOutbox.event_id == quarantine.event_id,
+            )
+            .with_for_update()
+        )
+        if ledger is None or outbox is None:
+            raise ApiError(
+                409,
+                "RFID quarantine replay unavailable",
+                "The quarantine record is not backed by a complete canonical event ledger.",
+                code="quarantine_event_ledger_incomplete",
+            )
+
+        if ledger.processing_status is RfidEventProcessingStatus.PROCESSED:
+            return QuarantineReplayResult(
+                quarantine_id=quarantine.id,
+                batch_id=quarantine.batch_id,
+                event_id=ledger.event_id,
+                processing_status=ledger.processing_status,
+                queued=False,
+            )
+        if ledger.processing_status is RfidEventProcessingStatus.PENDING:
+            if outbox.published_at is not None:
+                raise ApiError(
+                    409,
+                    "RFID quarantine replay unavailable",
+                    "The event ledger and durable inbox have inconsistent processing state.",
+                    code="quarantine_event_state_inconsistent",
+                )
+            return QuarantineReplayResult(
+                quarantine_id=quarantine.id,
+                batch_id=quarantine.batch_id,
+                event_id=ledger.event_id,
+                processing_status=ledger.processing_status,
+                queued=False,
+            )
+
+        event = RfidObservationEvent(
+            tenant_id=ledger.tenant_id,
+            batch_id=quarantine.batch_id,
+            event_id=ledger.event_id,
+            device_id=ledger.device_id,
+            store_id=ledger.store_id,
+            zone_id=ledger.zone_id,
+            epc=ledger.epc,
+            observed_at=ledger.observed_at,
+            received_at=ledger.first_received_at,
+            rssi=ledger.rssi,
+            antenna_id=ledger.antenna_id,
+            reader_health=ledger.reader_health,
+            is_buffered=ledger.is_buffered,
+            backlog_drained=ledger.backlog_drained,
+            reader_coverage_ok=ledger.reader_coverage_ok,
+            replayed_from_quarantine_id=quarantine.id,
+        )
+
+        links = list(
+            db.scalars(
+                select(RfidObservationBatchEvent)
+                .where(
+                    RfidObservationBatchEvent.tenant_id == tenant_id,
+                    RfidObservationBatchEvent.event_id == ledger.event_id,
+                )
+                .with_for_update()
+            ).all()
+        )
+        if not links:
+            raise ApiError(
+                409,
+                "RFID quarantine replay unavailable",
+                "The canonical event is not linked to an observation batch.",
+                code="quarantine_batch_link_missing",
+            )
+
+        ledger.processing_status = RfidEventProcessingStatus.PENDING
+        ledger.disposition = "REPLAY_QUEUED"
+        ledger.rejection_reason = None
+        ledger.processed_at = None
+        for link in links:
+            link.processing_status = RfidEventProcessingStatus.PENDING
+            link.disposition = "REPLAY_QUEUED"
+            link.rejection_reason = None
+            link.finalized_at = None
+
+        batch_ids = {link.batch_id for link in links}
+        for batch_id in batch_ids:
+            batch = db.scalar(
+                select(RfidObservationBatch)
+                .where(
+                    RfidObservationBatch.tenant_id == tenant_id,
+                    RfidObservationBatch.id == batch_id,
+                )
+                .with_for_update()
+            )
+            if batch is None:
+                raise ApiError(
+                    409,
+                    "RFID quarantine replay unavailable",
+                    "An observation batch linked to the event no longer exists.",
+                    code="quarantine_batch_missing",
+                )
+            batch_links = list(
+                db.scalars(
+                    select(RfidObservationBatchEvent).where(
+                        RfidObservationBatchEvent.tenant_id == tenant_id,
+                        RfidObservationBatchEvent.batch_id == batch_id,
+                    )
+                ).all()
+            )
+            batch.processed_count = sum(
+                item.processing_status is RfidEventProcessingStatus.PROCESSED
+                for item in batch_links
+            )
+            batch.rejected_count = sum(
+                item.processing_status is RfidEventProcessingStatus.REJECTED for item in batch_links
+            )
+            batch.status = ObservationBatchStatus.PROCESSING
+            batch.completed_at = None
+
+        outbox.partition_key = event.partition_key
+        outbox.payload = event.model_dump(mode="json")
+        outbox.published_at = None
+        outbox.publish_attempts = 0
+        outbox.last_error = None
+        db.commit()
+        return QuarantineReplayResult(
+            quarantine_id=quarantine.id,
+            batch_id=quarantine.batch_id,
+            event_id=ledger.event_id,
+            processing_status=ledger.processing_status,
+            queued=True,
+        )
     except Exception:
         db.rollback()
         raise

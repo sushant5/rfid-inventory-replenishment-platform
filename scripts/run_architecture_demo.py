@@ -80,7 +80,7 @@ class Client:
         self,
         tenant_id: str,
         *,
-        platform_key: str,
+        access_token: str,
     ) -> dict[str, Any]:
         boundary = f"abacus-{uuid.uuid4().hex}"
         content = CATALOG.read_bytes()
@@ -102,7 +102,7 @@ class Client:
             f"/v1/tenants/{tenant_id}/catalog-imports",
             expected=202,
             headers={
-                "X-Platform-Key": platform_key,
+                **bearer(access_token),
                 "Idempotency-Key": "orange-demo-catalog-v2",
             },
             body=body,
@@ -326,14 +326,14 @@ def run(args: argparse.Namespace) -> None:
         )
         devices[code] = object_result(registration, f"{code} device")
 
-    catalog_import = client.multipart_catalog(tenant_id, platform_key=args.platform_key)
+    catalog_import = client.multipart_catalog(tenant_id, access_token=admin_token)
     import_id = str(required(catalog_import, "id"))
     completed_import = poll(
         "catalog promotion",
         lambda: client.request(
             "GET",
             f"/v1/catalog-imports/{import_id}",
-            headers=platform_headers,
+            headers=bearer(admin_token),
         )[1],
         lambda item: item["status"] in {"COMPLETED", "FAILED", "REJECTED"},
         timeout=args.poll_timeout,
@@ -343,7 +343,7 @@ def run(args: argparse.Namespace) -> None:
     _, import_errors_value = client.request(
         "GET",
         f"/v1/catalog-imports/{import_id}/errors",
-        headers=platform_headers,
+        headers=bearer(admin_token),
     )
     import_errors = object_result(import_errors_value, "catalog import errors")
     if int(required(import_errors, "total")) != 0:

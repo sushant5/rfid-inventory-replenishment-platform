@@ -45,11 +45,6 @@ class RoleAssignmentCreate(ApiModel):
         return self
 
 
-class RoleAssignmentRead(ApiModel):
-    role: IdentityRole
-    store_id: uuid.UUID | None
-
-
 class UserRolesReplace(ApiModel):
     roles: list[CanonicalIdentityRole] = Field(min_length=1, max_length=4)
 
@@ -185,18 +180,6 @@ class UserCreateRequest(ApiModel):
         return self
 
 
-class UserRead(ApiModel):
-    id: uuid.UUID
-    tenant_id: uuid.UUID
-    email: EmailStr
-    display_name: str
-    status: UserStatus
-    role_assignments: list[RoleAssignmentRead]
-    last_login_at: datetime | None
-    created_at: datetime
-    updated_at: datetime
-
-
 class UserResponse(ApiModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -210,27 +193,11 @@ class UserResponse(ApiModel):
     updated_at: datetime
 
 
-class UserPage(ApiModel):
-    items: list[UserRead]
-    total: int
-    limit: int
-    offset: int
-
-
 class UserListResponse(ApiModel):
     items: list[UserResponse]
     total: int
     limit: int
     offset: int
-
-
-class CurrentPrincipalRead(ApiModel):
-    user_id: uuid.UUID
-    tenant_id: uuid.UUID
-    email: EmailStr
-    display_name: str
-    role_assignments: list[RoleAssignmentRead]
-    permissions: list[str]
 
 
 class CurrentUserResponse(ApiModel):

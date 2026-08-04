@@ -14,13 +14,13 @@ from abacus.config import get_settings
 from abacus.db import SessionLocal, tenant_session_scope
 from abacus.enums import JobKind, JobStatus
 from abacus.models.architecture import (
-    CanonicalReplenishmentTask,
-    CanonicalTaskStatus,
     CurrentItemState,
     InventoryProjection,
     PolicyRule,
     PolicyVersion,
     PolicyVersionStatus,
+    ReplenishmentTask,
+    ReplenishmentTaskStatus,
     RfidObservationBatch,
 )
 from abacus.models.identity import IdentityRole
@@ -198,10 +198,10 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
             assert (
                 verify_db.scalar(
                     select(func.count())
-                    .select_from(CanonicalReplenishmentTask)
+                    .select_from(ReplenishmentTask)
                     .where(
-                        CanonicalReplenishmentTask.tenant_id == tenant_id,
-                        CanonicalReplenishmentTask.status == CanonicalTaskStatus.COMPLETED,
+                        ReplenishmentTask.tenant_id == tenant_id,
+                        ReplenishmentTask.status == ReplenishmentTaskStatus.COMPLETED,
                     )
                 )
                 == 1
@@ -238,9 +238,7 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                     .values(status=PolicyVersionStatus.DRAFT)
                 )
                 cleanup_db.execute(
-                    delete(CanonicalReplenishmentTask).where(
-                        CanonicalReplenishmentTask.tenant_id == tenant_id
-                    )
+                    delete(ReplenishmentTask).where(ReplenishmentTask.tenant_id == tenant_id)
                 )
                 cleanup_db.execute(delete(PolicyRule).where(PolicyRule.tenant_id == tenant_id))
                 cleanup_db.execute(delete(Tenant).where(Tenant.id == tenant_id))

@@ -6,50 +6,37 @@ from fastapi import APIRouter, Depends, Query, status
 from fastapi.security import APIKeyHeader
 from sqlalchemy import func, select
 
-from abacus.api.dependencies import (
-    DatabaseSession,
-    PlatformAccess,
-    SettingsDependency,
-)
+from abacus.api.dependencies import DatabaseSession, SettingsDependency
 from abacus.api.errors import ApiError
-from abacus.enums import ObservationStatus
 from abacus.models.architecture import (
     CurrentItemState,
     InventoryProjection,
+    RfidEventProcessingStatus,
     RfidObservationBatch,
+    RfidObservationEventLedger,
     RfidQuarantine,
     StoreConnectivity,
 )
 from abacus.models.catalog import Sku
 from abacus.models.tenancy import Store, Zone
 from abacus.schemas.architecture import (
-    CanonicalObservationBatchCreate,
     InventoryProjectionPage,
     InventoryProjectionRead,
     ItemStateRead,
     ObservationBatchAccepted,
+    ObservationBatchCreate,
     ObservationBatchRead,
     RfidQuarantinePage,
     RfidQuarantineRead,
+    RfidQuarantineReplayRead,
 )
 from abacus.schemas.catalog import normalize_epc
-from abacus.schemas.rfid import (
-    InventoryBalanceListRead,
-    InventoryBalanceRead,
-    RfidBatchInput,
-    RfidBatchReceipt,
-    RfidObservationListRead,
-    RfidObservationRead,
-)
 from abacus.security import Permission, Principal, require_permission
-from abacus.services.rfid import (
-    authenticate_device,
-    ingest_batch,
-    list_balances,
-    list_observations,
-    replay_quarantined_observation,
+from abacus.services.device_auth import authenticate_device
+from abacus.services.rfid_ingress import (
+    accept_observation_batch,
+    queue_quarantined_observation_replay,
 )
-from abacus.services.rfid_ingress import accept_observation_batch
 from abacus.services.streaming_inventory import (
     current_inventory_bucket_metadata,
     effective_bucket_confidence,
@@ -57,23 +44,15 @@ from abacus.services.streaming_inventory import (
     effective_item_confidence,
 )
 
-device_router = APIRouter(prefix="/v1/device", tags=["3. RFID Ingestion"])
-platform_router = APIRouter(tags=["3. RFID Inventory"])
-canonical_router = APIRouter(prefix="/v1", tags=["3. RFID and Inventory"])
+router = APIRouter(prefix="/v1", tags=["3. RFID and Inventory"])
 CanReadInventory = Annotated[
     Principal,
     Depends(require_permission(Permission.INVENTORY_READ)),
 ]
-_device_key_header = APIKeyHeader(
-    name="X-Device-Key",
-    scheme_name="DeviceApiKey",
-    description=(
-        "RFID reader or gateway API key; plaintext is returned once and remains valid "
-        "until rotation."
-    ),
-    auto_error=False,
-)
-DeviceKey = Annotated[str | None, Depends(_device_key_header)]
+CanConfigureTenant = Annotated[
+    Principal,
+    Depends(require_permission(Permission.TENANT_CONFIGURE)),
+]
 _device_token_header = APIKeyHeader(
     name="X-Device-Token",
     scheme_name="DeviceToken",
@@ -83,14 +62,14 @@ _device_token_header = APIKeyHeader(
 DeviceToken = Annotated[str | None, Depends(_device_token_header)]
 
 
-@canonical_router.post(
+@router.post(
     "/rfid/observation-batches",
     response_model=ObservationBatchAccepted,
     status_code=status.HTTP_202_ACCEPTED,
     operation_id="submitRfidObservationBatch",
 )
 def submit_observation_batch_endpoint(
-    request: CanonicalObservationBatchCreate,
+    request: ObservationBatchCreate,
     db: DatabaseSession,
     x_device_token: DeviceToken,
 ) -> ObservationBatchAccepted:
@@ -108,7 +87,7 @@ def submit_observation_batch_endpoint(
     )
 
 
-@canonical_router.get(
+@router.get(
     "/rfid/observation-batches/{batch_id}",
     response_model=ObservationBatchRead,
     operation_id="getRfidObservationBatch",
@@ -138,7 +117,7 @@ def get_observation_batch_endpoint(
     )
 
 
-@canonical_router.get(
+@router.get(
     "/rfid/quarantine",
     response_model=RfidQuarantinePage,
     operation_id="listRfidQuarantine",
@@ -167,27 +146,74 @@ def list_rfid_quarantine_endpoint(
     if reason is not None:
         predicates.append(RfidQuarantine.reason == reason)
     total = db.scalar(select(func.count(RfidQuarantine.id)).where(*predicates)) or 0
-    records = list(
-        db.scalars(
-            select(RfidQuarantine)
-            .where(*predicates)
-            .order_by(
-                RfidQuarantine.quarantined_at.desc(),
-                RfidQuarantine.id.desc(),
-            )
-            .limit(limit)
-            .offset(offset)
-        ).all()
-    )
+    records = db.execute(
+        select(
+            RfidQuarantine,
+            RfidObservationEventLedger.processing_status,
+            RfidObservationEventLedger.processed_at,
+        )
+        .outerjoin(
+            RfidObservationEventLedger,
+            (RfidObservationEventLedger.tenant_id == RfidQuarantine.tenant_id)
+            & (RfidObservationEventLedger.event_id == RfidQuarantine.event_id),
+        )
+        .where(*predicates)
+        .order_by(
+            RfidQuarantine.quarantined_at.desc(),
+            RfidQuarantine.id.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    items = [
+        RfidQuarantineRead(
+            id=record.id,
+            batch_id=record.batch_id,
+            event_id=record.event_id,
+            reason=record.reason,
+            payload=record.payload,
+            quarantined_at=record.quarantined_at,
+            processing_status=processing_status,
+            resolved_at=(
+                processed_at if processing_status is RfidEventProcessingStatus.PROCESSED else None
+            ),
+        )
+        for record, processing_status, processed_at in records
+    ]
     return RfidQuarantinePage(
-        items=[RfidQuarantineRead.model_validate(record) for record in records],
+        items=items,
         total=total,
         limit=limit,
         offset=offset,
     )
 
 
-@canonical_router.get(
+@router.post(
+    "/rfid/quarantine/{quarantine_id}:replay",
+    response_model=RfidQuarantineReplayRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    operation_id="replayRfidQuarantine",
+)
+def replay_rfid_quarantine_endpoint(
+    quarantine_id: uuid.UUID,
+    db: DatabaseSession,
+    principal: CanConfigureTenant,
+) -> RfidQuarantineReplayRead:
+    result = queue_quarantined_observation_replay(
+        db,
+        tenant_id=principal.tenant_id,
+        quarantine_id=quarantine_id,
+    )
+    return RfidQuarantineReplayRead(
+        quarantine_id=result.quarantine_id,
+        batch_id=result.batch_id,
+        event_id=result.event_id,
+        processing_status=result.processing_status,
+        queued=result.queued,
+    )
+
+
+@router.get(
     "/stores/{store_id}/inventory",
     response_model=InventoryProjectionPage,
     operation_id="getStoreInventory",
@@ -287,7 +313,7 @@ def get_store_inventory_endpoint(
     )
 
 
-@canonical_router.get(
+@router.get(
     "/items/{epc}",
     response_model=ItemStateRead,
     operation_id="getCurrentItemState",
@@ -351,130 +377,4 @@ def get_item_state_endpoint(
         ),
         state_version=item.state_version,
         freshness_status=effective_freshness(connectivity, settings, now=evaluated_at),
-    )
-
-
-@device_router.post(
-    "/read-batches",
-    response_model=RfidBatchReceipt,
-    status_code=status.HTTP_202_ACCEPTED,
-    operation_id="ingestRfidReadBatch",
-)
-def ingest_rfid_batch_endpoint(
-    request: RfidBatchInput,
-    db: DatabaseSession,
-    x_device_key: DeviceKey,
-) -> RfidBatchReceipt:
-    device = authenticate_device(db, x_device_key)
-    return ingest_batch(db, device, request)
-
-
-@platform_router.get(
-    "/v1/tenants/{tenant_id}/inventory",
-    response_model=InventoryBalanceListRead,
-    operation_id="listInventoryBalances",
-)
-def list_inventory_endpoint(
-    tenant_id: uuid.UUID,
-    db: DatabaseSession,
-    principal: CanReadInventory,
-    store_id: uuid.UUID | None = None,
-    limit: Annotated[int, Query(ge=1, le=200)] = 100,
-    offset: Annotated[int, Query(ge=0)] = 0,
-) -> InventoryBalanceListRead:
-    if principal.tenant_id != tenant_id:
-        raise ApiError(
-            403,
-            "Forbidden",
-            "The requested tenant is outside the current user's access scope.",
-            code="tenant_scope_denied",
-        )
-    if store_id is None and not principal.has_tenant_permission(Permission.INVENTORY_READ):
-        raise ApiError(
-            400,
-            "Store filter required",
-            "Store-scoped users must specify store_id when listing inventory.",
-            code="store_filter_required",
-        )
-    if store_id is not None and not principal.can_access_store(Permission.INVENTORY_READ, store_id):
-        raise ApiError(
-            403,
-            "Forbidden",
-            "The requested store is outside the current user's access scope.",
-            code="store_scope_denied",
-        )
-    rows, total = list_balances(
-        db,
-        tenant_id,
-        store_id=store_id,
-        limit=limit,
-        offset=offset,
-    )
-    return InventoryBalanceListRead(
-        items=[
-            InventoryBalanceRead(
-                tenant_id=balance.tenant_id,
-                store_id=balance.store_id,
-                zone_id=balance.zone_id,
-                zone_kind=zone.kind,
-                sku_id=balance.sku_id,
-                sku_code=sku.code,
-                quantity=balance.quantity,
-                projection_updated_at=balance.updated_at,
-                last_relevant_observation_at=balance.last_relevant_observation_at,
-            )
-            for balance, zone, sku in rows
-        ],
-        total=total,
-        limit=limit,
-        offset=offset,
-    )
-
-
-@platform_router.post(
-    "/v1/platform/tenants/{tenant_id}/rfid/observations/{observation_id}:replay",
-    response_model=RfidObservationRead,
-    status_code=status.HTTP_202_ACCEPTED,
-    operation_id="replayQuarantinedObservation",
-)
-def replay_observation_endpoint(
-    tenant_id: uuid.UUID,
-    observation_id: uuid.UUID,
-    db: DatabaseSession,
-    _: PlatformAccess,
-) -> RfidObservationRead:
-    observation = replay_quarantined_observation(db, tenant_id, observation_id)
-    return RfidObservationRead.model_validate(observation)
-
-
-@platform_router.get(
-    "/v1/platform/tenants/{tenant_id}/rfid/observations",
-    response_model=RfidObservationListRead,
-    operation_id="listRfidObservations",
-)
-def list_observations_endpoint(
-    tenant_id: uuid.UUID,
-    db: DatabaseSession,
-    _: PlatformAccess,
-    observation_status: Annotated[
-        ObservationStatus | None,
-        Query(alias="status"),
-    ] = None,
-    epc: Annotated[str | None, Query(min_length=4, max_length=128)] = None,
-    limit: Annotated[int, Query(ge=1, le=200)] = 100,
-    offset: Annotated[int, Query(ge=0)] = 0,
-) -> RfidObservationListRead:
-    observations, total = list_observations(
-        db,
-        tenant_id,
-        status=observation_status,
-        epc=epc,
-        limit=limit,
-        offset=offset,
-    )
-    return RfidObservationListRead(
-        items=[RfidObservationRead.model_validate(item) for item in observations],
-        total=total,
-        limit=limit,
-        offset=offset,
     )

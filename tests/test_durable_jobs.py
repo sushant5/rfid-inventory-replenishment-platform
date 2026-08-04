@@ -54,7 +54,7 @@ def test_queue_timestamps_do_not_use_the_worker_process_clock(
         job = enqueue_job(
             db,
             tenant_id=tenant_id,
-            kind=JobKind.REPLENISHMENT_RECALC,
+            kind=JobKind.CATALOG_IMPORT,
             payload={"clock_probe": True},
         )
         after_enqueue = _database_now(db)
@@ -110,13 +110,13 @@ def test_claim_jobs_skips_suspended_tenants(
         active_job = enqueue_job(
             db,
             tenant_id=active_tenant.id,
-            kind=JobKind.REPLENISHMENT_RECALC,
+            kind=JobKind.CATALOG_IMPORT,
             payload={"tenant_status_probe": "active"},
         )
         suspended_job = enqueue_job(
             db,
             tenant_id=suspended_tenant.id,
-            kind=JobKind.REPLENISHMENT_RECALC,
+            kind=JobKind.CATALOG_IMPORT,
             payload={"tenant_status_probe": "suspended"},
         )
         active_tenant_id = active_tenant.id
@@ -168,7 +168,7 @@ def test_expired_lease_at_attempt_limit_is_quarantined(
         now = _database_now(db)
         exhausted = DurableJob(
             tenant_id=tenant.id,
-            kind=JobKind.REPLENISHMENT_RECALC,
+            kind=JobKind.CATALOG_IMPORT,
             payload={"lease_probe": "exhausted"},
             status=JobStatus.PROCESSING,
             attempts=3,
@@ -178,7 +178,7 @@ def test_expired_lease_at_attempt_limit_is_quarantined(
         )
         exhausted_pending = DurableJob(
             tenant_id=tenant.id,
-            kind=JobKind.REPLENISHMENT_RECALC,
+            kind=JobKind.CATALOG_IMPORT,
             payload={"lease_probe": "pending-budget-lowered"},
             status=JobStatus.PENDING,
             attempts=3,
@@ -186,7 +186,7 @@ def test_expired_lease_at_attempt_limit_is_quarantined(
         )
         reclaimable = DurableJob(
             tenant_id=tenant.id,
-            kind=JobKind.REPLENISHMENT_RECALC,
+            kind=JobKind.CATALOG_IMPORT,
             payload={"lease_probe": "reclaimable"},
             status=JobStatus.PROCESSING,
             attempts=2,

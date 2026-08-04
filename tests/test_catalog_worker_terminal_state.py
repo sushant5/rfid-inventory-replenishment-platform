@@ -112,6 +112,33 @@ def test_terminal_failure_marker_sets_a_useful_polling_result() -> None:
     assert "RuntimeError: catalog parser exploded" in catalog_import.failure_reason
 
 
+@pytest.mark.parametrize(
+    "import_status",
+    [CatalogImportStatus.COMPLETED, CatalogImportStatus.REJECTED],
+)
+def test_terminal_success_reconciles_quarantined_job(import_status: CatalogImportStatus) -> None:
+    tenant_id = uuid.uuid4()
+    catalog_import = CatalogImport(status=import_status)
+    job = DurableJob(
+        status=JobStatus.QUARANTINED,
+        locked_by=None,
+        lease_expires_at=None,
+        last_error="LeaseExpired: maximum processing attempts exhausted",
+    )
+    rows = Mock()
+    rows.all.return_value = [(job, catalog_import)]
+    db = Mock(spec=Session)
+    db.execute.return_value = rows
+
+    assert reconcile_quarantined_catalog_imports(db, tenant_id=tenant_id) == 1
+    assert catalog_import.status is import_status
+    assert job.status is JobStatus.COMPLETED
+    assert job.locked_by is None
+    assert job.lease_expires_at is None
+    assert job.last_error is None
+    db.commit.assert_called_once_with()
+
+
 @pytest.mark.integration
 def test_retry_exhaustion_fails_import_and_quarantines_job(
     postgres_session_factory: sessionmaker[Session],
@@ -217,6 +244,69 @@ def test_expired_exhausted_lease_terminalizes_catalog_import(
             assert persisted_job.last_error == (
                 "LeaseExpired: maximum processing attempts exhausted"
             )
+    finally:
+        with postgres_session_factory() as db:
+            db.execute(delete(Tenant).where(Tenant.id == tenant_id))
+            db.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("import_status", "expected_job_status", "expected_reconciled"),
+    [
+        (CatalogImportStatus.COMPLETED, JobStatus.COMPLETED, 1),
+        (CatalogImportStatus.REJECTED, JobStatus.COMPLETED, 1),
+        (CatalogImportStatus.FAILED, JobStatus.QUARANTINED, 0),
+    ],
+)
+def test_expired_job_reconciliation_preserves_terminal_import_outcome(
+    postgres_session_factory: sessionmaker[Session],
+    import_status: CatalogImportStatus,
+    expected_job_status: JobStatus,
+    expected_reconciled: int,
+) -> None:
+    with postgres_session_factory() as db:
+        tenant_id, catalog_import, job, _worker_id = _create_claimed_catalog_job(
+            db,
+            attempts=1,
+            import_status=import_status,
+        )
+        import_id = catalog_import.id
+        job_id = job.id
+        job.lease_expires_at = _database_now(db) - timedelta(seconds=1)
+        db.commit()
+
+    try:
+        with postgres_session_factory() as db:
+            assert (
+                claim_jobs(
+                    db,
+                    worker_id="catalog-terminal-recovery-worker",
+                    limit=1,
+                    lease_seconds=30,
+                    max_attempts=1,
+                    tenant_id=tenant_id,
+                    kinds=(JobKind.CATALOG_IMPORT,),
+                )
+                == []
+            )
+            assert (
+                reconcile_quarantined_catalog_imports(db, tenant_id=tenant_id)
+                == expected_reconciled
+            )
+
+        with postgres_session_factory() as db:
+            persisted_import = db.get(CatalogImport, import_id)
+            persisted_job = db.get(DurableJob, job_id)
+            assert persisted_import is not None
+            assert persisted_import.status is import_status
+            assert persisted_job is not None
+            assert persisted_job.status is expected_job_status
+            if expected_job_status is JobStatus.COMPLETED:
+                assert persisted_job.last_error is None
+            else:
+                assert persisted_job.last_error is not None
+                assert "LeaseExpired" in persisted_job.last_error
     finally:
         with postgres_session_factory() as db:
             db.execute(delete(Tenant).where(Tenant.id == tenant_id))

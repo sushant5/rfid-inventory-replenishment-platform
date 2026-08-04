@@ -1,8 +1,9 @@
 # Free hosted-demo topology: one supervised web container runs the same API and two
 # worker entry points that Docker Compose runs separately. The launcher performs
 # migrations because Render pre-deploy commands and background workers are paid-only.
-# A production deployment should use separate services and keep the owner credential
-# out of the long-running application container.
+# The launcher strips the owner credential from every long-running child environment.
+# A production deployment should additionally run migrations in a separate release job
+# so the owner credential never enters the application container.
 services:
   - type: web
     name: abacus-take-home-api

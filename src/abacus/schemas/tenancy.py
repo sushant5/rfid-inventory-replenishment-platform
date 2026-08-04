@@ -213,29 +213,10 @@ class DeviceRead(ApiModel):
     status: DeviceStatus
 
 
-class DeviceCredentialRead(ApiModel):
-    device_id: uuid.UUID
-    api_key: str
-    warning: str = "This credential is shown once. Store it securely."
-
-
 class DeviceTokenRead(ApiModel):
     device_id: uuid.UUID
     device_token: str
     warning: str = "This credential is shown once. Store it securely."
-
-
-class DeviceAssignmentCreate(ApiModel):
-    store_id: uuid.UUID
-    zone_id: uuid.UUID
-    effective_from: datetime
-
-    @field_validator("effective_from")
-    @classmethod
-    def require_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("effective_from must include a timezone offset")
-        return value
 
 
 class DeviceAssignmentRead(ApiModel):

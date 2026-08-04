@@ -7,23 +7,23 @@ from sqlalchemy import delete, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from abacus.api.errors import ApiError
-from abacus.api.routes.canonical_replenishment import router
+from abacus.api.routes.replenishment import router
 from abacus.models.architecture import (
-    CanonicalTaskStatus,
     PolicyDefinition,
     PolicyRule,
     PolicyVersion,
     PolicyVersionStatus,
+    ReplenishmentTaskStatus,
 )
 from abacus.models.identity import IdentityRole
 from abacus.models.tenancy import Tenant
-from abacus.schemas.canonical_replenishment import (
+from abacus.schemas.replenishment import (
     PolicyCreate,
     PolicyRuleWrite,
     ReplenishmentEvaluationCreate,
 )
 from abacus.security import Principal, RoleScope
-from abacus.services.canonical_replenishment import (
+from abacus.services.replenishment import (
     PolicyBundle,
     RuleDescriptor,
     SkuContext,
@@ -159,7 +159,7 @@ def test_rule_schema_rejects_undefined_or_ambiguous_scopes() -> None:
 
 
 def test_task_statuses_are_the_exact_canonical_state_machine() -> None:
-    assert [status.value for status in CanonicalTaskStatus] == [
+    assert [status.value for status in ReplenishmentTaskStatus] == [
         "OPEN",
         "CLAIMED",
         "IN_PROGRESS",
@@ -359,7 +359,7 @@ def test_policy_discovery_prefers_active_and_can_select_latest_draft(
             db.commit()
 
 
-def test_canonical_replenishment_api_is_versioned_and_jwt_secured() -> None:
+def test_replenishment_api_is_versioned_and_jwt_secured() -> None:
     app = FastAPI()
     app.include_router(router)
     paths = app.openapi()["paths"]

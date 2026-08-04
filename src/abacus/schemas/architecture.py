@@ -6,6 +6,7 @@ from pydantic import Field, field_validator, model_validator
 from abacus.models.architecture import (
     FreshnessStatus,
     ObservationBatchStatus,
+    RfidEventProcessingStatus,
 )
 from abacus.schemas.catalog import normalize_epc
 from abacus.schemas.common import ApiModel
@@ -50,12 +51,6 @@ class ObservationBatchCreate(ApiModel):
         return self
 
 
-# Internal compatibility aliases keep the durable processing modules stable while the
-# public OpenAPI contract uses concise domain names.
-CanonicalObservationInput = ObservationInput
-CanonicalObservationBatchCreate = ObservationBatchCreate
-
-
 class ObservationBatchAccepted(ApiModel):
     batch_id: uuid.UUID
     status: ObservationBatchStatus
@@ -78,6 +73,8 @@ class RfidQuarantineRead(ApiModel):
     reason: str
     payload: dict[str, object]
     quarantined_at: datetime
+    processing_status: RfidEventProcessingStatus | None
+    resolved_at: datetime | None
 
 
 class RfidQuarantinePage(ApiModel):
@@ -85,6 +82,14 @@ class RfidQuarantinePage(ApiModel):
     total: int
     limit: int
     offset: int
+
+
+class RfidQuarantineReplayRead(ApiModel):
+    quarantine_id: uuid.UUID
+    batch_id: uuid.UUID
+    event_id: str
+    processing_status: RfidEventProcessingStatus
+    queued: bool
 
 
 class InventoryProjectionRead(ApiModel):

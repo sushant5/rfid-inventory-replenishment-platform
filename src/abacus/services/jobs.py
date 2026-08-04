@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 from abacus.enums import JobKind, JobStatus, TenantStatus
 from abacus.models.jobs import DurableJob
 from abacus.models.tenancy import Tenant
-from abacus.services.cutover import ensure_reservation_cutover_ready
 
 
 def _database_now(db: Session) -> datetime:
@@ -52,9 +51,6 @@ def claim_jobs(
     tenant_id: uuid.UUID | None = None,
     kinds: tuple[JobKind, ...] | None = None,
 ) -> list[DurableJob]:
-    # Readiness does not stop a separately deployed worker. Refuse to lease any
-    # durable work while legacy replenishment reservations await reconciliation.
-    ensure_reservation_cutover_ready(db)
     now = _database_now(db)
 
     # A worker can disappear without reporting its failure, and deployments can

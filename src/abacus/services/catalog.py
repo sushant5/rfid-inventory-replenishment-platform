@@ -24,6 +24,7 @@ from abacus.models.catalog import (
     CatalogImportError,
     CatalogImportMode,
     CatalogImportRow,
+    CatalogImportSource,
     CatalogImportStatus,
     CatalogRowAction,
     CatalogRowStatus,
@@ -645,7 +646,7 @@ def _persist_issue(
     )
 
 
-def stage_catalog_import(
+def accept_catalog_import(
     db: Session,
     tenant_id: uuid.UUID,
     idempotency_key: str,
@@ -655,7 +656,7 @@ def stage_catalog_import(
     filename: str,
     content_type: str | None,
 ) -> CatalogImport:
-    """Persist, validate, and reconcile a CSV without mutating canonical products."""
+    """Durably accept immutable source bytes for asynchronous validation."""
 
     if isinstance(db, TenantSession):
         pin_session_to_tenant(db, tenant_id)
@@ -667,6 +668,13 @@ def stage_catalog_import(
             "Invalid idempotency key",
             "Idempotency-Key must contain 8 to 128 non-blank characters.",
             code="invalid_idempotency_key",
+        )
+    if len(content) > MAX_CATALOG_FILE_BYTES:
+        raise ApiError(
+            413,
+            "Catalog file is too large",
+            f"Catalog CSV must not exceed {MAX_CATALOG_FILE_BYTES} bytes.",
+            code="catalog_file_too_large",
         )
     checksum = hashlib.sha256(content).hexdigest()
     existing = db.scalar(
@@ -698,68 +706,28 @@ def stage_catalog_import(
         reconciliation={},
     )
     db.add(catalog_import)
-    db.flush()
-
-    parsed = parse_catalog_csv(content)
-    existing_styles, existing_skus, existing_bindings = _load_catalog_state(db, tenant_id)
-    _append_database_conflicts(parsed.rows, existing_styles, existing_skus)
-    data_rows = _normalized_rows(parsed.rows)
-    all_issues = [*parsed.issues, *(issue for row in parsed.rows for issue in row.issues)]
-
-    actions = _row_actions(data_rows, existing_styles, existing_skus, existing_bindings)
-    for row in parsed.rows:
-        normalized_data = (
-            row.normalized.model_dump(mode="json") if row.normalized is not None else None
-        )
+    try:
+        db.flush()
         db.add(
-            CatalogImportRow(
+            CatalogImportSource(
                 tenant_id=tenant_id,
                 import_id=catalog_import.id,
-                row_number=row.row_number,
-                raw_data=row.raw_data,
-                normalized_data=normalized_data,
-                status=CatalogRowStatus.INVALID if row.issues else CatalogRowStatus.VALID,
-                action=(
-                    actions.get(row.normalized.epc)
-                    if row.normalized is not None and not row.issues
-                    else None
-                ),
+                content=content,
             )
         )
-    db.add_all(_persist_issue(tenant_id, catalog_import.id, issue) for issue in all_issues)
-
-    invalid_row_numbers = {issue.row_number for issue in all_issues if issue.row_number is not None}
-    catalog_import.total_rows = len(parsed.rows)
-    catalog_import.invalid_rows = len(invalid_row_numbers)
-    catalog_import.valid_rows = len(parsed.rows) - len(invalid_row_numbers)
-    catalog_import.reconciliation = {
-        "validation": {
-            "rows_received": len(parsed.rows),
-            "valid_rows": catalog_import.valid_rows,
-            "invalid_rows": catalog_import.invalid_rows,
-            "error_count": len(all_issues),
-        },
-        "preview": (
-            _build_preview(mode, data_rows, existing_styles, existing_skus, existing_bindings)
-            if not all_issues
-            else {}
-        ),
-    }
-    catalog_import.status = (
-        CatalogImportStatus.REJECTED if all_issues else CatalogImportStatus.READY
-    )
-    if catalog_import.status is CatalogImportStatus.READY:
         enqueue_job(
             db,
             tenant_id=tenant_id,
             kind=JobKind.CATALOG_IMPORT,
             payload={"import_id": str(catalog_import.id)},
         )
-
-    try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
+        # SET LOCAL is cleared by rollback. Re-establish the tenant context before
+        # reading the concurrent winner through forced RLS.
+        if isinstance(db, TenantSession):
+            pin_session_to_tenant(db, tenant_id)
         winner = db.scalar(
             select(CatalogImport).where(
                 CatalogImport.tenant_id == tenant_id,
@@ -780,6 +748,103 @@ def stage_catalog_import(
     return catalog_import
 
 
+def validate_and_stage_catalog_import(db: Session, import_id: uuid.UUID) -> CatalogImport:
+    """Atomically validate and stage one accepted source in the catalog worker."""
+
+    catalog_import = db.scalar(
+        select(CatalogImport).where(CatalogImport.id == import_id).with_for_update()
+    )
+    if catalog_import is None:
+        raise ApiError(404, "Catalog import not found", "The requested import does not exist.")
+    if catalog_import.status in {
+        CatalogImportStatus.READY,
+        CatalogImportStatus.COMPLETED,
+        CatalogImportStatus.REJECTED,
+        CatalogImportStatus.FAILED,
+    }:
+        return catalog_import
+    if catalog_import.status is not CatalogImportStatus.VALIDATING:
+        raise ApiError(
+            409,
+            "Catalog import is not validatable",
+            f"Import status is {catalog_import.status.value}; VALIDATING is required.",
+            code="catalog_import_not_validatable",
+        )
+
+    source = db.scalar(
+        select(CatalogImportSource).where(
+            CatalogImportSource.tenant_id == catalog_import.tenant_id,
+            CatalogImportSource.import_id == catalog_import.id,
+        )
+    )
+    if source is None:
+        raise RuntimeError("catalog import source is missing")
+    if hashlib.sha256(source.content).hexdigest() != catalog_import.checksum:
+        raise RuntimeError("catalog import source checksum mismatch")
+
+    parsed = parse_catalog_csv(source.content)
+    existing_styles, existing_skus, existing_bindings = _load_catalog_state(
+        db, catalog_import.tenant_id
+    )
+    _append_database_conflicts(parsed.rows, existing_styles, existing_skus)
+    data_rows = _normalized_rows(parsed.rows)
+    all_issues = [*parsed.issues, *(issue for row in parsed.rows for issue in row.issues)]
+
+    actions = _row_actions(data_rows, existing_styles, existing_skus, existing_bindings)
+    for row in parsed.rows:
+        normalized_data = (
+            row.normalized.model_dump(mode="json") if row.normalized is not None else None
+        )
+        db.add(
+            CatalogImportRow(
+                tenant_id=catalog_import.tenant_id,
+                import_id=catalog_import.id,
+                row_number=row.row_number,
+                raw_data=row.raw_data,
+                normalized_data=normalized_data,
+                status=CatalogRowStatus.INVALID if row.issues else CatalogRowStatus.VALID,
+                action=(
+                    actions.get(row.normalized.epc)
+                    if row.normalized is not None and not row.issues
+                    else None
+                ),
+            )
+        )
+    db.add_all(
+        _persist_issue(catalog_import.tenant_id, catalog_import.id, issue) for issue in all_issues
+    )
+
+    invalid_row_numbers = {issue.row_number for issue in all_issues if issue.row_number is not None}
+    catalog_import.total_rows = len(parsed.rows)
+    catalog_import.invalid_rows = len(invalid_row_numbers)
+    catalog_import.valid_rows = len(parsed.rows) - len(invalid_row_numbers)
+    catalog_import.reconciliation = {
+        "validation": {
+            "rows_received": len(parsed.rows),
+            "valid_rows": catalog_import.valid_rows,
+            "invalid_rows": catalog_import.invalid_rows,
+            "error_count": len(all_issues),
+        },
+        "preview": (
+            _build_preview(
+                catalog_import.mode,
+                data_rows,
+                existing_styles,
+                existing_skus,
+                existing_bindings,
+            )
+            if not all_issues
+            else {}
+        ),
+    }
+    catalog_import.status = (
+        CatalogImportStatus.REJECTED if all_issues else CatalogImportStatus.READY
+    )
+    db.commit()
+    db.refresh(catalog_import)
+    return catalog_import
+
+
 def get_catalog_import(
     db: Session,
     tenant_id: uuid.UUID,
@@ -796,31 +861,6 @@ def get_catalog_import(
     if catalog_import is None:
         raise ApiError(404, "Catalog import not found", "The requested import does not exist.")
     return catalog_import
-
-
-def list_catalog_imports(
-    db: Session,
-    tenant_id: uuid.UUID,
-    *,
-    limit: int,
-    offset: int,
-) -> tuple[list[CatalogImport], int]:
-    if isinstance(db, TenantSession):
-        pin_session_to_tenant(db, tenant_id)
-    _get_tenant(db, tenant_id)
-    total = db.scalar(
-        select(func.count()).select_from(CatalogImport).where(CatalogImport.tenant_id == tenant_id)
-    )
-    imports = list(
-        db.scalars(
-            select(CatalogImport)
-            .where(CatalogImport.tenant_id == tenant_id)
-            .order_by(CatalogImport.created_at.desc(), CatalogImport.id.desc())
-            .limit(limit)
-            .offset(offset)
-        ).all()
-    )
-    return imports, int(total or 0)
 
 
 def list_catalog_import_errors(
@@ -1061,15 +1101,17 @@ def _apply_promotion(
     }
 
 
-def _sync_canonical_catalog(
+def _sync_architecture_catalog_projection(
     db: Session,
     catalog_import: CatalogImport,
     rows: list[CatalogRowData],
 ) -> None:
-    """Materialize Product -> Variant -> SKU -> EPC after legacy reconciliation.
+    """Materialize the assignment-facing product hierarchy in the import transaction.
 
-    The pre-existing style/binding tables remain the effective-dated audit history.
-    These tables are the active, architecture-facing catalog used by stream workers.
+    ProductStyle and SKU power catalog lookup, while effective-dated EpcBinding rows
+    remain the event-time RFID source of truth. Product, ProductVariant, and RfidTag
+    expose the requested product hierarchy and its current tag projection. Updating
+    both representations in this transaction prevents a partially promoted catalog.
     """
 
     tenant_id = catalog_import.tenant_id
@@ -1140,8 +1182,8 @@ def _sync_canonical_catalog(
             variant.active = True
 
         sku = skus.get(row.sku)
-        if sku is None:  # pragma: no cover - legacy promotion created it in this transaction
-            raise PromotionConflictError(f"canonical SKU {row.sku} was not promoted")
+        if sku is None:  # pragma: no cover - primary promotion created it in this transaction
+            raise PromotionConflictError(f"SKU {row.sku} was not promoted")
         sku.product_variant_id = variant.id
 
         supplied_epcs.add(row.epc)
@@ -1225,7 +1267,7 @@ def promote_catalog_import(db: Session, import_id: uuid.UUID) -> CatalogImport:
     try:
         with db.begin_nested():
             outcome = _apply_promotion(db, catalog_import, rows, effective_at)
-            _sync_canonical_catalog(db, catalog_import, rows)
+            _sync_architecture_catalog_projection(db, catalog_import, rows)
             db.flush()
     except (IntegrityError, PromotionConflictError) as exc:
         catalog_import.status = CatalogImportStatus.FAILED
@@ -1285,12 +1327,15 @@ def resolve_active_epc(
 
 
 def process_catalog_import_job(db: Session, payload: dict[str, object]) -> None:
-    """Promote a staged import from the durable worker."""
+    """Validate, stage, and promote an accepted import with retry-safe checkpoints."""
 
     raw_import_id = payload.get("import_id")
     if raw_import_id is None:
         raise ValueError("catalog import job is missing import_id")
-    promote_catalog_import(db, uuid.UUID(str(raw_import_id)))
+    import_id = uuid.UUID(str(raw_import_id))
+    catalog_import = validate_and_stage_catalog_import(db, import_id)
+    if catalog_import.status is CatalogImportStatus.READY:
+        promote_catalog_import(db, import_id)
 
 
 def mark_catalog_import_failed_after_retry_exhaustion(
@@ -1343,7 +1388,7 @@ def reconcile_quarantined_catalog_imports(
     tenant_id: uuid.UUID,
     limit: int = 100,
 ) -> int:
-    """Terminalize imports whose durable jobs were quarantined after a worker crash."""
+    """Reconcile terminal imports whose durable jobs were quarantined by a lease race."""
 
     if limit < 1:
         raise ValueError("limit must be positive")
@@ -1359,20 +1404,23 @@ def reconcile_quarantined_catalog_imports(
             DurableJob.tenant_id == tenant_id,
             DurableJob.kind == JobKind.CATALOG_IMPORT,
             DurableJob.status == JobStatus.QUARANTINED,
-            CatalogImport.status.not_in(
-                (
-                    CatalogImportStatus.COMPLETED,
-                    CatalogImportStatus.REJECTED,
-                    CatalogImportStatus.FAILED,
-                )
-            ),
+            CatalogImport.status != CatalogImportStatus.FAILED,
         )
         .order_by(DurableJob.created_at.asc())
-        .with_for_update(of=CatalogImport, skip_locked=True)
+        .with_for_update(of=(DurableJob, CatalogImport), skip_locked=True)
         .limit(limit)
     ).all()
 
     for job, catalog_import in stranded:
+        if catalog_import.status in {
+            CatalogImportStatus.COMPLETED,
+            CatalogImportStatus.REJECTED,
+        }:
+            job.status = JobStatus.COMPLETED
+            job.locked_by = None
+            job.lease_expires_at = None
+            job.last_error = None
+            continue
         detail = job.last_error or "Retry budget exhausted without a recorded worker error"
         catalog_import.status = CatalogImportStatus.FAILED
         catalog_import.failure_reason = f"Catalog worker job quarantined: {detail}"[:2000]

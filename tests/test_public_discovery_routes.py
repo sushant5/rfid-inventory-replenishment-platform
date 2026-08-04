@@ -78,7 +78,7 @@ def test_canonical_sku_discovery_uses_authenticated_tenant(
 
     monkeypatch.setattr(catalog_routes, "list_skus", fake_list_skus)
 
-    result = catalog_routes.list_skus_canonical_endpoint(
+    result = catalog_routes.list_skus_endpoint(
         Mock(spec=Session),
         principal,
         active=SkuActivityFilter.ACTIVE,
@@ -109,7 +109,7 @@ def test_canonical_sku_detail_uses_authenticated_tenant(monkeypatch) -> None:
 
     monkeypatch.setattr(catalog_routes, "get_sku", fake_get_sku)
 
-    result = catalog_routes.get_sku_canonical_endpoint(
+    result = catalog_routes.get_sku_endpoint(
         sku.id,
         Mock(spec=Session),
         principal,

@@ -1,5 +1,5 @@
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -463,24 +463,6 @@ def decode_access_token(
             "The access token is missing, invalid, or expired.",
             code="invalid_access_token",
         ) from exc
-
-
-def ensure_can_assign_roles(principal: Principal, assignments: Iterable[RoleScope]) -> None:
-    assignments_tuple = tuple(assignments)
-    if principal.has_tenant_permission(Permission.USERS_CREATE):
-        return
-
-    allowed_stores = principal.store_ids_for_permission(Permission.USERS_CREATE)
-    if not assignments_tuple or any(
-        assignment.role != IdentityRole.STORE_ASSOCIATE or assignment.store_id not in allowed_stores
-        for assignment in assignments_tuple
-    ):
-        raise ApiError(
-            403,
-            "Forbidden",
-            "Store managers may create associates only within stores they manage.",
-            code="role_assignment_forbidden",
-        )
 
 
 def _invalid_access_token() -> ApiError:

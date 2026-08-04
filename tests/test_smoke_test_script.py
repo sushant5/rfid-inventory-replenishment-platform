@@ -15,10 +15,9 @@ def healthy_fetcher(recorder: list[str]) -> Callable[[str, float], JsonObject]:
                 "status": "ok",
                 "schema_revision": "schema-test",
                 "restricted_database_role": True,
-                "cutover_ready": True,
             }
         if url.endswith("/version"):
-            return {"version": "0.6.1", "build_sha": "test", "environment": "test"}
+            return {"version": "0.7.0", "build_sha": "test", "environment": "test"}
         return {
             "openapi": "3.1.0",
             "paths": {
@@ -40,7 +39,7 @@ def test_smoke_checks_all_public_operational_surfaces_without_network() -> None:
     results = run_checks(
         "https://abacus.example.test/",
         timeout=3.0,
-        expected_version="0.6.1",
+        expected_version="0.7.0",
         expected_build_sha="test",
         expected_schema_revision="schema-test",
         fetcher=healthy_fetcher(requested_urls),
@@ -69,10 +68,9 @@ def test_smoke_check_rejects_an_incomplete_openapi_document() -> None:
                 "status": "ok",
                 "schema_revision": "schema-test",
                 "restricted_database_role": True,
-                "cutover_ready": True,
             }
         if url.endswith("/version"):
-            return {"version": "0.6.1", "build_sha": "test", "environment": "test"}
+            return {"version": "0.7.0", "build_sha": "test", "environment": "test"}
         return {"openapi": "3.1.0", "paths": {}}
 
     with pytest.raises(RuntimeError, match="missing required paths"):
@@ -83,8 +81,8 @@ def test_smoke_check_rejects_an_incomplete_openapi_document() -> None:
     ("expected_version", "expected_build_sha", "expected_schema_revision", "message"),
     [
         ("9.9.9", "test", "schema-test", "version mismatch"),
-        ("0.6.1", "other", "schema-test", "build SHA mismatch"),
-        ("0.6.1", "test", "other", "schema revision mismatch"),
+        ("0.7.0", "other", "schema-test", "build SHA mismatch"),
+        ("0.7.0", "test", "other", "schema revision mismatch"),
     ],
 )
 def test_smoke_check_rejects_stale_release_metadata(

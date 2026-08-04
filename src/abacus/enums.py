@@ -34,6 +34,8 @@ class BatchStatus(StrEnum):
 
 class JobKind(StrEnum):
     CATALOG_IMPORT = "CATALOG_IMPORT"
+    # Persisted compatibility values remain readable during the reversible schema
+    # retirement window. No current process enqueues or claims these kinds.
     RFID_OBSERVATION = "RFID_OBSERVATION"
     REPLENISHMENT_RECALC = "REPLENISHMENT_RECALC"
 

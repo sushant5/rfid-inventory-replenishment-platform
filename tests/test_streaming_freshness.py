@@ -95,6 +95,19 @@ def _event(
     )
 
 
+def test_batch_finalization_requires_a_durable_event_ledger() -> None:
+    now = datetime.now(UTC)
+    db = MagicMock(spec=Session)
+    db.scalar.return_value = None
+
+    with pytest.raises(ValueError, match="RFID event ledger does not exist"):
+        streaming_inventory._advance_batch(
+            db,
+            _event(observed_at=now, received_at=now),
+            rejected=False,
+        )
+
+
 def test_effective_freshness_decays_without_a_database_write() -> None:
     now = datetime(2026, 8, 2, 12, tzinfo=UTC)
     settings = _settings()
@@ -109,6 +122,18 @@ def test_effective_freshness_decays_without_a_database_write() -> None:
         effective_freshness(connectivity, settings, now=now + timedelta(seconds=601))
         == FreshnessStatus.STALE
     )
+
+
+def test_effective_freshness_fails_closed_until_inventory_reconciliation() -> None:
+    now = datetime(2026, 8, 2, 12, tzinfo=UTC)
+    connectivity = _connectivity(now)
+    connectivity.inventory_reconciliation_required_at = now
+
+    assert effective_freshness(connectivity, _settings(), now=now) == FreshnessStatus.DEGRADED
+
+    # A connectivity outage remains the stronger signal.
+    connectivity.gateway_last_heartbeat = now - timedelta(minutes=11)
+    assert effective_freshness(connectivity, _settings(), now=now) == FreshnessStatus.STALE
 
 
 def test_item_confidence_decays_without_a_database_write() -> None:

@@ -1,275 +1,179 @@
+"""Schemas for replenishment policies, evaluations, and tasks."""
+
 import uuid
 from datetime import datetime
-from typing import Annotated, Self
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
-from pydantic.json_schema import SkipJsonSchema
+from pydantic import Field, field_validator, model_validator
 
-from abacus.models.replenishment import (
-    PolicyImportStatus,
-    PolicySelectorType,
-    ReplenishmentReason,
-    ReplenishmentRunStatus,
-    ReplenishmentTaskStatus,
-    ReplenishmentTrigger,
-)
+from abacus.models.architecture import PolicyVersionStatus, ReplenishmentTaskStatus
 from abacus.schemas.common import ApiModel
 
 
-def _require_timezone(value: datetime | None, field_name: str) -> datetime | None:
-    if value is not None and (value.tzinfo is None or value.utcoffset() is None):
-        raise ValueError(f"{field_name} must include a timezone offset")
-    return value
+def _label(value: str, *, field: str) -> str:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise ValueError(f"{field} cannot be blank")
+    return normalized
 
 
-class PolicyDefinition(ApiModel):
-    external_key: str = Field(min_length=1, max_length=128)
+class PolicyRuleWrite(ApiModel):
     store_id: uuid.UUID | None = None
-    selector_type: PolicySelectorType
-    selector_value: str = Field(min_length=1, max_length=128)
-    minimum_floor_quantity: int = Field(ge=0)
-    target_floor_quantity: int = Field(ge=0)
-    maximum_floor_quantity: int | None = Field(default=None, ge=0)
+    category: str | None = Field(default=None, max_length=128)
+    style_code: str | None = Field(default=None, max_length=64)
+    sku_id: uuid.UUID | None = None
+    size: str | None = Field(default=None, max_length=64)
+    min_floor_qty: int = Field(ge=0)
+    target_floor_qty: int = Field(ge=0)
     priority: int = Field(default=0, ge=-1_000_000, le=1_000_000)
-    effective_from: datetime
-    effective_to: datetime | None = None
-    active: bool = True
 
-    @field_validator("external_key")
+    @field_validator("category")
     @classmethod
-    def normalize_external_key(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("external_key cannot be blank")
-        return normalized
+    def normalize_category(cls, value: str | None) -> str | None:
+        return _label(value, field="category").upper() if value is not None else None
 
-    @field_validator("selector_value")
+    @field_validator("style_code")
     @classmethod
-    def normalize_selector_value(cls, value: str) -> str:
-        normalized = " ".join(value.strip().split()).upper()
-        if not normalized:
-            raise ValueError("selector_value cannot be blank")
-        return normalized
+    def normalize_style_code(cls, value: str | None) -> str | None:
+        return _label(value, field="style_code").upper() if value is not None else None
 
-    @field_validator("effective_from", "effective_to")
+    @field_validator("size")
     @classmethod
-    def validate_effective_timestamp(
-        cls,
-        value: datetime | None,
-        info: object,
-    ) -> datetime | None:
-        field_name = getattr(info, "field_name", "effective timestamp")
-        return _require_timezone(value, str(field_name))
+    def normalize_size(cls, value: str | None) -> str | None:
+        return _label(value, field="size") if value is not None else None
 
     @model_validator(mode="after")
-    def validate_quantities_and_interval(self) -> Self:
-        if self.target_floor_quantity < self.minimum_floor_quantity:
-            raise ValueError(
-                "target_floor_quantity must be greater than or equal to minimum_floor_quantity"
-            )
-        if (
-            self.maximum_floor_quantity is not None
-            and self.maximum_floor_quantity < self.target_floor_quantity
-        ):
-            raise ValueError(
-                "maximum_floor_quantity must be greater than or equal to target_floor_quantity"
-            )
-        if self.effective_to is not None and self.effective_to <= self.effective_from:
-            raise ValueError("effective_to must be later than effective_from")
+    def validate_selector(self) -> "PolicyRuleWrite":
+        selector_count = sum(
+            value is not None for value in (self.category, self.style_code, self.sku_id)
+        )
+        if selector_count > 1:
+            raise ValueError("a rule may select category, style_code, or sku_id, not multiple")
+        if self.size is not None and self.sku_id is None:
+            raise ValueError("size requires sku_id")
+        if self.store_id is not None and selector_count == 0:
+            raise ValueError("store-default rules are outside the defined precedence")
+        if self.target_floor_qty < self.min_floor_qty:
+            raise ValueError("target_floor_qty must be at least min_floor_qty")
         return self
 
 
-class PolicyCreate(PolicyDefinition):
-    pass
+class PolicyCreate(ApiModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=2000)
+    rules: list[PolicyRuleWrite] = Field(min_length=1, max_length=500)
 
-
-class PolicyPatch(ApiModel):
-    store_id: uuid.UUID | None = None
-    selector_type: PolicySelectorType | SkipJsonSchema[None] = None
-    selector_value: Annotated[str, Field(min_length=1, max_length=128)] | SkipJsonSchema[None] = (
-        None
-    )
-    minimum_floor_quantity: Annotated[int, Field(ge=0)] | SkipJsonSchema[None] = None
-    target_floor_quantity: Annotated[int, Field(ge=0)] | SkipJsonSchema[None] = None
-    maximum_floor_quantity: int | None = Field(default=None, ge=0)
-    priority: Annotated[int, Field(ge=-1_000_000, le=1_000_000)] | SkipJsonSchema[None] = None
-    effective_from: datetime | SkipJsonSchema[None] = None
-    effective_to: datetime | None = None
-    active: bool | SkipJsonSchema[None] = None
-
-    @field_validator(
-        "selector_type",
-        "selector_value",
-        "minimum_floor_quantity",
-        "target_floor_quantity",
-        "priority",
-        "effective_from",
-        "active",
-        mode="before",
-    )
+    @field_validator("name")
     @classmethod
-    def reject_explicit_null(cls, value: object, info: ValidationInfo) -> object:
-        if value is None:
-            raise ValueError(f"{info.field_name} cannot be null")
-        return value
+    def normalize_name(cls, value: str) -> str:
+        return _label(value, field="name")
 
-    @field_validator("selector_value")
+    @field_validator("description")
     @classmethod
-    def normalize_selector_value(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = " ".join(value.strip().split()).upper()
-        if not normalized:
-            raise ValueError("selector_value cannot be blank")
-        return normalized
-
-    @field_validator("effective_from", "effective_to")
-    @classmethod
-    def validate_effective_timestamp(
-        cls,
-        value: datetime | None,
-        info: object,
-    ) -> datetime | None:
-        field_name = getattr(info, "field_name", "effective timestamp")
-        return _require_timezone(value, str(field_name))
+    def normalize_description(cls, value: str | None) -> str | None:
+        return _label(value, field="description") if value is not None else None
 
 
-class PolicyBulkUpsertRequest(ApiModel):
-    policies: list[PolicyDefinition] = Field(min_length=1, max_length=1000)
-
-    @model_validator(mode="after")
-    def require_unique_external_keys(self) -> Self:
-        keys = [policy.external_key for policy in self.policies]
-        if len(keys) != len(set(keys)):
-            raise ValueError("external_key values must be unique within an import")
-        return self
+class PolicyRulesPatch(ApiModel):
+    rules: list[PolicyRuleWrite] = Field(min_length=1, max_length=500)
 
 
-class PolicyRead(ApiModel):
+class PolicyDefinitionRead(ApiModel):
     id: uuid.UUID
-    tenant_id: uuid.UUID
-    external_key: str
-    store_id: uuid.UUID | None
-    selector_type: PolicySelectorType
-    selector_value: str
-    minimum_floor_quantity: int
-    target_floor_quantity: int
-    maximum_floor_quantity: int | None
-    priority: int
-    effective_from: datetime
-    effective_to: datetime | None
-    active: bool
-    revision: int
+    name: str
+    description: str | None
     created_at: datetime
     updated_at: datetime
 
 
-class PolicyListRead(ApiModel):
-    items: list[PolicyRead]
+class PolicyVersionRead(ApiModel):
+    id: uuid.UUID
+    policy_id: uuid.UUID
+    version_number: int
+    status: PolicyVersionStatus
+    activated_at: datetime | None
+    activated_by_user_id: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PolicyRuleRead(ApiModel):
+    id: uuid.UUID
+    version_id: uuid.UUID
+    store_id: uuid.UUID | None
+    category: str | None
+    style_code: str | None
+    sku_id: uuid.UUID | None
+    size: str | None
+    min_floor_qty: int
+    target_floor_qty: int
+    priority: int
+
+
+class PolicyBundleRead(ApiModel):
+    policy: PolicyDefinitionRead
+    version: PolicyVersionRead
+    rules: list[PolicyRuleRead]
+
+
+class PolicyBundlePage(ApiModel):
+    items: list[PolicyBundleRead]
     total: int
     limit: int
     offset: int
 
 
-class PolicyImportRead(ApiModel):
-    id: uuid.UUID
-    tenant_id: uuid.UUID
-    idempotency_key: str
-    request_hash: str
-    status: PolicyImportStatus
-    total_count: int
-    created_count: int
-    updated_count: int
-    unchanged_count: int
-    rejected_count: int
-    reconciliation: dict[str, object]
-    errors: list[dict[str, object]]
-    created_at: datetime
-    updated_at: datetime
-
-
-class ReplenishmentEvaluationRequest(ApiModel):
+class ReplenishmentEvaluationCreate(ApiModel):
     store_id: uuid.UUID
-    sku_ids: list[uuid.UUID] = Field(min_length=1, max_length=500)
-    generate_tasks: bool = True
+    sku_ids: list[uuid.UUID] = Field(default_factory=list, max_length=5000)
 
-    @model_validator(mode="after")
-    def require_unique_skus(self) -> Self:
-        if len(self.sku_ids) != len(set(self.sku_ids)):
-            raise ValueError("sku_ids must be unique")
-        return self
-
-
-class ReplenishmentRunLineRead(ApiModel):
-    id: uuid.UUID
-    tenant_id: uuid.UUID
-    run_id: uuid.UUID
-    store_id: uuid.UUID
-    sku_id: uuid.UUID
-    sku_code: str
-    policy_id: uuid.UUID | None
-    task_id: uuid.UUID | None
-    selector_type: PolicySelectorType | None
-    selector_value: str | None
-    policy_priority: int | None
-    minimum_floor_quantity: int | None
-    target_floor_quantity: int | None
-    maximum_floor_quantity: int | None
-    floor_quantity: int
-    backroom_quantity: int
-    open_task_quantity: int
-    recommended_quantity: int
-    reason: ReplenishmentReason
-    formula: str
-    inventory_as_of: datetime | None
-    created_at: datetime
-
-
-class ReplenishmentRunRead(ApiModel):
-    id: uuid.UUID
-    tenant_id: uuid.UUID
-    store_id: uuid.UUID
-    idempotency_key: str | None
-    trigger: ReplenishmentTrigger
-    status: ReplenishmentRunStatus
-    evaluated_at: datetime
-    requested_by_subject: str | None
-    line_count: int
-    tasks_created: int
-    tasks_updated: int
-    created_at: datetime
-    lines: list[ReplenishmentRunLineRead]
+    @field_validator("sku_ids")
+    @classmethod
+    def reject_duplicate_skus(cls, value: list[uuid.UUID]) -> list[uuid.UUID]:
+        if len(value) != len(set(value)):
+            raise ValueError("sku_ids cannot contain duplicates")
+        return value
 
 
 class ReplenishmentTaskRead(ApiModel):
     id: uuid.UUID
-    tenant_id: uuid.UUID
     store_id: uuid.UUID
     sku_id: uuid.UUID
-    sku_code: str
-    source_policy_id: uuid.UUID
+    policy_version_id: uuid.UUID
+    policy_rule_id: uuid.UUID
     status: ReplenishmentTaskStatus
     quantity: int
-    moved_quantity: int
-    remaining_quantity: int
     version: int
-    claimed_by_subject: str | None
+    claimed_by_user_id: uuid.UUID | None
     claimed_at: datetime | None
+    started_at: datetime | None
     completed_at: datetime | None
-    last_note: str | None
+    expires_at: datetime | None
+    note: str | None
     created_at: datetime
     updated_at: datetime
 
 
-class ReplenishmentTaskListRead(ApiModel):
+class ReplenishmentTaskPage(ApiModel):
     items: list[ReplenishmentTaskRead]
     total: int
     limit: int
     offset: int
 
 
-class ReplenishmentTaskUpdate(ApiModel):
+class ReplenishmentEvaluationRead(ApiModel):
+    store_id: uuid.UUID
+    created_count: int
+    suppressed_connectivity: bool
+    suppressed_low_confidence: int
+    tasks: list[ReplenishmentTaskRead]
+
+
+class ReplenishmentTaskPatch(ApiModel):
     status: ReplenishmentTaskStatus
-    expected_version: int = Field(ge=1)
-    moved_quantity: int | None = Field(default=None, ge=0)
-    note: str | None = Field(default=None, max_length=1000)
+    version: int = Field(ge=1)
+    note: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str | None) -> str | None:
+        return _label(value, field="note") if value is not None else None

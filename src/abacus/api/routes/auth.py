@@ -17,12 +17,11 @@ from abacus.security import (
 )
 from abacus.services.identity import authenticate_user
 
-router = APIRouter(prefix="/v1/auth", tags=["4. Identity and Access"])
-canonical_router = APIRouter(prefix="/v1", tags=["4. Identity and Access"])
+router = APIRouter(prefix="/v1", tags=["4. Identity and Access"])
 
 
 @router.post(
-    "/login",
+    "/auth/login",
     response_model=AccessTokenRead,
     operation_id="login",
 )
@@ -93,12 +92,12 @@ def login_endpoint(
     return response
 
 
-@canonical_router.get(
+@router.get(
     "/me",
     response_model=CanonicalPrincipalRead,
     operation_id="getCurrentUser",
 )
-def canonical_current_user_endpoint(principal: CurrentPrincipal) -> CanonicalPrincipalRead:
+def get_current_user_endpoint(principal: CurrentPrincipal) -> CanonicalPrincipalRead:
     return CanonicalPrincipalRead(
         user_id=principal.user_id,
         tenant_id=principal.tenant_id,

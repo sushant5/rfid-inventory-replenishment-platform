@@ -5,21 +5,21 @@ import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from abacus.api.errors import ApiError
-from abacus.api.routes.canonical_replenishment import list_store_tasks_endpoint
+from abacus.api.routes.replenishment import list_store_tasks_endpoint
 from abacus.api.routes.rfid import get_store_inventory_endpoint
 from abacus.config import Settings
 from abacus.enums import StoreStatus, TenantStatus, ZoneKind
 from abacus.main import create_app
 from abacus.models.architecture import (
     CanonicalIdentityRole,
-    CanonicalReplenishmentTask,
-    CanonicalTaskStatus,
     FreshnessStatus,
     InventoryProjection,
     PolicyDefinition,
     PolicyRule,
     PolicyVersion,
     PolicyVersionStatus,
+    ReplenishmentTask,
+    ReplenishmentTaskStatus,
 )
 from abacus.models.catalog import ProductStyle, Sku
 from abacus.models.tenancy import Store, Tenant, Zone
@@ -198,13 +198,13 @@ def test_inventory_and_task_pages_have_stable_order_totals_and_store_authorizati
             ]
         )
         task_specs = (
-            (CanonicalTaskStatus.COMPLETED, now - timedelta(minutes=3)),
-            (CanonicalTaskStatus.CANCELED, now - timedelta(minutes=2)),
-            (CanonicalTaskStatus.EXPIRED, now - timedelta(minutes=1)),
+            (ReplenishmentTaskStatus.COMPLETED, now - timedelta(minutes=3)),
+            (ReplenishmentTaskStatus.CANCELED, now - timedelta(minutes=2)),
+            (ReplenishmentTaskStatus.EXPIRED, now - timedelta(minutes=1)),
         )
         db.add_all(
             [
-                CanonicalReplenishmentTask(
+                ReplenishmentTask(
                     id=uuid.uuid4(),
                     tenant_id=tenant_id,
                     store_id=store_id,
@@ -247,7 +247,7 @@ def test_inventory_and_task_pages_have_stable_order_totals_and_store_authorizati
         assert task_page.total == 3
         assert task_page.limit == 1
         assert task_page.offset == 1
-        assert [item.status for item in task_page.items] == [CanonicalTaskStatus.CANCELED]
+        assert [item.status for item in task_page.items] == [ReplenishmentTaskStatus.CANCELED]
 
         out_of_scope = _principal(
             tenant_id,

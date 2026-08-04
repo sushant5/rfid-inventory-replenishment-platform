@@ -10,8 +10,11 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -105,6 +108,7 @@ class CatalogImport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "idempotency_key",
             name="uq_catalog_imports_tenant_idempotency",
         ),
+        UniqueConstraint("tenant_id", "id", name="uq_catalog_imports_tenant_id"),
         Index("ix_catalog_imports_tenant_created", "tenant_id", "created_at"),
         CheckConstraint("size_bytes >= 0", name="ck_catalog_imports_nonnegative_size"),
         CheckConstraint("total_rows >= 0", name="ck_catalog_imports_nonnegative_rows"),
@@ -160,6 +164,35 @@ class CatalogImport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     reconciliation: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CatalogImportSource(Base):
+    """Immutable hosted-demo copy of the exact uploaded catalog bytes."""
+
+    __tablename__ = "catalog_import_sources"
+    __table_args__ = (
+        PrimaryKeyConstraint("import_id", name="pk_catalog_import_sources"),
+        ForeignKeyConstraint(
+            ["tenant_id", "import_id"],
+            ["catalog_imports.tenant_id", "catalog_imports.id"],
+            ondelete="CASCADE",
+            name="fk_catalog_import_sources_tenant_import",
+        ),
+        CheckConstraint(
+            "octet_length(content) <= 10485760",
+            name="ck_catalog_import_sources_max_size",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    import_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
 
 
 class CatalogImportRow(UUIDPrimaryKeyMixin, TimestampMixin, Base):

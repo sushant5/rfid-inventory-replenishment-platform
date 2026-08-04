@@ -31,9 +31,13 @@ OPERATION_PROBLEM_RESPONSES: dict[str, dict[str, str]] = {
     "createCatalogImport": {
         "400": "The idempotency key is blank",
         "409": "The idempotency key conflicts with a previous catalog import",
+        "413": "The uploaded catalog exceeds the hosted import limit",
     },
     "submitRfidObservationBatch": {
         "409": "An event identifier conflicts with a previously accepted observation",
+    },
+    "replayRfidQuarantine": {
+        "409": "The quarantined event is incomplete, already in flight, or cannot be replayed",
     },
     "createUser": {
         "409": "The user email or requested access conflicts with existing data",
