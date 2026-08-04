@@ -2287,8 +2287,16 @@ def test_quarantine_replay_is_idempotent_and_recovers_after_late_catalog(
         assert first.processing_status is RfidEventProcessingStatus.PENDING
         assert repeated_pending.queued is False
         assert repeated_pending.processing_status is RfidEventProcessingStatus.PENDING
+        replayed_event_id = first.event_id
 
-    # Retrying before remediation fails again without creating another quarantine row.
+    # Retrying while the reader is inactive fails for a new reason without replacing
+    # the original quarantine evidence or creating another quarantine row.
+    with postgres_session_factory() as db:
+        device = db.get(Device, durable_pipeline.device_id)
+        assert device is not None
+        device.status = DeviceStatus.INACTIVE
+        db.commit()
+
     assert event_worker.process_tenant_once(durable_pipeline.tenant_id, recent) == (1, 0)
     with postgres_session_factory() as db:
         assert (
@@ -2301,10 +2309,23 @@ def test_quarantine_replay_is_idempotent_and_recovers_after_late_catalog(
         )
         first_ledger = db.get(
             RfidObservationEventLedger,
-            (durable_pipeline.tenant_id, event_ids[0]),
+            (durable_pipeline.tenant_id, replayed_event_id),
         )
         assert first_ledger is not None
         assert first_ledger.processing_status is RfidEventProcessingStatus.REJECTED
+        assert first_ledger.rejection_reason == "INACTIVE_DEVICE"
+
+        replay_failure = list_rfid_quarantine_endpoint(
+            db,
+            _tenant_admin(durable_pipeline),
+            event_id=replayed_event_id,
+        )
+        assert replay_failure.items[0].reason == "UNKNOWN_EPC"
+        assert replay_failure.items[0].current_rejection_reason == "INACTIVE_DEVICE"
+
+        device = db.get(Device, durable_pipeline.device_id)
+        assert device is not None
+        device.status = DeviceStatus.ACTIVE
 
         source_import_id = db.scalar(
             select(EpcBinding.source_import_id).where(
