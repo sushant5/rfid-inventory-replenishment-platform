@@ -41,6 +41,9 @@ from abacus.models.architecture import (
     Product,
     ProductVariant,
     ReplenishmentTask,
+    ReplenishmentTaskEvidence,
+    ReplenishmentTaskStatus,
+    ReplenishmentVerificationStatus,
     RfidEventProcessingStatus,
     RfidObservationBatch,
     RfidObservationBatchEvent,
@@ -65,10 +68,14 @@ from abacus.schemas.architecture import (
     ObservationInput,
 )
 from abacus.schemas.business_events import BusinessEventCreate
-from abacus.schemas.replenishment import ReplenishmentEvaluationCreate
+from abacus.schemas.replenishment import ReplenishmentEvaluationCreate, ReplenishmentTaskPatch
 from abacus.security import Principal, RoleScope
 from abacus.services.business_events import accept_authoritative_removal
-from abacus.services.replenishment import evaluate_replenishment
+from abacus.services.replenishment import (
+    evaluate_replenishment,
+    patch_replenishment_task,
+    replenishment_verification_status,
+)
 from abacus.services.rfid_ingress import accept_observation_batch
 from abacus.services.streaming_inventory import (
     ProcessingResult,
@@ -1568,6 +1575,165 @@ def test_equal_timestamp_reads_can_confirm_a_stable_zone_move(
         assert state.state_version == 2
         assert floor is not None and floor.quantity == 0
         assert backroom is not None and backroom.quantity == 1
+
+
+def test_confirmed_backroom_to_floor_move_verifies_completed_task(
+    postgres_session_factory: sessionmaker[Session],
+    durable_pipeline: DurablePipelineFixture,
+) -> None:
+    recent = RecentObservationState()
+    backroom_zone_id = uuid.uuid4()
+    backroom_device_id = uuid.uuid4()
+    backroom_at = durable_pipeline.observed_at + timedelta(seconds=1)
+    with postgres_session_factory() as db:
+        db.add_all(
+            [
+                Zone(
+                    id=backroom_zone_id,
+                    tenant_id=durable_pipeline.tenant_id,
+                    store_id=durable_pipeline.store_id,
+                    code="backroom-verification",
+                    name="Backroom Verification",
+                    kind=ZoneKind.BACKROOM,
+                ),
+                Device(
+                    id=backroom_device_id,
+                    tenant_id=durable_pipeline.tenant_id,
+                    serial_number=f"verify-backroom-{uuid.uuid4().hex[:12]}",
+                    display_name="Verification Backroom Reader",
+                    status=DeviceStatus.ACTIVE,
+                ),
+            ]
+        )
+        db.flush()
+        db.add(
+            DeviceAssignment(
+                tenant_id=durable_pipeline.tenant_id,
+                device_id=backroom_device_id,
+                store_id=durable_pipeline.store_id,
+                zone_id=backroom_zone_id,
+                effective_from=durable_pipeline.observed_at,
+            )
+        )
+        db.commit()
+
+    backroom_request = ObservationBatchCreate(
+        device_id=backroom_device_id,
+        observations=[
+            ObservationInput(
+                event_id=str(uuid.uuid4()),
+                epc=durable_pipeline.epc,
+                observed_at=backroom_at + timedelta(seconds=index),
+                rssi=-38,
+            )
+            for index in range(3)
+        ],
+    )
+    with postgres_session_factory() as db:
+        device = db.get(Device, backroom_device_id)
+        assert device is not None
+        accept_observation_batch(
+            db,
+            device=device,
+            request=backroom_request,
+            received_at=backroom_at + timedelta(seconds=3),
+        )
+    assert event_worker.process_tenant_once(durable_pipeline.tenant_id, recent) == (3, 1)
+
+    task_started_at = backroom_at + timedelta(seconds=3)
+    with postgres_session_factory() as db:
+        policy = PolicyDefinition(
+            tenant_id=durable_pipeline.tenant_id,
+            name=f"Verification {uuid.uuid4().hex[:8]}",
+            description=None,
+        )
+        db.add(policy)
+        db.flush()
+        version = PolicyVersion(
+            tenant_id=durable_pipeline.tenant_id,
+            policy_id=policy.id,
+            version_number=1,
+            status=PolicyVersionStatus.DRAFT,
+        )
+        db.add(version)
+        db.flush()
+        rule = PolicyRule(
+            tenant_id=durable_pipeline.tenant_id,
+            version_id=version.id,
+            sku_id=durable_pipeline.sku_id,
+            min_floor_qty=1,
+            target_floor_qty=1,
+            priority=0,
+        )
+        db.add(rule)
+        db.flush()
+        version.status = PolicyVersionStatus.ACTIVE
+        version.activated_at = task_started_at
+        task = ReplenishmentTask(
+            tenant_id=durable_pipeline.tenant_id,
+            store_id=durable_pipeline.store_id,
+            sku_id=durable_pipeline.sku_id,
+            policy_version_id=version.id,
+            policy_rule_id=rule.id,
+            status=ReplenishmentTaskStatus.IN_PROGRESS,
+            quantity=1,
+            verified_quantity=0,
+            version=1,
+            started_at=task_started_at,
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+
+        completed = patch_replenishment_task(
+            db,
+            _tenant_admin(durable_pipeline),
+            task_id,
+            ReplenishmentTaskPatch(
+                status=ReplenishmentTaskStatus.COMPLETED,
+                version=task.version,
+            ),
+            verification_window_seconds=900,
+        )
+        assert replenishment_verification_status(completed) is (
+            ReplenishmentVerificationStatus.PENDING
+        )
+
+    floor_at = task_started_at + timedelta(seconds=20)
+    floor_request = ObservationBatchCreate(
+        device_id=durable_pipeline.device_id,
+        observations=[
+            ObservationInput(
+                event_id=str(uuid.uuid4()),
+                epc=durable_pipeline.epc,
+                observed_at=floor_at + timedelta(seconds=index),
+                rssi=-37,
+            )
+            for index in range(3)
+        ],
+    )
+    _accept(
+        postgres_session_factory,
+        durable_pipeline,
+        floor_request,
+        received_at=floor_at + timedelta(seconds=3),
+    )
+    assert event_worker.process_tenant_once(durable_pipeline.tenant_id, recent) == (3, 1)
+
+    with postgres_session_factory() as db:
+        task = db.get(ReplenishmentTask, task_id)
+        assert task is not None
+        assert task.verified_quantity == 1
+        assert task.version == 3
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(ReplenishmentTaskEvidence)
+                .where(ReplenishmentTaskEvidence.task_id == task_id)
+            )
+            == 1
+        )
+        assert replenishment_verification_status(task) is (ReplenishmentVerificationStatus.VERIFIED)
 
 
 def test_projection_rebuild_rejects_pending_transition(

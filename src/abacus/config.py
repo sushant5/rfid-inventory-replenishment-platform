@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     jwt_issuer: str = "abacus-platform"
     jwt_audience: str = "abacus-api"
     access_token_minutes: int = Field(default=15, ge=1, le=1440)
+    refresh_token_days: int = Field(default=7, ge=1, le=90)
     login_throttle_enabled: bool = True
     login_throttle_window_seconds: int = Field(default=60, ge=1, le=3600)
     login_throttle_ip_limit: int = Field(default=30, ge=1, le=10_000)
@@ -60,6 +61,11 @@ class Settings(BaseSettings):
     connectivity_live_window_seconds: int = Field(default=120, ge=10, le=3600)
     connectivity_stale_window_seconds: int = Field(default=600, ge=30, le=86_400)
     replenishment_minimum_confidence: float = Field(default=0.70, ge=0.0, le=1.0)
+    replenishment_verification_window_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=86_400,
+    )
     rfid_max_future_skew_seconds: int = Field(default=300, ge=0, le=86_400)
     build_sha: str = "local"
     render_git_commit: str | None = Field(

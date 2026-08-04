@@ -61,6 +61,8 @@ jobs:
           scripts/smoke_test.py
           scripts/public_demo_smoke.py
           scripts/generate_store_batch.py
+          scripts/generate_showcase_catalog.py
+          scripts/check_branch_coverage.py
       - name: Audit dependencies
         run: pip-audit --skip-editable
       - name: Migrate clean database
@@ -68,7 +70,11 @@ jobs:
       - name: Verify full migration rollback chain
         run: alembic downgrade base && alembic upgrade head
       - name: Test
-        run: python -m pytest --cov=abacus --cov-report=term-missing --cov-report=xml
+        run: >-
+          python -m pytest --cov=abacus --cov-report=term-missing
+          --cov-report=xml --cov-report=json
+      - name: Verify branch coverage
+        run: python scripts/check_branch_coverage.py coverage.json --minimum 70
       - name: Verify migration metadata
         run: alembic check
       - name: Build image

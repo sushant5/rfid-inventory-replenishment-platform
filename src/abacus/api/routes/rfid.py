@@ -251,6 +251,8 @@ def get_store_inventory_endpoint(
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> InventoryProjectionPage:
+    if not principal.can_access_store(Permission.INVENTORY_READ, store_id):
+        raise ApiError(403, "Forbidden", "The store is outside the current user's scope.")
     store_exists = db.scalar(
         select(Store.id).where(
             Store.id == store_id,
@@ -259,8 +261,6 @@ def get_store_inventory_endpoint(
     )
     if store_exists is None:
         raise ApiError(404, "Store not found", "The requested store does not exist.")
-    if not principal.can_access_store(Permission.INVENTORY_READ, store_id):
-        raise ApiError(403, "Forbidden", "The store is outside the current user's scope.")
     predicates = [
         InventoryProjection.tenant_id == principal.tenant_id,
         InventoryProjection.store_id == store_id,

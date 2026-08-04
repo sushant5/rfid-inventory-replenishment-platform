@@ -283,7 +283,10 @@ def install_openapi_error_contract(app: FastAPI) -> None:
                     responses["422"] = deepcopy(validation_response)
                 route = route_lookup.get((path, method.lower()))
                 security = operation.get("security")
-                if (isinstance(security, list) and security) or path == "/v1/auth/login":
+                if (isinstance(security, list) and security) or path in {
+                    "/v1/auth/login",
+                    "/v1/auth/refresh",
+                }:
                     responses.setdefault(
                         "401",
                         problem_response("Authentication credentials are missing or invalid"),

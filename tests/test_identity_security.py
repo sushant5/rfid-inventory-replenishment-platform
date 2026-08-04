@@ -123,6 +123,41 @@ def test_access_token_rejects_missing_token_version() -> None:
     assert error.value.status_code == 401
 
 
+@pytest.mark.parametrize(
+    "claim_overrides",
+    [
+        {"sub": 7},
+        {"tid": 7},
+        {"token_version": True},
+        {"token_version": "1"},
+        {"token_version": 0},
+        {"sid": 7},
+        {"sid": "not-a-uuid"},
+        {"exp": "9999999999"},
+    ],
+)
+def test_access_token_rejects_malformed_claim_types(
+    claim_overrides: dict[str, object],
+) -> None:
+    now = datetime.now(UTC)
+    payload: dict[str, object] = {
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "iat": now,
+        "exp": now + timedelta(minutes=5),
+        "sub": str(uuid.uuid4()),
+        "tid": str(uuid.uuid4()),
+        "token_version": 1,
+    }
+    payload.update(claim_overrides)
+    token = jwt.encode(payload, SECRET, algorithm="HS256")
+
+    with pytest.raises(ApiError) as error:
+        decode_access_token(token, secret=SECRET, issuer=ISSUER, audience=AUDIENCE)
+
+    assert error.value.code == "invalid_access_token"
+
+
 def test_validation_errors_do_not_echo_passwords() -> None:
     password = "sensitive-password-" + ("x" * 128)
     with TestClient(create_app()) as client:

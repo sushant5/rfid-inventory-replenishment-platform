@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi import FastAPI
@@ -13,7 +14,9 @@ from abacus.models.architecture import (
     PolicyRule,
     PolicyVersion,
     PolicyVersionStatus,
+    ReplenishmentTask,
     ReplenishmentTaskStatus,
+    ReplenishmentVerificationStatus,
 )
 from abacus.models.identity import IdentityRole
 from abacus.models.tenancy import Tenant
@@ -31,10 +34,64 @@ from abacus.services.replenishment import (
     calculate_replenishment_quantity,
     get_policy_bundle,
     list_policy_bundles,
+    replenishment_verification_status,
     rule_precedence,
     rules_overlap,
     select_policy_rule,
 )
+
+
+@pytest.mark.parametrize(
+    ("status", "verified_quantity", "deadline_offset", "expected"),
+    [
+        (
+            ReplenishmentTaskStatus.IN_PROGRESS,
+            0,
+            60,
+            ReplenishmentVerificationStatus.NOT_APPLICABLE,
+        ),
+        (
+            ReplenishmentTaskStatus.COMPLETED,
+            1,
+            60,
+            ReplenishmentVerificationStatus.PENDING,
+        ),
+        (
+            ReplenishmentTaskStatus.COMPLETED,
+            2,
+            -60,
+            ReplenishmentVerificationStatus.VERIFIED,
+        ),
+        (
+            ReplenishmentTaskStatus.COMPLETED,
+            1,
+            -60,
+            ReplenishmentVerificationStatus.UNVERIFIED,
+        ),
+    ],
+)
+def test_replenishment_verification_status_is_derived_from_evidence_and_deadline(
+    status: ReplenishmentTaskStatus,
+    verified_quantity: int,
+    deadline_offset: int,
+    expected: ReplenishmentVerificationStatus,
+) -> None:
+    now = datetime.now(UTC)
+    task = ReplenishmentTask(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        store_id=uuid.uuid4(),
+        sku_id=uuid.uuid4(),
+        policy_version_id=uuid.uuid4(),
+        policy_rule_id=uuid.uuid4(),
+        status=status,
+        quantity=2,
+        verified_quantity=verified_quantity,
+        verification_deadline=now + timedelta(seconds=deadline_offset),
+        version=1,
+    )
+
+    assert replenishment_verification_status(task, evaluated_at=now) is expected
 
 
 def _rule(

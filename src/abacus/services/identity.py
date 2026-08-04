@@ -1,8 +1,10 @@
+import hashlib
+import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -15,6 +17,7 @@ from abacus.models.architecture import (
     UserStoreAssignment,
 )
 from abacus.models.identity import (
+    AuthSession,
     IdentityAuditAction,
     IdentityAuditRecord,
     IdentityRole,
@@ -57,6 +60,12 @@ class CanonicalUserRecord:
     user: User
     roles: tuple[CanonicalIdentityRole, ...]
     store_ids: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AuthSessionToken:
+    session: AuthSession
+    refresh_token: str
 
 
 def bootstrap_corporate_admin(
@@ -548,6 +557,171 @@ def authenticate_user(
     db.commit()
     db.refresh(user)
     return user
+
+
+def _invalid_refresh_token(*, reused: bool = False) -> ApiError:
+    return ApiError(
+        401,
+        "Unauthorized",
+        (
+            "The refresh token was already used; its session family has been revoked."
+            if reused
+            else "The refresh token is missing, invalid, expired, or revoked."
+        ),
+        code="refresh_token_reused" if reused else "invalid_refresh_token",
+    )
+
+
+def _parse_refresh_token(raw_token: str) -> tuple[uuid.UUID, str]:
+    if "." not in raw_token:
+        raise _invalid_refresh_token()
+    raw_session_id, secret = raw_token.split(".", 1)
+    try:
+        session_id = uuid.UUID(raw_session_id)
+    except ValueError as exc:
+        raise _invalid_refresh_token() from exc
+    if len(secret) < 32:
+        raise _invalid_refresh_token()
+    return session_id, secret
+
+
+def _new_auth_session_token(
+    user: User,
+    *,
+    lifetime: timedelta,
+    family_id: uuid.UUID | None = None,
+) -> AuthSessionToken:
+    session_id = uuid.uuid4()
+    secret = secrets.token_urlsafe(48)
+    now = datetime.now(UTC)
+    session = AuthSession(
+        id=session_id,
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        family_id=family_id or uuid.uuid4(),
+        refresh_token_hash=hashlib.sha256(secret.encode()).hexdigest(),
+        token_version=user.token_version,
+        expires_at=now + lifetime,
+    )
+    return AuthSessionToken(session=session, refresh_token=f"{session_id}.{secret}")
+
+
+def create_auth_session(
+    db: Session,
+    user: User,
+    *,
+    lifetime: timedelta,
+) -> AuthSessionToken:
+    token = _new_auth_session_token(user, lifetime=lifetime)
+    db.add(token.session)
+    db.commit()
+    db.refresh(token.session)
+    return token
+
+
+def rotate_auth_session(
+    db: Session,
+    *,
+    tenant_code: str,
+    raw_refresh_token: str,
+    lifetime: timedelta,
+) -> tuple[User, AuthSessionToken]:
+    session_id, secret = _parse_refresh_token(raw_refresh_token)
+    if isinstance(db, TenantSession):
+        tenant_id = db.scalar(
+            text("SELECT abacus_resolve_login_tenant(:tenant_code)"),
+            {"tenant_code": tenant_code},
+        )
+        db.rollback()
+        if tenant_id is None:
+            raise _invalid_refresh_token()
+        pin_session_to_tenant(db, uuid.UUID(str(tenant_id)))
+
+    auth_session = db.scalar(
+        select(AuthSession).where(AuthSession.id == session_id).with_for_update()
+    )
+    candidate_hash = hashlib.sha256(secret.encode()).hexdigest()
+    if auth_session is None or not secrets.compare_digest(
+        candidate_hash,
+        auth_session.refresh_token_hash,
+    ):
+        raise _invalid_refresh_token()
+
+    now = datetime.now(UTC)
+    if auth_session.rotated_at is not None:
+        db.execute(
+            update(AuthSession)
+            .where(
+                AuthSession.tenant_id == auth_session.tenant_id,
+                AuthSession.family_id == auth_session.family_id,
+                AuthSession.revoked_at.is_(None),
+            )
+            .values(revoked_at=now)
+        )
+        db.commit()
+        raise _invalid_refresh_token(reused=True)
+    if auth_session.revoked_at is not None or auth_session.expires_at <= now:
+        raise _invalid_refresh_token()
+
+    user = db.scalar(
+        select(User)
+        .where(
+            User.tenant_id == auth_session.tenant_id,
+            User.id == auth_session.user_id,
+        )
+        .with_for_update()
+    )
+    tenant_status = db.scalar(select(Tenant.status).where(Tenant.id == auth_session.tenant_id))
+    if (
+        user is None
+        or user.status is not UserStatus.ACTIVE
+        or tenant_status is not TenantStatus.ACTIVE
+        or user.token_version != auth_session.token_version
+    ):
+        auth_session.revoked_at = now
+        db.commit()
+        raise _invalid_refresh_token()
+
+    auth_session.rotated_at = now
+    auth_session.last_used_at = now
+    replacement = _new_auth_session_token(
+        user,
+        lifetime=lifetime,
+        family_id=auth_session.family_id,
+    )
+    db.add(replacement.session)
+    db.commit()
+    db.refresh(replacement.session)
+    return user, replacement
+
+
+def revoke_auth_session(db: Session, principal: Principal) -> None:
+    if principal.session_id is None:
+        user = db.scalar(
+            select(User)
+            .where(
+                User.tenant_id == principal.tenant_id,
+                User.id == principal.user_id,
+            )
+            .with_for_update()
+        )
+        if user is not None:
+            user.token_version += 1
+            db.commit()
+        return
+
+    auth_session = db.scalar(
+        select(AuthSession)
+        .where(
+            AuthSession.tenant_id == principal.tenant_id,
+            AuthSession.id == principal.session_id,
+            AuthSession.user_id == principal.user_id,
+        )
+        .with_for_update()
+    )
+    if auth_session is not None and auth_session.revoked_at is None:
+        auth_session.revoked_at = datetime.now(UTC)
+        db.commit()
 
 
 def create_canonical_user(

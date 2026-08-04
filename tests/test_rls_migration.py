@@ -83,11 +83,67 @@ def _load_business_event_migration() -> ModuleType:
     return module
 
 
+def _load_replenishment_evidence_migration() -> ModuleType:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "b8e4c1a7d920_verify_replenishment_moves.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "abacus_replenishment_evidence_migration",
+        migration_path,
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("Unable to load replenishment-evidence migration")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def _load_auth_session_migration() -> ModuleType:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "e9f2a4c6b831_add_rotating_auth_sessions.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "abacus_auth_session_migration",
+        migration_path,
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("Unable to load auth-session migration")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def _load_store_scope_migration() -> ModuleType:
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "a1c5e7f9b042_enforce_database_store_scope.py"
+    )
+    specification = importlib.util.spec_from_file_location(
+        "abacus_store_scope_migration",
+        migration_path,
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("Unable to load store-scope migration")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
 def test_rls_table_inventory_matches_all_tenant_owned_models() -> None:
     migration = _load_rls_migration()
     retirement = _load_retirement_migration()
     catalog_source = _load_catalog_source_migration()
     business_events = _load_business_event_migration()
+    replenishment_evidence = _load_replenishment_evidence_migration()
+    auth_sessions = _load_auth_session_migration()
     modeled_tenant_tables = {
         table.name for table in Base.metadata.tables.values() if "tenant_id" in table.columns
     }
@@ -95,14 +151,34 @@ def test_rls_table_inventory_matches_all_tenant_owned_models() -> None:
 
     historical_tables = set(migration.TENANT_OWNED_TABLES)
     retired_tables = set(retirement.RETIRED_TABLES)
-    added_tables = set(catalog_source.ADDED_TENANT_TABLES) | set(
-        business_events.ADDED_TENANT_TABLES
+    added_tables = (
+        set(catalog_source.ADDED_TENANT_TABLES)
+        | set(business_events.ADDED_TENANT_TABLES)
+        | set(replenishment_evidence.ADDED_TENANT_TABLES)
+        | set(auth_sessions.ADDED_TENANT_TABLES)
     )
     assert historical_tables | added_tables == modeled_tenant_tables | retired_tables
     assert historical_tables.isdisjoint(added_tables)
     assert modeled_tenant_tables.isdisjoint(retired_tables)
     assert "NULLIF" in migration.TENANT_CONTEXT_SQL
     assert "current_setting('app.tenant_id', true)" in migration.TENANT_CONTEXT_SQL
+
+
+def test_store_scope_policy_inventory_matches_store_owned_models() -> None:
+    migration = _load_store_scope_migration()
+    identity_scope_tables = {"user_access_grants", "user_store_assignments"}
+    modeled_direct_tables = {
+        table.name
+        for table in Base.metadata.tables.values()
+        if "tenant_id" in table.columns and "store_id" in table.columns
+    } - identity_scope_tables
+    modeled_direct_tables.add("stores")
+
+    assert set(migration.DIRECT_STORE_TABLES) == modeled_direct_tables
+    assert set(migration.INDIRECT_STORE_TABLES) == {
+        "devices",
+        "replenishment_task_evidence",
+    }
 
 
 @pytest.mark.integration
@@ -282,6 +358,10 @@ def test_postgres_rls_and_security_definer_boundaries(postgres_engine: Engine) -
         role_connection.execute(
             text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
             {"tenant_id": str(tenant_a)},
+        )
+        role_connection.execute(
+            text("SELECT set_config('app.store_scope', :store_scope, true)"),
+            {"store_scope": str(store_a)},
         )
         visible_tenants = role_connection.scalars(
             text("SELECT id FROM public.tenants ORDER BY id")

@@ -64,7 +64,7 @@ def test_openapi_contains_public_api_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.8.5"
+    assert __version__ == "0.9.0"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",
@@ -137,6 +137,8 @@ def test_openapi_contains_public_api_contract() -> None:
     }
     optional_operations = {
         ("post", "/v1/auth/login"): "login",
+        ("post", "/v1/auth/refresh"): "refreshAccessToken",
+        ("post", "/v1/auth/logout"): "logout",
         ("get", "/v1/stores"): "listStores",
         ("get", "/v1/tenants/{tenant_id}/stores"): "listTenantStores",
         ("get", "/v1/stores/{store_id}/zones"): "listStoreZones",
@@ -169,6 +171,7 @@ def test_openapi_contains_public_api_contract() -> None:
     assert security_schemes["PlatformApiKey"]["name"] == "X-Platform-Key"
     assert security_schemes["HTTPBearer"]["scheme"] == "bearer"
     assert paths["/v1/rfid/observation-batches"]["post"]["security"] == [{"DeviceToken": []}]
+    assert "401" in paths["/v1/auth/refresh"]["post"]["responses"]
     for path, method in (
         ("/v1/tenants", "post"),
         ("/v1/tenants/{tenant_id}/store-imports", "post"),

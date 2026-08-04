@@ -96,6 +96,22 @@ def require_page(result: HttpResult, *, operation: str) -> list[object]:
     return items
 
 
+def require_sized_page(
+    result: HttpResult,
+    *,
+    operation: str,
+    minimum_total: int,
+) -> list[object]:
+    body = require_object(result, operation=operation)
+    items = body.get("items")
+    total = body.get("total")
+    if not isinstance(items, list) or not isinstance(total, int):
+        raise RuntimeError(f"{operation} did not return a sized page")
+    if total < minimum_total:
+        raise RuntimeError(f"{operation} returned {total}; expected at least {minimum_total}")
+    return items
+
+
 def require_list(result: HttpResult, *, operation: str) -> list[object]:
     if result.status_code != 200:
         raise RuntimeError(f"{operation} returned HTTP {result.status_code}")
@@ -150,8 +166,25 @@ def run_checks(
         operation="login",
     )
     token = login.get("access_token")
+    refresh_token = login.get("refresh_token")
+    if not isinstance(token, str) or not token or not isinstance(refresh_token, str):
+        raise RuntimeError("login response did not include an access and refresh token pair")
+    original_headers = {"Authorization": f"Bearer {token}"}
+    refreshed = require_object(
+        transport(
+            "POST",
+            f"{root}/v1/auth/refresh",
+            {},
+            {"tenant_code": demo_tenant, "refresh_token": refresh_token},
+            timeout,
+        ),
+        operation="token refresh",
+    )
+    token = refreshed.get("access_token")
     if not isinstance(token, str) or not token:
-        raise RuntimeError("login response did not include an access token")
+        raise RuntimeError("refresh response did not include an access token")
+    if transport("GET", f"{root}/v1/me", original_headers, None, timeout).status_code != 401:
+        raise RuntimeError("refresh did not retire the previous access token")
     headers = {"Authorization": f"Bearer {token}"}
 
     me = require_object(
@@ -160,9 +193,10 @@ def run_checks(
     if me.get("email") != demo_email:
         raise RuntimeError("current-user response did not identify the public reviewer")
 
-    stores = require_page(
+    stores = require_sized_page(
         transport("GET", f"{root}/v1/stores?limit=5", headers, None, timeout),
         operation="store discovery",
+        minimum_total=100,
     )
     if not stores or not isinstance(stores[0], dict) or not isinstance(stores[0].get("id"), str):
         raise RuntimeError("store discovery returned no usable store")
@@ -190,23 +224,33 @@ def run_checks(
         raise RuntimeError("device discovery returned an unusable device")
     device_serial = device["serial_number"]
 
-    skus = require_page(
+    skus = require_sized_page(
         transport("GET", f"{root}/v1/skus?limit=5", headers, None, timeout),
         operation="SKU discovery",
+        minimum_total=100,
     )
     if not skus:
         raise RuntimeError("SKU discovery returned no seeded data")
 
-    require_page(
-        transport(
-            "GET",
-            f"{root}/v1/stores/{store_id}/inventory?limit=5",
-            headers,
-            None,
-            timeout,
-        ),
-        operation="inventory",
-    )
+    stocked_stores = 0
+    for item in stores:
+        candidate_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(candidate_id, str):
+            raise RuntimeError("store discovery returned an unusable store")
+        inventory = require_page(
+            transport(
+                "GET",
+                f"{root}/v1/stores/{candidate_id}/inventory?limit=5",
+                headers,
+                None,
+                timeout,
+            ),
+            operation="inventory",
+        )
+        if inventory:
+            stocked_stores += 1
+    if stocked_stores < 3:
+        raise RuntimeError(f"only {stocked_stores} of the first five stores contain inventory")
     require_page(
         transport(
             "GET",
@@ -310,19 +354,27 @@ def run_checks(
             operation=operation,
         )
 
+    logout = transport("POST", f"{root}/v1/auth/logout", headers, None, timeout)
+    if logout.status_code != 204:
+        raise RuntimeError(f"logout returned HTTP {logout.status_code}")
+    if transport("GET", f"{root}/v1/me", headers, None, timeout).status_code != 401:
+        raise RuntimeError("logout did not revoke the access token")
+
     return [
         "discovery",
         "login",
+        "refresh rotation",
         "current user",
         "stores",
         "zones",
         "devices",
         "SKUs",
-        "inventory",
+        "inventory in three stores",
         "policies",
         "tasks",
         "quarantine",
         "eight write categories denied",
+        "logout revocation",
     ]
 
 

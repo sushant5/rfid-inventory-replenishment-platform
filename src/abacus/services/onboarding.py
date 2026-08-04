@@ -11,7 +11,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from abacus.api.errors import ApiError
-from abacus.db import TenantSession, pin_session_to_tenant
+from abacus.db import (
+    STORE_SCOPE_CONTEXT_KEY,
+    TenantSession,
+    pin_session_to_store_scope,
+    pin_session_to_tenant,
+)
 from abacus.enums import BatchStatus, StoreStatus, TenantStatus
 from abacus.models.tenancy import (
     Device,
@@ -59,6 +64,7 @@ def create_tenant(db: Session, request: TenantCreate) -> Tenant:
             uuid.UUID(str(resolved_tenant_id)) if resolved_tenant_id is not None else uuid.uuid4()
         )
         pin_session_to_tenant(db, tenant_id)
+        pin_session_to_store_scope(db, tenant_wide=True)
     else:
         tenant_id = uuid.uuid4()
     existing = db.scalar(select(Tenant).where(Tenant.code == request.code))
@@ -98,6 +104,13 @@ def _store_in_principal_tenant(
     principal: Principal,
     store_id: uuid.UUID,
 ) -> Store:
+    if not principal.can_access_store(Permission.TENANT_CONFIGURE, store_id):
+        raise ApiError(
+            403,
+            "Forbidden",
+            "The requested store is outside the current user's access scope.",
+            code="store_scope_denied",
+        )
     store = db.scalar(
         select(Store).where(
             Store.id == store_id,
@@ -107,13 +120,6 @@ def _store_in_principal_tenant(
     if store is None:
         # Tenant-scoped lookup avoids confirming another tenant's identifiers.
         raise ApiError(404, "Store not found", "The requested store does not exist.")
-    if not principal.can_access_store(Permission.TENANT_CONFIGURE, store.id):
-        raise ApiError(
-            403,
-            "Forbidden",
-            "The requested store is outside the current user's access scope.",
-            code="store_scope_denied",
-        )
     return store
 
 
@@ -216,6 +222,8 @@ def _request_hash(request: BulkStoreOnboardingRequest) -> str:
 def _get_tenant(db: Session, tenant_id: uuid.UUID) -> Tenant:
     if isinstance(db, TenantSession):
         pin_session_to_tenant(db, tenant_id)
+        if db.info.get(STORE_SCOPE_CONTEXT_KEY) is None:
+            pin_session_to_store_scope(db, tenant_wide=True)
     tenant = db.get(Tenant, tenant_id)
     if tenant is None:
         raise ApiError(404, "Tenant not found", "The requested tenant does not exist.")
@@ -404,6 +412,7 @@ def onboard_stores(
 def list_stores(db: Session, tenant_id: uuid.UUID) -> list[Store]:
     if isinstance(db, TenantSession):
         pin_session_to_tenant(db, tenant_id)
+        pin_session_to_store_scope(db, tenant_wide=True)
     _get_tenant(db, tenant_id)
     return list(
         db.scalars(

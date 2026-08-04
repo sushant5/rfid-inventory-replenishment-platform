@@ -123,6 +123,41 @@ class UserAccessGrant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class AuthSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Server-side lifecycle for one rotating refresh-token family."""
+
+    __tablename__ = "auth_sessions"
+    __table_args__ = (
+        UniqueConstraint("refresh_token_hash", name="uq_auth_sessions_refresh_hash"),
+        ForeignKeyConstraint(
+            ["tenant_id", "user_id"],
+            ["users.tenant_id", "users.id"],
+            name="fk_auth_sessions_tenant_user",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("token_version >= 1", name="ck_auth_sessions_token_version"),
+        Index("ix_auth_sessions_tenant_user", "tenant_id", "user_id", "expires_at"),
+        Index("ix_auth_sessions_family", "tenant_id", "family_id"),
+        Index(
+            "ix_auth_sessions_expired",
+            "expires_at",
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    family_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    refresh_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class IdentityAuditRecord(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "identity_audit_records"
     __table_args__ = (

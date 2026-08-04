@@ -30,6 +30,18 @@ class AccessTokenRead(ApiModel):
     access_token: str
     token_type: str = Field(default="bearer")
     expires_in: int
+    refresh_token: str | None = None
+    refresh_expires_in: int | None = None
+
+
+class RefreshTokenRequest(ApiModel):
+    tenant_code: str = Field(min_length=2, max_length=64, pattern=TENANT_CODE_PATTERN)
+    refresh_token: SecretStr = Field(min_length=32, max_length=512)
+
+    @field_validator("tenant_code")
+    @classmethod
+    def normalize_tenant_code(cls, value: str) -> str:
+        return value.strip().lower()
 
 
 class RoleAssignmentCreate(ApiModel):

@@ -7,10 +7,13 @@ from sqlalchemy.orm import Session, SessionTransaction
 
 from abacus.api.dependencies import require_tenant_session
 from abacus.db import (
+    STORE_SCOPE_CONTEXT_KEY,
     TENANT_CONTEXT_KEY,
+    TENANT_WIDE_STORE_SCOPE,
     TenantSession,
     _apply_transaction_tenant_context,
     get_db,
+    pin_session_to_store_scope,
     pin_session_to_tenant,
     tenant_session_scope,
 )
@@ -57,6 +60,45 @@ def test_listener_reapplies_context_for_each_new_transaction() -> None:
     _apply_transaction_tenant_context(session, second_transaction, connection)
 
     assert connection.execute.call_count == 2
+
+
+def test_listener_applies_database_store_scope_after_tenant_context() -> None:
+    tenant_id = uuid.uuid4()
+    store_ids = (uuid.uuid4(), uuid.uuid4())
+    session = pin_session_to_tenant(TenantSession(), tenant_id)
+    pin_session_to_store_scope(session, store_ids)
+    transaction, connection = _event_arguments()
+
+    _apply_transaction_tenant_context(session, transaction, connection)
+
+    assert connection.execute.call_count == 2
+    statement, parameters = connection.execute.call_args_list[1].args
+    assert str(statement) == "SELECT set_config('app.store_scope', :store_scope, true)"
+    assert set(parameters["store_scope"].split(",")) == {str(store_id) for store_id in store_ids}
+
+
+def test_store_scope_requires_tenant_and_is_immutable() -> None:
+    store_id = uuid.uuid4()
+    with pytest.raises(RuntimeError, match="tenant context"):
+        pin_session_to_store_scope(TenantSession(), [store_id])
+
+    session = pin_session_to_tenant(TenantSession(), uuid.uuid4())
+    assert pin_session_to_store_scope(session, [store_id]) is session
+    assert pin_session_to_store_scope(session, [store_id]) is session
+    with pytest.raises(RuntimeError, match="cannot be rebound"):
+        pin_session_to_store_scope(session, [uuid.uuid4()])
+
+
+def test_empty_store_scope_is_valid_and_fails_closed() -> None:
+    session = pin_session_to_tenant(TenantSession(), uuid.uuid4())
+    pin_session_to_store_scope(session)
+    transaction, connection = _event_arguments()
+
+    _apply_transaction_tenant_context(session, transaction, connection)
+
+    assert session.info[STORE_SCOPE_CONTEXT_KEY] == ""
+    _, parameters = connection.execute.call_args_list[1].args
+    assert parameters == {"store_scope": ""}
 
 
 def test_tenant_binding_is_idempotent_but_cannot_be_changed() -> None:
@@ -119,3 +161,4 @@ def test_tenant_scope_yields_a_pinned_session() -> None:
     with tenant_session_scope(tenant_id) as session:
         assert isinstance(session, TenantSession)
         assert session.info[TENANT_CONTEXT_KEY] == tenant_id
+        assert session.info[STORE_SCOPE_CONTEXT_KEY] == TENANT_WIDE_STORE_SCOPE
