@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session
 from abacus.api.errors import ApiError
 from abacus.events.rfid import RfidObservationEvent
 from abacus.models.architecture import (
-    FreshnessStatus,
     ObservationBatchStatus,
     RfidEventProcessingStatus,
     RfidObservationBatch,
@@ -20,10 +19,10 @@ from abacus.models.architecture import (
     RfidObservationEventLedger,
     RfidObservationOutbox,
     RfidQuarantine,
-    StoreConnectivity,
 )
 from abacus.models.tenancy import Device, DeviceAssignment
 from abacus.schemas.architecture import ObservationBatchCreate
+from abacus.services.connectivity import lock_store_connectivity_for_receipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,24 +278,14 @@ def accept_observation_batch(
 
         _set_initial_batch_outcome(batch, ledgers, received_at=received_at)
 
-        connectivity = db.get(
-            StoreConnectivity,
-            (device.tenant_id, current_assignment.store_id),
+        lock_store_connectivity_for_receipt(
+            db,
+            tenant_id=device.tenant_id,
+            store_id=current_assignment.store_id,
+            received_at=received_at,
+            backlog_drained=request.backlog_drained,
+            reader_coverage_ok=request.reader_coverage_ok,
         )
-        if connectivity is None:
-            connectivity = StoreConnectivity(
-                tenant_id=device.tenant_id,
-                store_id=current_assignment.store_id,
-                backlog_drained=request.backlog_drained,
-                reader_coverage_ok=request.reader_coverage_ok,
-                freshness_status=FreshnessStatus.STALE,
-            )
-            db.add(connectivity)
-        connectivity.gateway_last_heartbeat = received_at
-        connectivity.backlog_drained = request.backlog_drained
-        connectivity.reader_coverage_ok = request.reader_coverage_ok
-        if not request.backlog_drained or not request.reader_coverage_ok:
-            connectivity.freshness_status = FreshnessStatus.STALE
 
         db.commit()
         db.refresh(batch)

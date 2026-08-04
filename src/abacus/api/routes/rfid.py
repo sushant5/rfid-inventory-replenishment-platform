@@ -13,6 +13,7 @@ from abacus.models.architecture import (
     InventoryProjection,
     RfidEventProcessingStatus,
     RfidObservationBatch,
+    RfidObservationBatchEvent,
     RfidObservationEventLedger,
     RfidQuarantine,
     StoreConnectivity,
@@ -106,8 +107,27 @@ def get_observation_batch_endpoint(
     )
     if batch is None:
         raise ApiError(404, "RFID batch not found", "The requested batch does not exist.")
-    if not principal.can_access_store(Permission.INVENTORY_READ, batch.store_id):
-        raise ApiError(403, "Forbidden", "The batch's store is outside the user's scope.")
+    event_store_ids = set(
+        db.scalars(
+            select(RfidObservationEventLedger.store_id)
+            .join(
+                RfidObservationBatchEvent,
+                (RfidObservationBatchEvent.tenant_id == RfidObservationEventLedger.tenant_id)
+                & (RfidObservationBatchEvent.event_id == RfidObservationEventLedger.event_id),
+            )
+            .where(
+                RfidObservationBatchEvent.tenant_id == principal.tenant_id,
+                RfidObservationBatchEvent.batch_id == batch.id,
+            )
+            .distinct()
+        ).all()
+    )
+    batch_store_ids = event_store_ids | {batch.store_id}
+    if any(
+        not principal.can_access_store(Permission.INVENTORY_READ, store_id)
+        for store_id in batch_store_ids
+    ):
+        raise ApiError(403, "Forbidden", "The batch contains stores outside the user's scope.")
     return ObservationBatchRead(
         batch_id=batch.id,
         status=batch.status,

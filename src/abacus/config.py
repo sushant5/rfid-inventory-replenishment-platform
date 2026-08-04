@@ -68,9 +68,11 @@ class Settings(BaseSettings):
         exclude=True,
     )
 
-    @field_validator("database_url")
+    @field_validator("database_url", "migration_database_url")
     @classmethod
-    def select_psycopg_driver(cls, value: str) -> str:
+    def select_psycopg_driver(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if value.startswith("postgresql://"):
             return value.replace("postgresql://", "postgresql+psycopg://", 1)
         return value

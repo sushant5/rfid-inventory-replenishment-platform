@@ -807,7 +807,13 @@ class StoreConnectivity(Base):
     gateway_last_heartbeat: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    status_received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     last_live_event_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_live_received_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     oldest_buffered_event_at: Mapped[datetime | None] = mapped_column(

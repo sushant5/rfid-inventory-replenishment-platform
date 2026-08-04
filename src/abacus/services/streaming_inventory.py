@@ -33,6 +33,7 @@ from abacus.models.architecture import (
 )
 from abacus.models.catalog import EpcBinding
 from abacus.models.tenancy import Device, DeviceAssignment
+from abacus.services.connectivity import lock_store_connectivity_for_receipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +188,11 @@ class RecentObservationState:
         self._event_ids.pop((event.tenant_id, event.event_id), None)
 
     def add(
-        self, event: RfidObservationEvent, window_seconds: int
+        self,
+        event: RfidObservationEvent,
+        window_seconds: int,
+        *,
+        evidence_not_before: datetime | None = None,
     ) -> tuple[RfidObservationEvent, ...]:
         key = (event.tenant_id, event.epc)
         window = self._windows.setdefault(key, deque())
@@ -195,7 +200,12 @@ class RecentObservationState:
         window.append(event)
         newest = max(item.observed_at for item in window)
         cutoff = newest - timedelta(seconds=window_seconds)
-        retained = deque(item for item in window if item.observed_at >= cutoff)
+        retained = deque(
+            item
+            for item in window
+            if item.observed_at >= cutoff
+            and (evidence_not_before is None or item.observed_at >= evidence_not_before)
+        )
         self._windows[key] = retained
         if len(self._windows) > self._maximum_epcs:
             self._windows.popitem(last=False)
@@ -482,51 +492,71 @@ def _delta_payload(
     ).model_dump(mode="json")
 
 
-def _update_connectivity(
-    db: Session,
+def _apply_connectivity_observation(
+    connectivity: StoreConnectivity,
     event: RfidObservationEvent,
     settings: Settings,
-) -> StoreConnectivity:
-    connectivity = db.get(StoreConnectivity, (event.tenant_id, event.store_id))
-    if connectivity is None:
-        connectivity = StoreConnectivity(
-            tenant_id=event.tenant_id,
-            store_id=event.store_id,
-            backlog_drained=False,
-            reader_coverage_ok=event.reader_coverage_ok,
-            freshness_status=FreshnessStatus.STALE,
-        )
-        db.add(connectivity)
-    if (
-        connectivity.gateway_last_heartbeat is None
-        or event.received_at - connectivity.gateway_last_heartbeat
-        >= timedelta(seconds=settings.rfid_last_seen_flush_seconds)
-    ):
-        connectivity.gateway_last_heartbeat = event.received_at
-    connectivity.reader_coverage_ok = event.reader_coverage_ok
+    *,
+    is_current_receipt: bool,
+) -> None:
+    """Apply event evidence without making same-receipt results order-dependent."""
+
     if event.is_buffered:
-        if (
-            connectivity.oldest_buffered_event_at is None
-            or event.observed_at < connectivity.oldest_buffered_event_at
-        ):
-            connectivity.oldest_buffered_event_at = event.observed_at
-        connectivity.backlog_drained = False
-        connectivity.freshness_status = FreshnessStatus.STALE
+        if is_current_receipt:
+            live_has_resumed = (
+                event.backlog_drained
+                and connectivity.last_live_received_at is not None
+                and connectivity.last_live_received_at >= event.received_at
+            )
+            if not live_has_resumed:
+                if (
+                    connectivity.oldest_buffered_event_at is None
+                    or event.observed_at < connectivity.oldest_buffered_event_at
+                ):
+                    connectivity.oldest_buffered_event_at = event.observed_at
+                connectivity.backlog_drained = False
+                connectivity.freshness_status = FreshnessStatus.STALE
     else:
+        if (
+            connectivity.last_live_received_at is None
+            or event.received_at > connectivity.last_live_received_at
+        ):
+            connectivity.last_live_received_at = event.received_at
         if (
             connectivity.last_live_event_at is None
             or event.observed_at - connectivity.last_live_event_at
             >= timedelta(seconds=settings.rfid_last_seen_flush_seconds)
         ):
             connectivity.last_live_event_at = event.observed_at
-        connectivity.backlog_drained = event.backlog_drained
-        if event.backlog_drained:
-            connectivity.oldest_buffered_event_at = None
-        connectivity.freshness_status = effective_freshness(
-            connectivity,
-            settings,
-            now=event.received_at,
-        )
+        if is_current_receipt:
+            if event.backlog_drained:
+                connectivity.oldest_buffered_event_at = None
+            connectivity.freshness_status = effective_freshness(
+                connectivity,
+                settings,
+                now=event.received_at,
+            )
+
+
+def _update_connectivity(
+    db: Session,
+    event: RfidObservationEvent,
+    settings: Settings,
+) -> StoreConnectivity:
+    connectivity, is_current_receipt = lock_store_connectivity_for_receipt(
+        db,
+        tenant_id=event.tenant_id,
+        store_id=event.store_id,
+        received_at=event.received_at,
+        backlog_drained=event.backlog_drained,
+        reader_coverage_ok=event.reader_coverage_ok,
+    )
+    _apply_connectivity_observation(
+        connectivity,
+        event,
+        settings,
+        is_current_receipt=is_current_receipt,
+    )
     return connectivity
 
 
@@ -688,6 +718,7 @@ def process_observation(
         .order_by(EpcBinding.effective_from.desc())
         .limit(1)
     )
+    binding_evidence_start = binding.effective_from if binding is not None else None
     if binding is None and event.replayed_from_quarantine_id is not None:
         quarantine = db.scalar(
             select(RfidQuarantine).where(
@@ -743,7 +774,11 @@ def process_observation(
             reason="AUTHORITATIVELY_REMOVED",
         )
 
-    window = recent.add(resolved_event, settings.rfid_move_confirmation_window_seconds)
+    window = recent.add(
+        resolved_event,
+        settings.rfid_move_confirmation_window_seconds,
+        evidence_not_before=binding_evidence_start,
+    )
     decision = infer_stable_zone(window, settings)
     if decision is None:
         if state is not None:

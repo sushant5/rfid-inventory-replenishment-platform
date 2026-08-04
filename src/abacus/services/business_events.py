@@ -43,10 +43,12 @@ def _request_fingerprint(store_id: uuid.UUID, request: BusinessEventCreate) -> s
 
 def business_event_status(db: Session, event: BusinessEvent) -> BusinessEventStatus:
     transition = db.get(InventoryTransitionOutbox, event.transition_id)
-    if transition is None or transition.quarantined_at is not None:
+    if transition is None:
         return BusinessEventStatus.FAILED
-    if transition.published_at is not None:
+    if transition.published_at is not None or transition.reconciled_at is not None:
         return BusinessEventStatus.PROJECTED
+    if transition.quarantined_at is not None:
+        return BusinessEventStatus.FAILED
     return BusinessEventStatus.PENDING_PROJECTION
 
 

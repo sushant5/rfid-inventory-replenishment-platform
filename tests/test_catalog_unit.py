@@ -1,4 +1,6 @@
+import csv
 import hashlib
+import io
 from datetime import UTC, datetime
 from unittest.mock import Mock
 from uuid import uuid4
@@ -21,6 +23,38 @@ HEADER = "style_code,style_name,sku,upc,color,size,epc,attributes,attr.brand\n"
 
 def csv_bytes(*rows: str) -> bytes:
     return (HEADER + "\n".join(rows) + "\n").encode()
+
+
+def catalog_json_csv(field_name: str, value: str) -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "style_code",
+            "style_name",
+            "sku",
+            "upc",
+            "color",
+            "size",
+            "epc",
+            "attributes",
+            "style_attributes",
+        ],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "style_code": "ST-1",
+            "style_name": "Trail Shirt",
+            "sku": "SKU-1",
+            "upc": "036000291452",
+            "color": "Blue",
+            "size": "M",
+            "epc": "3074257BF7194E4000001A85",
+            field_name: value,
+        }
+    )
+    return buffer.getvalue().encode()
 
 
 def test_catalog_row_normalizes_identifiers() -> None:
@@ -73,6 +107,52 @@ def test_csv_parser_normalizes_and_merges_attributes() -> None:
         "season": "summer",
         "brand": "Orange",
     }
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e10000"])
+@pytest.mark.parametrize(
+    ("field_name", "issue_code"),
+    [
+        ("attributes", "invalid_attributes"),
+        ("style_attributes", "invalid_style_attributes"),
+    ],
+)
+def test_csv_parser_rejects_non_finite_json_numbers(
+    constant: str,
+    field_name: str,
+    issue_code: str,
+) -> None:
+    result = parse_catalog_csv(catalog_json_csv(field_name, f'{{"score":{constant}}}'))
+
+    assert result.issues == []
+    assert result.rows[0].normalized is None
+    assert result.rows[0].issues[0].field == field_name
+    assert result.rows[0].issues[0].code == issue_code
+    assert "non-finite JSON number" in result.rows[0].issues[0].message
+
+
+@pytest.mark.parametrize(
+    ("field_name", "issue_code"),
+    [
+        ("attributes", "invalid_attributes"),
+        ("style_attributes", "invalid_style_attributes"),
+    ],
+)
+def test_csv_parser_rejects_deep_json_as_a_row_error(
+    field_name: str,
+    issue_code: str,
+) -> None:
+    deeply_nested = '{"value":' + "[" * 1_100 + "0" + "]" * 1_100 + "}"
+    content = catalog_json_csv(field_name, deeply_nested)
+    assert len(deeply_nested.encode()) < 16_384
+
+    result = parse_catalog_csv(content)
+
+    assert result.issues == []
+    assert result.rows[0].normalized is None
+    assert result.rows[0].issues[0].field == field_name
+    assert result.rows[0].issues[0].code == issue_code
+    assert "nested JSON levels" in result.rows[0].issues[0].message
 
 
 def test_same_sku_may_have_multiple_distinct_epcs() -> None:

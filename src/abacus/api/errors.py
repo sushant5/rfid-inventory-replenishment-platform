@@ -1,6 +1,7 @@
 import re
 from collections.abc import Mapping
 from copy import deepcopy
+from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -10,6 +11,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute, RouteContext, iter_route_contexts
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # These responses are operation-specific runtime behavior, not an assumption that
 # every write can conflict. Keeping the registry keyed by stable operationId makes
@@ -159,6 +161,35 @@ def install_error_handlers(app: FastAPI) -> None:
             status_code=422,
             content=problem.model_dump(exclude_none=True),
             media_type="application/problem+json",
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(
+        request: Request,
+        exc: StarletteHTTPException,
+    ) -> JSONResponse:
+        try:
+            title = HTTPStatus(exc.status_code).phrase
+        except ValueError:
+            title = "HTTP error"
+        detail = exc.detail if isinstance(exc.detail, str) else title
+        code = {
+            404: "route_not_found",
+            405: "method_not_allowed",
+        }.get(exc.status_code, "http_error")
+        problem = ProblemDetail(
+            title=title,
+            status=exc.status_code,
+            detail=detail,
+            instance=str(request.url.path),
+            code=code,
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=problem.model_dump(exclude_none=True),
+            media_type="application/problem+json",
+            headers=exc.headers,
         )
 
     @app.exception_handler(Exception)
