@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.8.4` on Render with managed PostgreSQL. Render may need
+The hosted demo runs release `0.8.5` on Render with managed PostgreSQL. Render may need
 about a minute to wake the free web service after inactivity.
 
 Public reviewer login:
@@ -199,7 +199,7 @@ also a production extension, not a demo dependency.
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.4`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.5`).
 
 The visible contract includes all required endpoints:
 
@@ -325,8 +325,9 @@ administrator can request recovery with
 `POST /v1/rfid/quarantine/{quarantine_id}:replay`. Recovery reconstructs the immutable
 observation from that ledger and requeues the same event identity; repeated requests
 while it is pending or after it succeeds are no-ops. The original quarantine row remains
-as audit history, and event, transition, and delta uniqueness constraints prevent
-duplicate inventory. For `UNKNOWN_EPC`, explicit replay after a product-master
+as audit history, while `current_rejection_reason` reports the latest failed replay
+without overwriting that original evidence. Event, transition, and delta uniqueness
+constraints prevent duplicate inventory. For `UNKNOWN_EPC`, explicit replay after a product-master
 correction may use the current active EPC binding because the master data arrived after
 the physical read; ordinary observations continue to use event-time bindings.
 
@@ -357,7 +358,7 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.4 --expected-build-sha <release-sha> --expected-schema-revision d7a9b3e5f820
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.5 --expected-build-sha <release-sha> --expected-schema-revision d7a9b3e5f820
 ```
 
 ## Hosting

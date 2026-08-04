@@ -673,6 +673,7 @@ def test_quarantine_replay_and_device_credential_rotation_cross_http_and_databas
     assert quarantine.json()["total"] == 1
     quarantine_record = quarantine.json()["items"][0]
     assert quarantine_record["reason"] == "UNKNOWN_EPC"
+    assert quarantine_record["current_rejection_reason"] == "UNKNOWN_EPC"
     assert quarantine_record["processing_status"] == RfidEventProcessingStatus.REJECTED
 
     replay = api_client.post(

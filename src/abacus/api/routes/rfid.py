@@ -172,6 +172,7 @@ def list_rfid_quarantine_endpoint(
             RfidQuarantine,
             RfidObservationEventLedger.processing_status,
             RfidObservationEventLedger.processed_at,
+            RfidObservationEventLedger.rejection_reason,
         )
         .outerjoin(
             RfidObservationEventLedger,
@@ -192,6 +193,7 @@ def list_rfid_quarantine_endpoint(
             batch_id=record.batch_id,
             event_id=record.event_id,
             reason=record.reason,
+            current_rejection_reason=current_rejection_reason,
             payload=record.payload,
             quarantined_at=record.quarantined_at,
             processing_status=processing_status,
@@ -199,7 +201,7 @@ def list_rfid_quarantine_endpoint(
                 processed_at if processing_status is RfidEventProcessingStatus.PROCESSED else None
             ),
         )
-        for record, processing_status, processed_at in records
+        for record, processing_status, processed_at, current_rejection_reason in records
     ]
     return RfidQuarantinePage(
         items=items,

@@ -71,7 +71,13 @@ class RfidQuarantineRead(ApiModel):
     id: uuid.UUID
     batch_id: uuid.UUID
     event_id: str | None
-    reason: str
+    reason: str = Field(description="Original reason the event entered quarantine.")
+    current_rejection_reason: str | None = Field(
+        description=(
+            "Latest processing failure from the event ledger; null while replay is pending "
+            "or after recovery succeeds."
+        )
+    )
     payload: dict[str, object]
     quarantined_at: datetime
     processing_status: RfidEventProcessingStatus | None
