@@ -721,6 +721,10 @@ def run(args: argparse.Namespace) -> None:
         raise DemoFailure(f"completed task did not await RFID verification: {task}")
 
     moved_epcs = EPCS[1:3]
+    verification_time = max(
+        datetime.now(UTC) + timedelta(seconds=1),
+        base_time + timedelta(seconds=20),
+    )
     verification_batch = submit_batch(
         client,
         device_id=str(required(floor_device, "id")),
@@ -729,7 +733,7 @@ def run(args: argparse.Namespace) -> None:
             observation(
                 str(uuid.uuid4()),
                 epc,
-                base_time + timedelta(seconds=10 + index),
+                verification_time + timedelta(seconds=index),
                 -36,
             )
             for epc in moved_epcs
