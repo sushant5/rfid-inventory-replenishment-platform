@@ -15,7 +15,7 @@ JWT, and Pytest. There is intentionally no frontend or external message broker.
 - Readiness: <https://abacus-take-home-api.onrender.com/health/ready>
 - Release metadata: <https://abacus-take-home-api.onrender.com/version>
 
-The hosted demo runs release `0.8.2` on Render with managed PostgreSQL. Render may need
+The hosted demo runs release `0.8.3` on Render with managed PostgreSQL. Render may need
 about a minute to wake the free web service after inactivity.
 
 Public reviewer login:
@@ -92,8 +92,9 @@ make demo
 make test
 ```
 
-The demo prints seven end-to-end checks, including duplicate/late RFID protection,
-store-level authorization, and an idempotent authoritative sale. Swagger is at
+The demo ensures the 100-store Orange footprint, runs the complete device and inventory
+workflow against Store 1, and prints seven end-to-end checks, including duplicate/late
+RFID protection, store-level authorization, and an idempotent authoritative sale. Swagger is at
 <http://localhost:8000/docs>; readiness is
 at <http://localhost:8000/health/ready>.
 
@@ -195,7 +196,7 @@ also a production extension, not a demo dependency.
 
 ## REST API
 
-The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.2`).
+The authoritative contract is `GET /openapi.json` (OpenAPI 3.1, release `0.8.3`).
 
 The visible contract includes all required endpoints:
 
@@ -203,14 +204,16 @@ The visible contract includes all required endpoints:
 - Catalog: create import, status, row errors, SKU discovery
 - RFID: submit batch, batch status, tenant-wide quarantine inspection and recovery
 - Inventory: store projection, physical item state, authoritative business-event removal
-- Identity: create user, atomically replace access, replace roles/store assignments, current user
+- Identity: login, create user, atomically replace access, replace roles/store assignments, current user
 - Replenishment: policy discovery/version/activation, evaluation, task list/lifecycle
 - Operations: liveness, readiness, version
 
-Demo authentication uses a platform key, one-time device credentials, and short-lived
-JWTs. JWTs contain only user and tenant identity; current roles and store assignments
-are loaded from PostgreSQL on every authenticated request. Production SSO/SCIM is an
-explicit extension, not simulated here.
+Demo authentication uses a platform key, one-time device credentials, and 15-minute
+JWTs. JWTs contain only user and tenant identity; current status, roles, store
+assignments, and token version are loaded from PostgreSQL on every authenticated
+request. Suspension, password rotation, and access changes invalidate all existing
+tokens immediately. Refresh and per-session logout state are deliberately outside
+this demo authentication slice; production SSO owns the interactive session lifecycle.
 
 All documented failures use RFC 7807 `application/problem+json`, including validation
 and unexpected server errors. Each failure includes the request ID returned in the
@@ -220,6 +223,9 @@ Compose does not trust arbitrary proxy headers.
 
 Device discovery returns each reader with its currently effective store/zone
 assignment. Plaintext device tokens are returned only at registration or rotation.
+Bulk store onboarding records planned hardware mappings without returning hundreds of
+secrets in one response; commissioning rotates each device credential before it can
+ingest observations.
 Store discovery, SKU discovery, inventory, and replenishment-task collections use
 bounded `{items, total, limit, offset}` pages. SKU discovery accepts `active=ACTIVE`,
 `INACTIVE`, or `ALL`; the previous `true` and `false` values remain supported aliases.
@@ -343,7 +349,7 @@ stationary-burst scenarios.
 verification can pin the deployed artifact instead of accepting any healthy build:
 
 ```bash
-python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.2 --expected-build-sha <release-sha> --expected-schema-revision a9d4e6f2b713
+python scripts/smoke_test.py --base-url https://abacus-take-home-api.onrender.com --timeout 90 --expected-version 0.8.3 --expected-build-sha <release-sha> --expected-schema-revision a9d4e6f2b713
 ```
 
 ## Hosting
@@ -353,6 +359,14 @@ and both worker entry points in one container. Docker Compose keeps those proces
 separate, which is the production-shaped topology. Hosted deployment needs one
 managed PostgreSQL database with two credentials: a migration owner and a non-owner
 `abacus_app` runtime role.
+
+For an existing demo tenant, the private operator can add only missing store codes
+without rerunning the mutable RFID and policy walkthrough:
+
+```bash
+python scripts/run_architecture_demo.py --base-url https://abacus-take-home-api.onrender.com \
+  --platform-key "$PLATFORM_API_KEY" --request-timeout 120 --provision-only
+```
 
 The existing Render service is named `abacus-inventory-api`, but Render retains the
 provider-assigned hostname from the service's initial creation. Consequently, the

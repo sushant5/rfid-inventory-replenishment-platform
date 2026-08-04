@@ -13,14 +13,13 @@ def _store_count(value: str) -> int:
 
 
 def _store(number: int) -> dict[str, object]:
-    code = f"store{number:03d}"
+    code = f"orange-{number:03d}"
     serial_prefix = f"ORANGE-{number:04d}"
     return {
         "code": code,
         "name": f"Orange Store {number:03d}",
         "timezone": "America/Los_Angeles",
         "organization_path": [
-            {"code": "us", "name": "United States", "unit_type": "COUNTRY"},
             {"code": "west", "name": "West", "unit_type": "REGION"},
         ],
         "zones": [

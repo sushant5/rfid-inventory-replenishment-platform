@@ -23,7 +23,7 @@ from abacus.models.architecture import (
 )
 from abacus.models.identity import IdentityRole
 from abacus.models.jobs import DurableJob
-from abacus.models.tenancy import Store, Tenant
+from abacus.models.tenancy import Device, DeviceAssignment, Store, Tenant, Zone
 from abacus.processes import catalog_worker, event_worker
 from abacus.schemas.identity import RoleAssignmentCreate, UserCreate
 from abacus.schemas.tenancy import TenantCreate
@@ -157,10 +157,12 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                 request_timeout=2.0,
                 startup_timeout=2.0,
                 poll_timeout=2.0,
+                provision_only=False,
             )
         )
 
         output = capsys.readouterr().out
+        assert "PASS tenant/100-store footprint and Store 1 zones/devices" in output
         assert "PASS RFID stable-zone inventory: floor=1 backroom=3" in output
         assert "PASS store-scoped authorization denied Store 2" in output
         assert "PASS idempotent authoritative sale removed one physical item" in output
@@ -178,7 +180,27 @@ def test_canonical_architecture_demo_runs_through_testclient_and_durable_workers
                 verify_db.scalar(
                     select(func.count()).select_from(Store).where(Store.tenant_id == tenant_id)
                 )
-                == 2
+                == 100
+            )
+            assert (
+                verify_db.scalar(
+                    select(func.count()).select_from(Zone).where(Zone.tenant_id == tenant_id)
+                )
+                == 201
+            )
+            assert (
+                verify_db.scalar(
+                    select(func.count()).select_from(Device).where(Device.tenant_id == tenant_id)
+                )
+                == 202
+            )
+            assert (
+                verify_db.scalar(
+                    select(func.count())
+                    .select_from(DeviceAssignment)
+                    .where(DeviceAssignment.tenant_id == tenant_id)
+                )
+                == 202
             )
             assert (
                 verify_db.scalar(

@@ -41,6 +41,8 @@ def test_store_import_fixture_is_valid_and_deterministic() -> None:
 
     assert len(request.stores) == 100
     assert sum(len(store.devices) for store in request.stores) == 200
+    assert request.stores[0].code == "orange-001"
+    assert request.stores[-1].code == "orange-100"
     assert build_store_batch(100) == payload
 
 
@@ -54,7 +56,7 @@ def test_checked_in_examples_match_the_public_request_schemas() -> None:
     )
 
 
-def test_openapi_contains_the_submission_contract() -> None:
+def test_openapi_contains_public_api_contract() -> None:
     schema = create_app().openapi()
     assert schema["openapi"] == "3.1.0"
     assert schema["info"] == {
@@ -62,7 +64,7 @@ def test_openapi_contains_the_submission_contract() -> None:
         "title": API_TITLE,
         "version": __version__,
     }
-    assert __version__ == "0.8.2"
+    assert __version__ == "0.8.3"
 
     expected_operations = {
         ("get", "/health/live"): "liveness",
