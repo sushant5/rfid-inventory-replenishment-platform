@@ -28,6 +28,10 @@ Demo-only reviewer account with access to synthetic Orange tenant data. All
 business-data mutation endpoints are denied. Administrative, device, platform, and
 infrastructure credentials are not published.
 
+The hosted reviewer account is read-only. To submit custom test data or exercise
+mutation endpoints, run `make demo` locally and use Swagger at
+<http://localhost:8000/docs>.
+
 In Swagger, run `POST /v1/auth/login`, copy the returned `access_token`, select
 **Authorize**, and paste it into `HTTPBearer`. Then call `GET /v1/me`, `GET /v1/stores`,
 `GET /v1/stores/{store_id}/zones`, `GET /v1/stores/{store_id}/devices`, `GET /v1/skus`,
@@ -85,13 +89,6 @@ run the private architecture demo once. Locally, `make demo` performs that step.
 Prerequisites: Docker with Compose v2. GNU Make is convenient but not required.
 
 ```bash
-docker compose up --build
-```
-
-In another terminal:
-
-```bash
-make seed
 make demo
 make test
 ```
@@ -102,6 +99,12 @@ eight end-to-end checks. These include duplicate/late RFID protection, RFID veri
 of a completed task, store-level authorization, and an idempotent sale. Swagger is at
 <http://localhost:8000/docs>; readiness is
 at <http://localhost:8000/health/ready>.
+
+For manual local testing, sign in with the local-only Orange administrator configured
+in `docker-compose.yml`: tenant `orange`, email `reviewer@orange.example`, password
+`OrangeReviewer123!`. Custom catalog CSVs, zones, devices, policies, and other business
+data can then be submitted through Swagger. Device registration returns the device token
+required by the RFID observation endpoint.
 
 Required commands:
 
