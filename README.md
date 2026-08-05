@@ -32,6 +32,11 @@ The hosted reviewer account is read-only. To submit custom test data or exercise
 mutation endpoints, run `make demo` locally and use Swagger at
 <http://localhost:8000/docs>.
 
+The hosted demo reports `STALE` inventory with decayed confidence between demo runs.
+This is the freshness model working: confidence decays on a 30-minute half-life, and
+`POST /v1/replenishment/evaluations` refuses any store that is not `LIVE` rather than
+generating tasks from untrusted data.
+
 In Swagger, run `POST /v1/auth/login`, copy the returned `access_token`, select
 **Authorize**, and paste it into `HTTPBearer`. Then call `GET /v1/me`, `GET /v1/stores`,
 `GET /v1/stores/{store_id}/zones`, `GET /v1/stores/{store_id}/devices`, `GET /v1/skus`,
@@ -278,10 +283,6 @@ watermarks and conditional state updates prevent state regression. The demo uses
 gateway reader-coverage status as the reader-health input to confidence; production
 integrations would supply per-reader diagnostics and an adjacency graph.
 
-The hosted event worker is intentionally single-instance. Horizontal production
-workers require `tenant_id:epc` partition affinity and durable or changelog-backed
-evidence windows so all reads for one item reach the same inference state.
-
 ## Replenishment
 
 Active policy versions are immutable. Rule precedence is:
@@ -339,6 +340,18 @@ without overwriting that original evidence. Event, transition, and delta uniquen
 constraints prevent duplicate inventory. For `UNKNOWN_EPC`, explicit replay after a product-master
 correction may use the current active EPC binding because the master data arrived after
 the physical read; ordinary observations continue to use event-time bindings.
+
+## Known limits and next steps
+
+- The hosted event worker is single-instance. Every raw outbox row already carries
+  `partition_key = tenant_id:epc`; production workers would own disjoint key shards and
+  use `SKIP LOCKED` within each shard, preserving per-EPC ordering. This is not built in
+  the hosted slice.
+- `_advance_batch` recounts a batch's sibling rows whenever an event is finalized. Its
+  terminal-state guard makes incremental processed/rejected counters safe and O(1), but
+  that optimization is not built in the hosted slice.
+- The immutable RFID event ledger is not pruned. Production would archive and expire it
+  under a retention policy at least as long as the maximum gateway replay window.
 
 ## Tests and utilities
 
